@@ -69,11 +69,15 @@ function extractCvssScore(item) {
 
 function extractId(item) {
   if (Array.isArray(item.aliases)) {
-    const cve = item.aliases.find((a) => /^CVE-\d{4}-\d+$/.test(a));
-    if (cve) return cve;
+    const cve = item.aliases.find((a) => typeof a === "string" && /^CVE-\d{4}-\d+$/i.test(a));
+    if (cve) return cve.toUpperCase();
+    const ghsa = item.aliases.find((a) => typeof a === "string" && /^GHSA-[a-z0-9-]+$/i.test(a));
+    if (ghsa) return ghsa.toUpperCase();
+    const mal = item.aliases.find((a) => typeof a === "string" && /^MAL-\d{4}-\d+$/i.test(a));
+    if (mal) return mal.toUpperCase();
   }
-  if (item.id && item.id !== "CVE-DISCLOSURE") return item.id;
-  if (item.cve_id) return item.cve_id;
+  if (item.id && item.id !== "CVE-DISCLOSURE") return item.id.toUpperCase();
+  if (item.cve_id) return item.cve_id.toUpperCase();
   return null;
 }
 
