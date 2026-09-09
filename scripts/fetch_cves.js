@@ -97,6 +97,16 @@ function extractProducts(item) {
   return [];
 }
 
+function cleanSummary(text) {
+  if (typeof text !== "string") return text;
+  return text
+    .replace(/^---\s*/gm, "")
+    .replace(/_-=\s*Per source details\..*?=-_/gs, "")
+    .replace(/^##\s*Source:.*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function extractSummary(item) {
   const candidates = [
     item.details,
@@ -108,7 +118,10 @@ function extractSummary(item) {
     item.document?.title,
   ];
   for (const c of candidates) {
-    if (typeof c === "string" && c.trim().length > 10) return c.trim();
+    if (typeof c === "string" && c.trim().length > 10) {
+      const cleaned = cleanSummary(c);
+      if (cleaned.length > 10) return cleaned;
+    }
   }
   return "Security disclosure registered in public vulnerability database.";
 }
