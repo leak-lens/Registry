@@ -188,24 +188,64 @@ async function fetchCisaKev() {
 }
 
 async function fetchGithubAdvisories(exploitedIds) {
-  console.log("  → Fetching GitHub Advisory DB (OSV)...");
+  console.log("  → Fetching OSV / GitHub Advisory DB...");
   const results = [];
-  const ecosystems = ["npm", "PyPI", "Go", "Maven", "RubyGems", "NuGet"];
+  const ecosystems = [
+    "npm", "PyPI", "Go", "Maven", "RubyGems", "NuGet",
+    "Linux", "Packagist", "crates.io", "Hex", "Android", "Pub"
+  ];
   for (const eco of ecosystems) {
     try {
-      const data = await get(`https://api.osv.dev/v1/query?ecosystem=${eco}&page_size=20`);
+      const data = await get(`https://api.osv.dev/v1/query?ecosystem=${encodeURIComponent(eco)}&page_size=100`);
       if (Array.isArray(data.vulns)) {
         for (const v of data.vulns) {
           const norm = normalise(v, exploitedIds);
           if (norm) results.push(norm);
         }
       }
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 150));
     } catch (e) {
       console.warn(`     OSV ${eco} failed:`, e.message);
     }
   }
-  console.log(`     GitHub Advisory: ${results.length} records`);
+  console.log(`     OSV Database: ${results.length} records`);
+  return results;
+}
+
+async function fetchGithubAdvisoriesApi(exploitedIds) {
+  console.log("  → Fetching GitHub Security Advisories API...");
+  const results = [];
+  try {
+    const data = await get("https://api.github.com/advisories?per_page=100");
+    if (Array.isArray(data)) {
+      for (const item of data) {
+        const norm = normalise(item, exploitedIds);
+        if (norm) results.push(norm);
+      }
+    }
+    console.log(`     GitHub Advisories API: ${results.length} records`);
+  } catch (e) {
+    console.warn("     GitHub Advisories API skipped:", e.message);
+  }
+  return results;
+}
+
+async function fetchNvdCves(exploitedIds) {
+  console.log("  → Fetching NIST NVD API 2.0...");
+  const results = [];
+  try {
+    const data = await get("https://services.nvd.nist.gov/rest/json/cves/2.0?resultsPerPage=100");
+    const vulnerabilities = data.vulnerabilities || [];
+    for (const item of vulnerabilities) {
+      const cveObj = item.cve;
+      if (!cveObj) continue;
+      const norm = normalise(cveObj, exploitedIds);
+      if (norm) results.push(norm);
+    }
+    console.log(`     NIST NVD: ${results.length} records`);
+  } catch (e) {
+    console.warn("     NIST NVD skipped (rate limit or timeout):", e.message);
+  }
   return results;
 }
 
@@ -213,7 +253,7 @@ async function fetchCirclCves(exploitedIds) {
   console.log("  → Fetching CIRCL CVE Search (recent)...");
   const results = [];
   try {
-    const data = await get("https://cve.circl.lu/api/last/60");
+    const data = await get("https://cve.circl.lu/api/last/100");
     if (Array.isArray(data)) {
       for (const item of data) {
         const norm = normalise(item, exploitedIds);
@@ -227,26 +267,65 @@ async function fetchCirclCves(exploitedIds) {
   return results;
 }
 
+function loadExistingCves() {
+  const existingMap = new Map();
+  if (!fs.existsSync(OUT_DIR)) return existingMap;
+
+  const files = fs.readdirSync(OUT_DIR);
+  for (const file of files) {
+    if (/^cves_page_\d+\.json$/.test(file)) {
+      try {
+        const filePath = path.join(OUT_DIR, file);
+        const data = JSON.parse(fs.readFileSync(filePath, "utf8"));
+        if (Array.isArray(data.cves)) {
+          for (const item of data.cves) {
+            if (item && item.id && item.id !== "CVE-DISCLOSURE") {
+              existingMap.set(item.id.toUpperCase(), item);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn(`     Warning: failed to read ${file}: ${e.message}`);
+      }
+    }
+  }
+  console.log(`  → Loaded ${existingMap.size} accumulated CVEs from local storage`);
+  return existingMap;
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log("\n🔍 LeakLens Registry — CVE Fetcher\n");
+  console.log("\n🔍 LeakLens Registry — CVE Fetcher & Accumulator\n");
 
+  const existingMap = loadExistingCves();
   const exploitedIds = await fetchCisaKev();
 
-  const [ghAdvisories, circlCves] = await Promise.all([
+  const [ghAdvisories, ghApi, nvdCves, circlCves] = await Promise.all([
     fetchGithubAdvisories(exploitedIds),
+    fetchGithubAdvisoriesApi(exploitedIds),
+    fetchNvdCves(exploitedIds),
     fetchCirclCves(exploitedIds),
   ]);
 
-  // Merge + deduplicate by ID
-  const seen = new Set();
-  const all = [];
-  for (const item of [...ghAdvisories, ...circlCves]) {
-    if (!item || seen.has(item.id)) continue;
-    seen.add(item.id);
-    all.push(item);
+  // Accumulate and merge: add new CVEs, update existing ones without losing data
+  for (const item of [...ghAdvisories, ...ghApi, ...nvdCves, ...circlCves]) {
+    if (!item || !item.id || item.id === "CVE-DISCLOSURE") continue;
+    const key = item.id.toUpperCase();
+    const existing = existingMap.get(key);
+    if (!existing) {
+      existingMap.set(key, item);
+    } else {
+      existingMap.set(key, {
+        ...existing,
+        ...item,
+        isExploited: existing.isExploited || item.isExploited,
+        summary: (item.summary && item.summary.length > (existing.summary?.length || 0)) ? item.summary : existing.summary,
+      });
+    }
   }
+
+  const all = Array.from(existingMap.values());
 
   // Sort: exploited first, then CVSS desc
   all.sort((a, b) => {
@@ -254,7 +333,7 @@ async function main() {
     return (b.cvssScore || 0) - (a.cvssScore || 0);
   });
 
-  console.log(`\n✅ Total unique CVEs: ${all.length}`);
+  console.log(`\n✅ Total accumulated unique CVEs in database: ${all.length}`);
 
   if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 
@@ -268,7 +347,7 @@ async function main() {
     const pageData = {
       version: "1.0",
       lastUpdated: today,
-      source: "CIRCL CVE Search + GitHub Advisory OSV + CISA KEV",
+      source: "CIRCL CVE Search + GitHub Advisory OSV + CISA KEV + NIST NVD",
       pagination: {
         page: pageNum,
         pageSize: PAGE_SIZE,
@@ -287,7 +366,7 @@ async function main() {
   const index = {
     version: "1.0",
     lastUpdated: today,
-    source: "CIRCL CVE Search + GitHub Advisory OSV + CISA KEV",
+    source: "CIRCL CVE Search + GitHub Advisory OSV + CISA KEV + NIST NVD",
     meta: {
       total: all.length,
       exploited: all.filter((c) => c.isExploited).length,
@@ -298,7 +377,7 @@ async function main() {
     pages,
   };
   fs.writeFileSync(path.join(OUT_DIR, "cves_index.json"), JSON.stringify(index, null, 2));
-  console.log(`\n✅ Written: CVE/cves_index.json + ${pages.length} page file(s)`);
+  console.log(`\n✅ Written: CVE/cves_index.json + ${pages.length} accumulated page file(s)`);
   console.log(`   Exploited (CISA KEV): ${index.meta.exploited} / ${index.meta.total}\n`);
 }
 
