@@ -1,76 +1,47 @@
-# LeakLens Registry
+# LeakLens Open Security Registry
 
-Public registry of verified data breach records. Each entry is independently verified by LeakLens.
+Public data repository maintained by [LeakLens](https://leaklens.org) — an independent, non-commercial project.
 
-## Structure
+The LeakLens Registry is an open, auditable dataset tracking documented data breach exposures, along with aggregated CVE and open-source supply-chain vulnerability data. Every entry is labeled by verification status (confirmed / disputed / unconfirmed) — this project does not treat every claim as fact.
 
-```
-leaks.json          — all verified breach records
-schema.json         — JSON Schema for validation
-```
+---
 
-## How entries are added
+## Features and Capabilities
 
-### Manual (recommended for high-profile breaches)
-1. Create a new entry in `leaks.json`
-2. Follow the schema in `schema.json`
-3. Submit a PR with at least 1 verification source
-4. After review → merge
+- **Breach Verification Tracking**: Records of documented data exposures, each labeled by verification status and linked to its original source — not published as "confirmed" without one.
+- **CVE and Vulnerability Feeds**: Aggregated feed of CVEs, CISA KEV-cataloged exploits, and open-source package advisories, pulled from upstream sources rather than independently assessed.
+- **Open JSON Data Feeds**: Machine-readable feeds intended for use by security researchers, auditors, and other tools — not just the LeakLens site itself.
+- **Scheduled Sync**: Periodic aggregation across NIST NVD API 2.0, CISA KEV, GitHub Security Advisories, and OSV databases.
 
-### Auto-publish (from radar)
-The LeakLens radar automatically publishes entries that meet verification criteria:
-- Source is from a trusted domain (BleepingComputer, SecurityWeek, OCCRP, etc.)
-- Has specific data (company name, date, record count)
-- Confidence score ≥ 0.6
+---
 
-## Entry format
+## Open Data Feeds
 
-```json
-{
-  "slug": "company-name-2026",
-  "title": "Company Name Data Exposure — 5M Records",
-  "institution": "Company Name",
-  "date": "2026-01-15",
-  "size": 5000000,
-  "status": "verified",
-  "severity": "High",
-  "exposedData": ["Email addresses", "Passwords"],
-  "description": "Brief description of the breach.",
-  "methodology": "Verified via OCCRP investigation and company disclosure.",
-  "sources": [
-    {
-      "url": "https://example.com/report",
-      "title": "Report title",
-      "publisher": "Publisher name",
-      "date": "2026-01-10"
-    }
-  ]
-}
-```
+| Data Feed | Location | Format | Description |
+|-----------|----------|--------|-------------|
+| Data Breach Registry | [`leaks.json`](leaks.json) | JSON | Documented breach exposures, with source and verification status per entry |
+| CVE Master Index | [`CVE/cves_index.json`](CVE/cves_index.json) | JSON | Index of vulnerabilities, CVSS scores, and threat levels, as reported upstream |
+| Paginated CVE Feed | [`CVE/cves_page_1.json`](CVE/cves_page_1.json) | JSON | Paginated CVE feed, 50 items per page |
 
-## Status values
+---
 
-| Status | Meaning |
-|--------|---------|
-| `verified` | Confirmed by LeakLens with ≥1 trusted source |
-| `confirmed` | Company officially acknowledged the breach |
-| `disputed` | Company disputes the breach or its scale |
-| `unconfirmed` | Reported but not yet independently verified |
+## Data Integrity Approach
 
-## Validation
+This project tries to hold a clear line between "someone claimed this" and "this is independently verified" — most breach coverage doesn't, and that gap is part of why this registry exists.
 
-Before publishing, validate your entry:
+1. **Verification labeling**: Every breach entry is marked `confirmed`, `disputed`, or `unconfirmed`. Nothing is published as confirmed without a traceable public source or an official disclosure.
+2. **Source attribution**: Every entry links to where the information came from. Entries without a locatable source are not published to the main feed.
+3. **Schema compliance**: Breach records follow `schema.json`; vulnerability entries carry standard CVSS/CWE metadata as provided by upstream sources.
+4. **Open to correction**: Anyone can inspect, audit, or fork this registry. To flag an error or submit a disclosure, open a Pull Request or an issue.
 
-```bash
-node -e "
-  const data = require('./leaks.json');
-  const leaks = data.leaks;
-  const schema = require('./schema.json');
-  console.log('Total entries:', leaks.length);
-  console.log('Schema valid:', true); // Add ajv for full validation
-"
-```
+This is a best-effort, independently-run project, not a certification body — treat "confirmed" here as "independently corroborated as of the listed date," and always check the linked source yourself for anything decision-relevant.
 
-## License
+---
 
-Data in this registry is provided under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Source attribution is required.
+## About LeakLens
+
+LeakLens is an independent, non-commercial registry built for transparency around data breaches and infrastructure vulnerabilities — not a company, and not a security vendor.
+
+- Website: [leaklens.org](https://leaklens.org)
+- GitHub: [github.com/leak-lens](https://github.com/leak-lens)
+- License: Data provided under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Attribution required.
