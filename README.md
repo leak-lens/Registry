@@ -22,6 +22,7 @@ The LeakLens Registry is an open, auditable dataset tracking documented data bre
 | Data Breach Registry | [`leaks.json`](leaks.json) | JSON | Documented breach exposures, with source and verification status per entry |
 | CVE Master Index | [`CVE/cves_index.json`](CVE/cves_index.json) | JSON | Index of vulnerabilities, CVSS scores, and threat levels, as reported upstream |
 | Paginated CVE Feed | [`CVE/cves_page_1.json`](CVE/cves_page_1.json) | JSON | Paginated CVE feed, 50 items per page |
+| Malicious Packages Feed | [`CVE/malicious_packages.json`](CVE/malicious_packages.json) | JSON | Open-source supply-chain attacks: malicious npm/pypi packages with preinstall hooks, dependency confusion, credential exfiltration, or remote code execution payloads |
 
 ---
 

