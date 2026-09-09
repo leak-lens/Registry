@@ -76,8 +76,12 @@ function extractId(item) {
     const mal = item.aliases.find((a) => typeof a === "string" && /^MAL-\d{4}-\d+$/i.test(a));
     if (mal) return mal.toUpperCase();
   }
-  if (item.id && item.id !== "CVE-DISCLOSURE") return item.id.toUpperCase();
-  if (item.cve_id) return item.cve_id.toUpperCase();
+  if (typeof item.id === "string" && (/^CVE-\d{4}-\d+$/i.test(item.id) || /^GHSA-[a-z0-9-]+$/i.test(item.id) || /^MAL-\d{4}-\d+$/i.test(item.id))) {
+    return item.id.toUpperCase();
+  }
+  if (typeof item.cve_id === "string" && /^CVE-\d{4}-\d+$/i.test(item.cve_id)) {
+    return item.cve_id.toUpperCase();
+  }
   return null;
 }
 
