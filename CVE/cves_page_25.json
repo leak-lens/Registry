@@ -5,891 +5,922 @@
   "pagination": {
     "page": 25,
     "pageSize": 50,
-    "totalPages": 268,
-    "totalItems": 13390,
+    "totalPages": 269,
+    "totalItems": 13411,
     "hasNextPage": true,
     "hasPrevPage": true
   },
   "cves": [
     {
-      "id": "CVE-2026-88016",
-      "summary": "## Summary\nWith `-l/--links`, rclone's local backend recreates a source `.rclonelink` object as a real symlink at the destination **verbatim** (preserved by design for faithful backups). Directory-metadata application, however, does **not** go through the `os.Root` sandbox and does **not** use NOFOLLOW syscalls. A local `Directory` always has `translatedLink=false`, so when the destination path already exists as a planted symlink, rclone applies `chmod`/`chown`/`chtimes` **through** that symlink to a target **outside** the destination tree. An attacker who controls the source contents (malicious/compromised remote, shared bucket) obtains attacker-valued `chmod`/`chown`/`chtimes` of an arbitrary path outside the backup destination.\n\n## Root Cause\n- `MkdirMetadata` (`backend/local/local.go:895`) calls `f.lstat` (=`os.Lstat`, local.go:465) on the destination path. On a pre-planted symlink, `os.Lstat` succeeds, so the `errors.Is(err, os.ErrNotExist)` branch (local.go:896) that would create a real directory via the `os.Root`-guarded `f.Mkdir` is **not** taken. Instead a `Directory` is built directly on the symlink path.\n- `writeMetadataToFile` runs raw `os.Chown` (`backend/local/metadata.go:131`) and `os.Chmod` (`metadata.go:158`); `setTimes` runs raw `os.Chtimes` (`backend/local/local.go:1318`).\n- The CVE-2024-52522 NOFOLLOW fix (`os.Lchown`/`lChmod`/`lChtimes`) is gated on `if o.translatedLink` (metadata.go:128/150, local.go:1315). A `Directory` (`newDirectory`→`newObject` with no `.rclonelink` suffix) is never `translatedLink`, so it always takes the raw *following* branch. The CVE-2026-54572 `os.Root` fix covers only content **writes**, not metadata syscalls.\n\n## Impact\nAttacker-controlled `chmod`/`chown`/`chtimes` (values taken from the source directory's mode/uid/gid/mtime) applied to any file or directory **outside** the destination. `chtimes` (mtime) escape works with just `--links` and default flags; `chmod`/`chown` escape additionally needs `--metadata`. When rclone runs as root with `--metadata` and a source `uid=0`, the `chown` primitive reaches the CVE-2024-52522 privilege-escalation ceiling (take ownership of an out-of-tree path).\n\n## Proof of Concept\n```\nmkdir -p /src /dest\n# run 1: source object pwn.rclonelink whose body = /home/victim/secret.d\nprintf '/home/victim/secret.d' > /src/pwn.rclonelink\nrclone sync --links /src /dest              # plants /dest/pwn -> /home/victim/secret.d\n# attacker swaps source pwn to a real directory with chosen metadata:\nrm /src/pwn.rclonelink ; mkdir -p /src/pwn/keep ; chmod 777 /src/pwn\nrclone sync --links --metadata /src /dest   # MkdirMetadata sees /dest/pwn exists (symlink) ->\n                                            # chmod 0777 applied THROUGH it to /home/victim/secret.d\nls -ld /home/victim/secret.d                # => drwxrwxrwx  (outside dir, attacker-chosen mode)\n```\nA single-run PoC is achievable against directory-based object sources (drive/onedrive-class) that satisfy both `ReadDirMetadata` and `CanHaveEmptyDirectories` and can present `pwn.rclonelink` and `pwn/` simultaneously. Local→local uses the two-run backup model (same repeated-backup model as CVE-2024-52522 and CVE-2026-54572). Verified end-to-end against the real `fs/sync.Sync` engine on HEAD: the two-run backup backdated the outside target's mtime and chmod'd it 0777 while os.Root correctly blocked the content-copy of `pwn/keep` — isolating the metadata gap.\n\n## Attack Chain\n1. **Entry.** Victim runs `rclone copy`/`sync --links [--metadata] <untrusted-remote>: /dest`. Attacker controls source contents.\n   - Guard: none — `--links` copying an untrusted remote is a documented, supported operation.\n2. **Plant symlink.** Source serves `pwn.rclonelink` with body = absolute outside path; rclone recreates `dst/pwn` → outside.\n   - Guard: `Fs.symlink` routes creation through `os.Root.Symlink` (local.go:~1552).\n   - Bypass proof: `os.Root` creates the link **verbatim by design** (commit 1154afe); the upstream `os.Root` fix's test `TestSymlinkEscapeWriteThroughBlocked` confirms only write-*through* is refused, the link is planted.\n3. **Deferred dir-metadata fires after transfers.** Source presents non-empty dir `pwn`; `setDelayedDirModTimes` (sync.go:1002) runs strictly after `stopTransfers()` (sync.go:988) — after the symlink is planted.\n   - Guard: `MkdirMetadata` would create a real dir via os.Root-guarded `f.Mkdir` (local.go:897) inside its `errors.Is(err, os.ErrNotExist)` branch.\n   - Bypass proof: `os.Lstat` (local.go:465) on the existing symlink returns success, so the `ErrNotExist` branch (local.go:896) is NOT taken; `f.Mkdir`/os.Root never runs. Empirically `os.IsNotExist(err)=false` for the planted symlink.\n4. **Sink follows the symlink.** `CopyDirMetadata`→`MkdirMetadata`→`writeMetadataToFile` runs `os.Chown`/`os.Chmod` (metadata.go:131/158); `DirSetModTime`→`setTimes` runs `os.Chtimes` (local.go:1318) — all on `o.path=\"dst/pwn\"` with `translatedLink=false`.\n   - Guard: CVE-2024-52522 NOFOLLOW branch (`os.Lchown`/`lChmod`/`lChtimes`).\n   - Bypass proof: that branch is gated on `if o.translatedLink` (metadata.go:128/150, local.go:1315); a `Directory` always has `translatedLink=false`, so the raw following branch runs. POSIX-confirmed: `chmod 777`/`touch` on a symlink path change the *target's* mode/mtime.\n5. **Impact.** `chmod`/`chown`/`chtimes` on an attacker-chosen path outside the destination, with attacker-controlled values.\n\n## Bypass Evidence\n- `if o.translatedLink` gates verified verbatim on v1.75.0 at metadata.go:128/150 and local.go:1315; `os.Chown`/`os.Chmod`/`os.Chtimes` on the else branch at metadata.go:131/158 and local.go:1318.\n- `newDirectory`→`newObject` (local.go:581/589/596) never sets the `.rclonelink` suffix → `translatedLink=false` for all directories.\n- `MkdirMetadata` skip branch: `os.Lstat` succeeds on planted symlink → `errors.Is(err, os.ErrNotExist)` false at local.go:896 → guarded `f.Mkdir` skipped.\n- Real `fs/sync.Sync` E2E on HEAD: `TestDirMetadataThroughPlantedSymlink` (outside dir → 0777), `TestDirSetModTimeThroughPlantedSymlink` (mtime set, default-on), `TestE2E_TwoRunBackup` (backdated outside target while content-copy blocked by os.Root). All PASS. Control `TestControl_ContentWriteBlocked` confirms harness fidelity.\n\n## Affected Versions\n`<= 1.75.0`. Vulnerable code present on latest release tag v1.75.0 and HEAD (5629f26); `git log v1.75.0..HEAD -- backend/local/metadata.go backend/local/local.go` is empty (no post-release fix).\n\n## Suggested Fix\nRoute directory metadata through `os.Root` when `TranslateSymlinks` is set (use `fchmodat(AT_SYMLINK_NOFOLLOW)`/`Lchown`/`UtimesNanoAt(AT_SYMLINK_NOFOLLOW)` on the `rel` path within the root), and/or extend `MkdirMetadata` to detect that the pre-existing destination path is a symlink and refuse to apply following-metadata — mirroring the CVE-2024-52522 NOFOLLOW branch that currently exists only for `translatedLink` objects.\n\nReported by **zx (Jace)** — GitHub: @manus-use",
-      "cvssScore": 6.5,
-      "severity": "Medium",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
-      "cwe": {
-        "cwe_id": "CWE-59",
-        "name": "Improper Link Resolution Before File Access ('Link Following')"
-      },
+      "id": "CVE-2002-0989",
+      "summary": "The URL handler in the manual browser option for Gaim before 0.59.1 allows remote attackers to execute arbitrary script via shell metacharacters in a link.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-09-24",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/rclone/rclone/security/advisories/GHSA-f8g7-2xjc-7mfh",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88016",
-        "https://github.com/rclone/rclone/commit/17b0c03338a857bcb0a68d2d4c82ddbdec3f7893",
-        "https://github.com/rclone/rclone/commit/a7ab39d3d1958afa1446982c1dc4e4a73a887e3e",
-        "https://github.com/rclone/rclone/releases/tag/v1.75.1"
+        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SN-02:06.asc",
+        "http://bugzilla.redhat.com/bugzilla/show_bug.cgi?id=72728",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000521",
+        "http://frontal2.mandriva.com/security/advisories?name=MDKSA-2002:054",
+        "http://gaim.sourceforge.net/ChangeLog"
       ],
-      "vulnerableProducts": [
-        "github.com/rclone/rclone go"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-88015",
-      "summary": "### Summary\nWhen `backend/local` is used with `--links`/`-l` (or the `links=true` config option), each symlink is exposed as an rclone object whose content is the target path string, suffixed `.rclonelink`. `Object.Open()` decodes an incoming `fs.RangeOption` via `Decode(o.Size())`, then for a translated-symlink object passes the decoded `offset` straight into `openTranslatedLink`, which indexes the target string directly: `linkdst[offset:]`.\n\n`RangeOption.Decode`'s `Start >= 0` branch (an ordinary `Range: bytes=X-` request) sets `offset = o.Start` with no upper bound, unlike its suffix-range branch (`Start < 0`, e.g. `bytes=-N`), which already clamps a too-large value to 0 - the fix for a prior, related crash (issue #6310: \"bytes=-90407\" against a 5-byte object panicked with \"slice bounds out of range\", now covered by an existing regression test). The `Start >= 0` branch never received the analogous protection.\n\nA `Range: bytes=<hugeStart>-` request sent to `rclone serve http`/`webdav` (or any consumer of `lib/http/serve`'s `Object()`, which parses and decodes the client's own Range header) against a directory containing a symlink therefore reaches `linkdst[offset:]` with offset far beyond the target string's length, and Go panics with \"slice bounds out of range\" instead of returning an empty read.\n\n### Details\nVulnerable code (before fix):\n```go\nfunc (o *Object) openTranslatedLink(offset, limit int64) (lrc io.ReadCloser, err error) {\n\tlinkdst, err := os.Readlink(o.path)\n\tif err != nil { return nil, err }\n\treturn readers.NewLimitedReadCloser(io.NopCloser(strings.NewReader(linkdst[offset:])), limit), nil\n}\n```\n\n### PoC\nCalled the real production `Object.Open()` on a translated-symlink object (target length 12) with `&fs.RangeOption{Start: math.MaxInt64, End: -1}`:\n```\npanic: runtime error: slice bounds out of range [9223372036854775807:8]\n  ...backend/local.(*Object).openTranslatedLink\n  ...backend/local.(*Object).Open\n```\n\n### Impact\nA remote client can send a single crafted `Range` header against any symlink-backed object exposed by `rclone serve http`/`webdav`/etc (backed by `backend/local` with `--links` enabled) to deterministically panic the request-handling goroutine. Go's `net/http` recovers panics per-connection by default, so this fails the one request/connection rather than crashing the whole server process, and no file handle is left open (the panic occurs before any read handle is acquired) - but it is fully deterministic and remotely triggerable with no authentication or race window needed, unlike some other panic-recovery findings.\n\n### Fix\nClamp `offset` to the length of the target string before slicing, matching how a real file read past EOF behaves (an empty read):\n```go\nif offset > int64(len(linkdst)) {\n\toffset = int64(len(linkdst))\n}\n```\nNote: the shared `RangeOption.Decode()` also has a related, unaddressed issue - `limit = o.End - o.Start + 1` can itself overflow to a large negative number for a huge `End` - but a fix attempted there during this investigation broke `fs/operations/reopen.go`'s `NewReOpen`, which calls `Decode` with its `h.end` field still at its zero value at that point in construction. Flagged for awareness but not changed here to keep this patch minimal and low-risk.",
-      "cvssScore": 5.3,
+      "id": "CVE-2001-0361",
+      "summary": "Implementations of SSH version 1.5, including (1) OpenSSH up to version 2.3.0, (2) AppGate, and (3) ssh-1 up to version 1.2.31, in certain configurations, allow a remote attacker to decrypt and/or alter traffic via a \"Bleichenbacher attack\" on PKCS#1 version 1.5.",
+      "cvssScore": 4,
       "severity": "Medium",
-      "published": "2026-09-19",
-      "modified": "2026-09-19",
-      "cwe": {
-        "cwe_id": "CWE-190",
-        "name": "Integer Overflow or Wraparound"
-      },
+      "published": "2001-06-27",
+      "modified": null,
+      "cwe": "CWE-310",
       "references": [
-        "https://github.com/rclone/rclone/commit/28bf49d66f94acc3f4f7f318504a706686281af9",
-        "https://github.com/rclone/rclone/releases/tag/v1.75.1",
-        "https://github.com/rclone/rclone/security/advisories/GHSA-p6m2-r3w9-mpxw",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88015"
+        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-01:24.ssh.asc",
+        "http://marc.info/?l=bugtraq&m=98158450021686&w=2",
+        "http://www.ciac.org/ciac/bulletins/l-047.shtml",
+        "http://www.debian.org/security/2001/dsa-023",
+        "http://www.debian.org/security/2001/dsa-027"
       ],
-      "vulnerableProducts": [
-        "rclone Bitnami"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-2202",
-      "summary": "Outlook Express 6.0 does not delete messages from dbx files, even when a user empties the Deleted items folder, which allows local users to read other users email.",
-      "cvssScore": 3.8,
-      "severity": "Low",
+      "id": "CVE-2004-0362",
+      "summary": "Multiple stack-based buffer overflows in the ICQ parsing routines of the ISS Protocol Analysis Module (PAM) component, as used in various RealSecure, Proventia, and BlackICE products, allow remote attackers to execute arbitrary code via a SRV_MULTI response containing a SRV_USER_ONLINE response packet and a SRV_META_USER response packet with long (1) nickname, (2) firstname, (3) lastname, or (4) email address fields, as exploited by the Witty worm.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-04-15",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=107965651712378&w=2",
+        "http://secunia.com/advisories/11073",
+        "http://www.ciac.org/ciac/bulletins/o-104.shtml",
+        "http://www.eeye.com/html/Research/Advisories/AD20040318.html",
+        "http://www.kb.cert.org/vuls/id/947254"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1951",
+      "summary": "Buffer overflow in GoAhead WebServer 2.1 allows remote attackers to execute arbitrary code via a long HTTP GET request with a large number of subdirectories.",
+      "cvssScore": 7.5,
+      "severity": "High",
       "published": "2002-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.iss.net/security_center/static/10500.php",
-        "http://www.ntbugtraq.com/default.asp?pid=36&sid=1&A2=ind0210&L=ntbugtraq&F=P&S=&P=5732",
-        "http://www.iss.net/security_center/static/10500.php",
-        "http://www.ntbugtraq.com/default.asp?pid=36&sid=1&A2=ind0210&L=ntbugtraq&F=P&S=&P=5732"
+        "http://freecode.com/projects/embedthis-goahead-webserver/releases/343539",
+        "http://osvdb.org/81099",
+        "http://www.iss.net/security_center/static/9884.php",
+        "http://www.securiteam.com/securitynews/5MP0C1580W.html",
+        "http://www.securityfocus.com/bid/5464"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0395",
-      "summary": "The TFTP server for Red-M 1050 (Bluetooth Access Point) can not be disabled and makes it easier for remote attackers to crack the administration password via brute force methods.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2002-07-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9264",
-        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9264"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0396",
-      "summary": "The web management server for Red-M 1050 (Bluetooth Access Point) does not use session-based credentials to authenticate users, which allows attackers to connect to the server from the same IP address as a user who has already established a session.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-07-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
-        "http://www.securityfocus.com/bid/4940",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9265",
-        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
-        "http://www.securityfocus.com/bid/4940"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0397",
-      "summary": "Red-M 1050 (Bluetooth Access Point) publicizes its name, IP address, and other information in UDP packets to a broadcast address, which allows any system on the network to obtain potentially sensitive information about the Access Point device by monitoring UDP port 8887.",
+      "id": "CVE-2003-1526",
+      "summary": "PHP-Nuke 7.0 allows remote attackers to obtain the installation path via certain characters such as (1) \", (2) ', or (3) > in the search field, which reveals the path in an error message.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2002-07-26",
+      "published": "2003-12-31",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-200",
       "references": [
-        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9266",
-        "http://www.atstake.com/research/advisories/2002/a060502-1.txt",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/9266"
+        "http://www.securityfocus.com/archive/1/341743",
+        "http://www.securityfocus.com/bid/8848",
+        "http://www.securityfocus.com/archive/1/341743",
+        "http://www.securityfocus.com/bid/8848"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0180",
-      "summary": "Sojourn search engine allows remote attackers to read arbitrary files via a .. (dot dot) attack.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-03-14",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q1/0201.html",
-        "http://www.securityfocus.com/bid/1052",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4197",
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q1/0201.html",
-        "http://www.securityfocus.com/bid/1052"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0199",
-      "summary": "When a new SQL Server is registered in Enterprise Manager for Microsoft SQL Server 7.0 and the \"Always prompt for login name and password\" option is not set, then the Enterprise Manager uses weak encryption to store the login ID and password.",
+      "id": "CVE-1999-1556",
+      "summary": "Microsoft SQL Server 6.5 uses weak encryption for the password for the SQLExecutiveCmdExec account and stores it in an accessible portion of the registry, which could allow local users to gain privileges by reading and decrypting the CmdExecAccount value.",
       "cvssScore": 7.2,
       "severity": "High",
-      "published": "2000-03-14",
+      "published": "1998-06-29",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/1055",
-        "http://www.securityfocus.com/bid/1055"
+        "http://marc.info/?l=ntbugtraq&m=90222453431645&w=2",
+        "http://www.securityfocus.com/bid/109",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7354",
+        "http://marc.info/?l=ntbugtraq&m=90222453431645&w=2",
+        "http://www.securityfocus.com/bid/109"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-1456",
-      "summary": "filediff in CVStrac allows remote attackers to execute arbitrary commands via shell metacharacters in rcsinfo.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109173359428253&w=2",
-        "http://secunia.com/advisories/12090/",
-        "http://www.cvstrac.org/cvstrac/chngview?cn=316",
-        "http://www.cvstrac.org/cvstrac/tktview?tn=339",
-        "http://www.kb.cert.org/vuls/id/770816"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1457",
-      "summary": "The Virtual Private Network (VPN) capability in Novell Bordermanager 3.8 allows remote attackers to cause a denial of service (ABEND in IKE.NLM) via a malformed IKE packet, as sent by the Striker ISAKMP Protocol Test Suite.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://secunia.com/advisories/12067/",
-        "http://support.novell.com/cgi-bin/search/searchtid.cgi?/10093576.htm",
-        "http://www.kb.cert.org/vuls/id/432097",
-        "http://www.securityfocus.com/bid/10727",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16697"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108789",
-      "summary": "A vulnerability was identified in deepseek-ai deepseek-harness up to 0.1.1-rc.2. This affects the function agent of the component dsh-workflow-worker-thread. The manipulation leads to enforcement of behavioral workflow. The attack is possible to be carried out remotely. The exploit is publicly available and might be used. The vendor was contacted early about this disclosure but did not respond in any way.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108789",
-        "https://github.com/deepseek-ai/deepseek-harness",
-        "https://github.com/deepseek-ai/deepseek-harness/discussions/243",
-        "https://mcniyfj5bw9b.feishu.cn/docx/M5H6d9AbioNftYxwk9CchJgGnHc",
-        "https://vuldb.com/cve/CVE-2026-108789"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108985",
-      "summary": "ZDR decoding in libnfs through 6.0.2 before 7613236 has an out-of-bounds write related to lib/libnfs-zdr.c with libnfs_zdr_bytes(), libnfs_zdr_string(), and libnfs_zdr_array(). The caller-supplied maxsize value is not honored.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108985",
-        "https://github.com/sahlberg/libnfs/commit/7613236464317bee2d9636f087f995148de4db27"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108790",
-      "summary": "A security flaw has been discovered in westboy CicadasCMS up to 2431154dac8d0735e04f1fd2a3c3556668fc8dab. This impacts the function TemplateController.save of the file /system/cms/template/save of the component Backend Template Editor. The manipulation results in path traversal. The attack may be performed from remote. The exploit has been released to the public and may be used for attacks. The vendor was contacted early about this disclosure but did not respond in any way.",
-      "cvssScore": 3.7,
-      "severity": "Low",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108790",
-        "https://github.com/wawyw/cve_report/blob/main/CicadasCMS_1.md",
-        "https://vuldb.com/cve/CVE-2026-108790",
-        "https://vuldb.com/submit/959802",
-        "https://vuldb.com/vuln/416569"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108794",
-      "summary": "A security vulnerability has been detected in ZKTeco BioTime 9.5.6 Build 20260130.3206. Affected by this vulnerability is an unknown functionality of the file /base/api/v1.0/systemSettings/db_migrate_setting/ of the component Database Migration Functionality. Such manipulation leads to sql injection. It is possible to launch the attack remotely. The vendor was contacted early about this disclosure but did not respond in any way.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108794",
-        "https://vuldb.com/cve/CVE-2026-108794",
-        "https://vuldb.com/submit/961112",
-        "https://vuldb.com/vuln/416571",
-        "https://vuldb.com/vuln/416571/cti"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108982",
-      "summary": "VeraCrypt 1.26.29 (FUSE-T build) on macOS sometimes allows unintended access to decrypted data. It does not terminate the FUSE-T auxiliary service (go-nfsv4) and its associated VeraCrypt core-service helper processes when a volume is dismounted. After VeraCrypt reports the volume as dismounted, the auxiliary mount continues to serve the decrypted volume image (volume.dmg) over a loopback SMB session, and the leaked processes retain an open handle to the underlying raw device. A local user or process can therefore remount and access the decrypted volume without the passphrase, e.g., by reopening a previously accessed path (such as through a macOS Open Recent menu) or by attaching volume.dmg from the stale auxiliary mount. (The macFUSE build of VeraCrypt is not affected.)",
-      "cvssScore": null,
-      "severity": "High",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108982",
-        "https://github.com/veracrypt/VeraCrypt/issues/1779",
-        "https://github.com/veracrypt/VeraCrypt/issues/1845",
-        "https://github.com/veracrypt/VeraCrypt/pull/1866",
-        "https://github.com/veracrypt/VeraCrypt/releases/tag/VeraCrypt_1.26.29"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108791",
-      "summary": "A weakness has been identified in westboy CicadasCMS up to 2431154dac8d0735e04f1fd2a3c3556668fc8dab. Affected is the function TemplateController.input of the file /system/cms/template/input of the component Template Management. This manipulation of the argument filePath causes path traversal. It is possible to initiate the attack remotely. The exploit has been made available to the public and could be used for attacks. The vendor was contacted early about this disclosure but did not respond in any way.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108791",
-        "https://github.com/wawyw/cve_report/blob/main/CicadasCMS_2.md",
-        "https://vuldb.com/cve/CVE-2026-108791",
-        "https://vuldb.com/submit/959848",
-        "https://vuldb.com/vuln/416570"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108981",
-      "summary": "ngx_cache_purge before 3.0.4 can allow file deletion via a symlink attack in certain situations where nginx and a served application (e.g., WordPress) run under the same user account. The attacker must be able to create a symlink inside the cache path. Version 3.0.4 fixes this for the case of a symlink created at an arbitrary earlier time, but does not resolve an applicable TOCTOU race condition. (The ngx_cache_purge module follows symlinks while walking the cache directory tree during purge operations. The module relies on nginx's ngx_walk_tree(), which relies on stat() and therefore follows symlinks.)",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108981",
-        "https://github.com/nginx-modules/ngx_cache_purge/pull/72",
-        "https://github.com/nginx-modules/ngx_cache_purge/commit/a6da1352f52a8a02dd6828e88c39ed42fddcee96",
-        "https://github.com/nginx-modules/ngx_cache_purge/releases/tag/3.0.4"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-66086",
-      "summary": "In the modem OTA stack, there is a possible stack-based buffer overflow due to improper validation of scheduling information in SIB1 messages. This could lead to remote code execution or denial of service with no additional execution privileges needed.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-66086",
-        "https://www.unisoc.com/en/support/product-security-bulletin/2109454821805424641"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108784",
-      "summary": "A vulnerability was detected in macrozheng mall up to 1.0.3. This vulnerability affects the function AlipayServiceImpl.pay of the file com/macro/mall/portal/service/impl/AlipayServiceImpl.java of the component Payment Endpoint. The manipulation of the argument total_amount results in business logic errors. The attack can be launched remotely. The exploit is now public and may be used. The patch is identified as dcaa93b3150352e5044708d7211b5bed0af4509f. A patch should be applied to remediate this issue.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108784",
-        "https://github.com/macrozheng/mall/issues/998",
-        "https://github.com/macrozheng/mall/commit/dcaa93b3150352e5044708d7211b5bed0af4509f",
-        "https://github.com/macrozheng/mall",
-        "https://vuldb.com/cve/CVE-2026-108784"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-58379",
-      "summary": "A flaw was found in GIMP's Paint Shop Pro (PSP) file format parser. This heap buffer overflow vulnerability allows a remote attacker to cause arbitrary code execution or a denial of service (DoS) by tricking a user into opening a specially crafted PSP image file. The vulnerability occurs because the software incorrectly calculates buffer sizes when processing low bit-depth images, leading to an overwrite of adjacent memory.",
-      "cvssScore": 5.6,
-      "severity": "Medium",
-      "published": "2026-07-03",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-58379",
-        "https://access.redhat.com/errata/RHSA-2026:38496",
-        "https://access.redhat.com/errata/RHSA-2026:73768",
-        "https://access.redhat.com/errata/RHSA-2026:80509",
-        "https://access.redhat.com/security/cve/CVE-2026-58379"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-86320",
-      "summary": "A flaw was found in flatpak-builder where Git hooks are not disabled when applying patch sources with use-git-am: true. An attacker who can provide a malicious source containing a Git post-applypatch hook can cause the hook to execute on the host during the build process, resulting in arbitrary code execution with the privileges of the user running flatpak-builder.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-17",
-      "modified": "2026-10-30",
-      "cwe": null,
-      "references": [
-        "https://github.com/flatpak/flatpak-builder/security/advisories/GHSA-j5p8-jgjc-f3xv",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-86320",
-        "https://access.redhat.com/errata/RHSA-2026:80495",
-        "https://access.redhat.com/errata/RHSA-2026:80496",
-        "https://access.redhat.com/errata/RHSA-2026:80973"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-107437",
-      "summary": "GV-E-Map\nServer V18.2.0A contains a plaintext database password embedded within an\napplication component. The credential can be recovered through static analysis\nof the distributed binary and may also be exposed in process memory during\nruntime.",
-      "cvssScore": 3.9,
-      "severity": "Low",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-107437",
-        "https://www.geovision.com.tw/cyber_security.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108980",
-      "summary": "Blinko through 1.8.8 allows directory traversal, overwriting startup files as root, via installPlugin. It builds the plugin install path from an unsanitized name in server/routerTrpc/plugin.ts, and the plugin.installPlugin tRPC procedure is open to any authenticated user. Thus, a name containing ../ sequences writes the downloaded plugin files outside the plugins directory. Because the official Docker image runs as root, an authenticated attacker overwrites a root-owned startup file and achieves remote code execution as root. Self-registration for an account may be possible.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108980",
-        "https://github.com/blinkospace/blinko/blob/178e4b3538a21823a50ac2481e653d56cb1ffa86/app/src/pages/signin.tsx#L238-L243",
-        "https://github.com/blinkospace/blinko/blob/178e4b3538a21823a50ac2481e653d56cb1ffa86/server/routerTrpc/plugin.ts#L273",
-        "https://github.com/kashishtopi/blinko-plugin-path-traversal-rce"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-58384",
-      "summary": "A flaw was found in GIMP's PSD parser. An integer overflow in read_RLE_channel() can cause an undersized heap allocation for the RLE row-length table, after which subsequent per-row writes corrupt heap memory. This could lead to memory corruption, potentially resulting in denial of service or arbitrary code execution.",
-      "cvssScore": 5.6,
-      "severity": "Medium",
-      "published": "2026-07-07",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-58384",
-        "https://access.redhat.com/errata/RHSA-2026:40751",
-        "https://access.redhat.com/errata/RHSA-2026:73768",
-        "https://access.redhat.com/errata/RHSA-2026:80509",
-        "https://access.redhat.com/security/cve/CVE-2026-58384"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-66758",
-      "summary": "A flaw was found in the file-fits plugin in GIMP. When processing a FITS image file, the plugin calculates memory allocation sizes using signed 32-bit integers for width and height. If a crafted file sets both values to large values, their product exceeds 2^31 and overflows, resulting in an undersized heap-based buffer allocation. This integer overflow issue results in a heap-based buffer overflow when cfitsio subsequently writes a full row of pixels in the buffer, causing memory corruption, potentially leading to arbitrary code execution or a denial of service.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-07-27",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-66758",
-        "https://access.redhat.com/errata/RHSA-2026:50817",
-        "https://access.redhat.com/errata/RHSA-2026:62507",
-        "https://access.redhat.com/errata/RHSA-2026:73768",
-        "https://access.redhat.com/errata/RHSA-2026:80509"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108781",
-      "summary": "A security flaw has been discovered in erzhongxmu JEEWMS up to 2026.09.27-W39. Affected by this vulnerability is the function WmToMoveGoodsController.list of the file src/main/java/com/zzjee/wm/controller/WmToMoveGoodsController.java of the component PDA Interface. Performing a manipulation of the argument searchstr results in sql injection. It is possible to initiate the attack remotely. The exploit has been released to the public and may be used for attacks. The vendor was contacted early about this disclosure but did not respond in any way.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108781",
-        "https://vuldb.com/cve/CVE-2026-108781",
-        "https://vuldb.com/submit/959640",
-        "https://vuldb.com/vuln/416560",
-        "https://vuldb.com/vuln/416560/cti"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-59090",
-      "summary": "A flaw was found in GIMP's PSD file format plugin. This vulnerability, an unsigned integer underflow in the `block_rem` variable, occurs when a user opens a specially crafted `.psd` image file. The underflow leads to parser confusion, enabling an attacker to inject arbitrary data as layer resource blocks. This can ultimately result in arbitrary code execution, allowing the attacker to run malicious code on the victim's system.",
-      "cvssScore": 8,
-      "severity": "High",
-      "published": "2026-08-10",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-59090",
-        "https://access.redhat.com/errata/RHSA-2026:61587",
-        "https://access.redhat.com/errata/RHSA-2026:73768",
-        "https://access.redhat.com/errata/RHSA-2026:80509",
-        "https://access.redhat.com/security/cve/CVE-2026-59090"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108786",
-      "summary": "A vulnerability has been found in houtini-ai seo-crawler-mcp up to 2.1.5. Impacted is the function run_seo_audit of the file src/core/CrawlOrchestrator.ts of the component Crawler. Such manipulation leads to server-side request forgery. The attack may be launched remotely. The exploit has been disclosed to the public and may be used. The vendor was contacted early about this disclosure but did not respond in any way.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-12",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108786",
-        "https://github.com/Net-defense/public_exp/issues/1",
-        "https://vuldb.com/cve/CVE-2026-108786",
-        "https://vuldb.com/submit/959331",
-        "https://vuldb.com/vuln/416565"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-58380",
-      "summary": "A flaw was found in GIMP's PNM file format parser. When parsing a specially crafted PNM file, the pnmscanner_gettoken() function writes a null terminator one byte past the end of a stack-allocated buffer due to an off-by-one error in the loop boundary check. This could lead to memory corruption, potentially resulting in denial of service or arbitrary code execution.",
-      "cvssScore": 5.6,
-      "severity": "Medium",
-      "published": "2026-07-06",
-      "modified": "2026-10-12",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-58380",
-        "https://access.redhat.com/errata/RHSA-2026:40751",
-        "https://access.redhat.com/errata/RHSA-2026:62507",
-        "https://access.redhat.com/errata/RHSA-2026:73768",
-        "https://access.redhat.com/errata/RHSA-2026:80509"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1504",
-      "summary": "The displaycontent function in config.php for Just Another Flat file (JAF) CMS 3.0RC allows remote attackers to gain sensitive information via a blank show parameter, which reveals the installation path in an error message, as demonstrated using index.php.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://echo.or.id/adv/adv08-y3dips-2004.txt",
-        "http://marc.info/?l=bugtraq&m=110004150430309&w=2",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/18006",
-        "http://echo.or.id/adv/adv08-y3dips-2004.txt",
-        "http://marc.info/?l=bugtraq&m=110004150430309&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1505",
-      "summary": "Directory traversal vulnerability in index.php in Just Another Flat file (JAF) CMS 3.0RC allows remote attackers to read arbitrary files and possibly execute PHP code via a .. (dot dot) in the show parameter.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://echo.or.id/adv/adv08-y3dips-2004.txt",
-        "http://marc.info/?l=bugtraq&m=110004150430309&w=2",
-        "http://secunia.com/advisories/13104",
-        "http://www.securityfocus.com/bid/11627",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17983"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1506",
-      "summary": "Multiple cross-site scripting (XSS) vulnerabilities in WebCalendar allow remote attackers to inject arbitrary web script via (1) view_entry.php, (2) view_d.php, (3) usersel.php, (4) datesel.php, (5) trailer.php, or (6) styles.php, as demonstrated using img srg tags.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=110011618724455&w=2",
-        "http://secunia.com/advisories/13164",
-        "http://www.securityfocus.com/bid/11651",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/18026",
-        "http://marc.info/?l=bugtraq&m=110011618724455&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1507",
-      "summary": "CRLF injection vulnerability in login.php in WebCalendar allows remote attackers to inject CRLF sequences via the return_path parameter and perform HTTP Response Splitting attacks to modify expected HTML content from the server.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=110011618724455&w=2",
-        "http://secunia.com/advisories/13164",
-        "http://www.securityfocus.com/bid/11651",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/18027",
-        "http://marc.info/?l=bugtraq&m=110011618724455&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1471",
-      "summary": "Format string vulnerability in wrapper.c in CVS 1.12.x through 1.12.8, and 1.11.x through 1.11.16 allows remote attackers with CVSROOT commit access to cause a denial of service (application crash) and possibly execute arbitrary code via format string specifiers in a wrapper line.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-04:14.cvs.asc",
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-June/022441.html",
-        "http://security.e-matters.de/advisories/092004.html",
-        "http://www.securityfocus.com/bid/10499",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16365"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1472",
-      "summary": "Symantec Enterprise Firewall/VPN Appliances 100, 200, and 200R running firmware before 1.63 allow remote attackers to cause a denial of service (device freeze) via a fast UDP port scan on the WAN interface.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109588376426070&w=2",
-        "http://secunia.com/advisories/12635",
-        "http://securityresponse.symantec.com/avcenter/security/Content/2004.09.22.html",
-        "http://www.kb.cert.org/vuls/id/441078",
-        "http://www.osvdb.org/10204"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1473",
-      "summary": "Symantec Enterprise Firewall/VPN Appliances 100, 200, and 200R running firmware before 1.63 and Gateway Security 320, 360, and 360R running firmware before 622 allow remote attackers to bypass filtering and determine whether the device is running services such as tftpd, snmpd, or isakmp via a UDP port scan with a source port of UDP 53.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109588376426070&w=2",
-        "http://secunia.com/advisories/12635",
-        "http://securityresponse.symantec.com/avcenter/security/Content/2004.09.22.html",
-        "http://www.kb.cert.org/vuls/id/329230",
-        "http://www.osvdb.org/10205"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1474",
-      "summary": "Symantec Enterprise Firewall/VPN Appliances 100, 200, and 200R running firmware before 1.63 and Gateway Security 320, 360, and 360R running firmware before 622 uses a default read/write SNMP community string, which allows remote attackers to alter the firewall's configuration file.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109588376426070&w=2",
-        "http://secunia.com/advisories/12635",
-        "http://securityresponse.symantec.com/avcenter/security/Content/2004.09.22.html",
-        "http://www.kb.cert.org/vuls/id/173910",
-        "http://www.osvdb.org/10206"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1475",
-      "summary": "Multiple stack-based buffer overflows in xine-lib 1-rc2 through 1-rc5 allow attackers to execute arbitrary code via (1) long VideoCD vcd:// MRLs or (2) long subtitle lines.",
-      "cvssScore": 5.1,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://security.gentoo.org/glsa/glsa-200408-18.xml",
-        "http://www.gentoo.org/security/en/glsa/glsa-200409-30.xml",
-        "http://www.securityfocus.com/archive/1/375485/2004-09-02/2004-09-08/0",
-        "http://www.securityfocus.com/bid/11206",
-        "http://xinehq.de/index.php/security/XSA-2004-4"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0514",
-      "summary": "Unknown vulnerability in LoginWindow for Mac OS X 10.3.4, related to \"handling of directory services lookups.\"",
+      "id": "CVE-1999-0313",
+      "summary": "disk_bandwidth on SGI IRIX 6.4 S2MP for Origin/Onyx2 allows local users to gain root access using relative pathnames.",
       "cvssScore": 7.2,
       "severity": "High",
-      "published": "2004-08-18",
+      "published": "1998-07-01",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://lists.seifried.org/pipermail/security/2004-May/003743.html",
-        "http://securitytracker.com/id?1010330",
-        "http://www.kb.cert.org/vuls/id/174790",
-        "http://www.securityfocus.com/bid/10432",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16289"
+        "ftp://patches.sgi.com/support/free/security/advisories/19980701-01-P",
+        "http://www.osvdb.org/936",
+        "http://www.securityfocus.com/bid/213/exploit",
+        "http://www.securityfocus.com/bid/214",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1441"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0515",
-      "summary": "Unknown vulnerability in LoginWindow for Mac OS X 10.3.4, related to \"handling of console log files.\"",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2004-08-18",
+      "id": "CVE-1999-0314",
+      "summary": "ioconfig on SGI IRIX 6.4 S2MP for Origin/Onyx2 allows local users to gain root access using relative pathnames.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1998-07-01",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://lists.seifried.org/pipermail/security/2004-May/003743.html",
-        "http://securitytracker.com/id?1010330",
-        "http://www.securityfocus.com/bid/10432",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16289",
-        "http://lists.seifried.org/pipermail/security/2004-May/003743.html"
+        "ftp://patches.sgi.com/support/free/security/advisories/19980701-01-P",
+        "http://www.osvdb.org/6788",
+        "http://www.securityfocus.com/bid/213",
+        "http://www.securityfocus.com/bid/213/exploit",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1199"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0516",
-      "summary": "Unknown vulnerability in Mac OS X 10.3.4, related to \"package installation scripts,\" a different vulnerability than CVE-2004-0517.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2004-08-18",
+      "id": "CVE-1999-1435",
+      "summary": "Buffer overflow in libsocks5 library of Socks 5 (socks5) 1.0r5 allows local users to gain privileges via long environmental variables.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1998-07-10",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://lists.seifried.org/pipermail/security/2004-May/003743.html",
-        "http://securitytracker.com/id?1010331",
-        "http://www.securityfocus.com/bid/10432",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16290",
-        "http://lists.seifried.org/pipermail/security/2004-May/003743.html"
+        "http://marc.info/?l=bugtraq&m=90221104525933&w=2",
+        "http://www.securityfocus.com/bid/154",
+        "http://marc.info/?l=bugtraq&m=90221104525933&w=2",
+        "http://www.securityfocus.com/bid/154"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0243",
-      "summary": "AnalogX SimpleServer:WWW HTTP server 1.03 allows remote attackers to cause a denial of service via a short GET request to cgi-bin.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-03-25",
+      "id": "CVE-1999-1434",
+      "summary": "login in Slackware Linux 3.2 through 3.5 does not properly check for an error when the /etc/group file is missing, which prevents it from dropping privileges, causing it to assign root privileges to any local user who logs on to the server.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1998-07-13",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.analogx.com/contents/download/network/sswww.htm",
-        "http://www.osvdb.org/1265",
-        "http://www.securityfocus.com/bid/1076",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=web-5645555%40post2.rnci.com",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4189"
+        "http://marc.info/?l=bugtraq&m=90221104525951&w=2",
+        "http://www.securityfocus.com/bid/155",
+        "http://marc.info/?l=bugtraq&m=90221104525951&w=2",
+        "http://www.securityfocus.com/bid/155"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0281",
-      "summary": "Buffer overflow in the Napster client beta 5 allows remote attackers to cause a denial of service via a long message.",
+      "id": "CVE-1999-1433",
+      "summary": "HP JetAdmin D.01.09 on Solaris allows local users to change the permissions of arbitrary files via a symlink attack on the /tmp/jetadmin.log file.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1998-07-15",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=90221104525988&w=2",
+        "http://marc.info/?l=bugtraq&m=90221104526067&w=2",
+        "http://www.securityfocus.com/bid/157",
+        "http://marc.info/?l=bugtraq&m=90221104525988&w=2",
+        "http://marc.info/?l=bugtraq&m=90221104526067&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0134",
+      "summary": "vold in Solaris 2.x allows local users to gain root access.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1996-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.osvdb.org/8159",
+        "http://www.osvdb.org/8159"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1309",
+      "summary": "Sendmail before 8.6.7 allows local users to gain root access via a large value in the debug (-d) command line option.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1996-08-30",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cert.org/advisories/CA-94.12.sendmail.vulnerabilities",
+        "http://www.dataguard.no/bugtraq/1994_1/0040.html",
+        "http://www.dataguard.no/bugtraq/1994_1/0042.html",
+        "http://www.dataguard.no/bugtraq/1994_1/0043.html",
+        "http://www.dataguard.no/bugtraq/1994_1/0048.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0909",
+      "summary": "Buffer overflow in helpctr.exe program in Microsoft Help Center for Windows XP allows remote attackers to execute arbitrary code via a long hcp: URL.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-11-21",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=100638955422011&w=2",
+        "http://www.securityfocus.com/bid/6802",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7605",
+        "http://marc.info/?l=bugtraq&m=100638955422011&w=2",
+        "http://www.securityfocus.com/bid/6802"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0910",
+      "summary": "Legato Networker before 6.1 allows remote attackers to bypass access restrictions and gain privileges on the Networker interface by spoofing the admin server name and IP address and connecting to Networker from an IP address whose hostname can not be determined by a DNS reverse lookup.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-11-21",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=100638782917917&w=2",
+        "http://www.securityfocus.com/bid/3564",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7601",
+        "http://marc.info/?l=bugtraq&m=100638782917917&w=2",
+        "http://www.securityfocus.com/bid/3564"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0911",
+      "summary": "PHP-Nuke 5.1 stores user and administrator passwords in a base-64 encoded cookie, which could allow remote attackers to gain privileges by stealing or sniffing the cookie and decoding it.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-11-21",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=100638850219503&w=2",
+        "http://www.securityfocus.com/bid/3567",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7596",
+        "http://marc.info/?l=bugtraq&m=100638850219503&w=2",
+        "http://www.securityfocus.com/bid/3567"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0914",
+      "summary": "Linux kernel before 2.4.11pre3 in multiple Linux distributions allows local users to cause a denial of service (crash) by starting the core vmlinux kernel, possibly related to poor error checking during ELF loading.",
       "cvssScore": 2.1,
       "severity": "Low",
-      "published": "2000-03-26",
+      "published": "2001-11-21",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-03/0277.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-03/0299.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-03/0277.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-03/0299.html"
+        "http://marc.info/?l=bugtraq&m=100638584813349&w=2",
+        "http://marc.info/?l=bugtraq&m=100654787226869&w=2L:2",
+        "http://www.securityfocus.com/bid/3570",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7591",
+        "http://marc.info/?l=bugtraq&m=100638584813349&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0235",
-      "summary": "Buffer overflow in the huh program in the orville-write package allows local users to gain root privileges.",
+      "id": "CVE-2001-0915",
+      "summary": "Format string vulnerability in Berkeley parallel make (pmake) 2.1.33 and earlier allows a local user to gain root privileges via format specifiers in the check argument of a shell definition.",
       "cvssScore": 7.2,
       "severity": "High",
-      "published": "2000-03-27",
+      "published": "2001-11-21",
       "modified": null,
       "cwe": null,
       "references": [
-        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-00:10-orville-write.asc",
-        "http://www.osvdb.org/1263",
-        "http://www.securityfocus.com/bid/1070",
-        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-00:10-orville-write.asc",
-        "http://www.osvdb.org/1263"
+        "http://marc.info/?l=bugtraq&m=100638919720975&w=2",
+        "http://www.iss.net/security_center/static/7602.php",
+        "http://www.securityfocus.com/bid/3572",
+        "http://marc.info/?l=bugtraq&m=100638919720975&w=2",
+        "http://www.iss.net/security_center/static/7602.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0245",
-      "summary": "Vulnerability in SGI IRIX objectserver daemon allows remote attackers to create user accounts.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2000-03-27",
-      "modified": null,
+      "id": "CVE-2026-92363",
+      "summary": "A flaw has been found in ag-ui-protocol ag-ui 1.0. Affected is an unknown function of the file src/stream/sse_parser.cpp of the component JSON Parser. Executing a manipulation can lead to resource consumption. The attack may be performed from remote. This patch is called ab6e0bc298996caac2b4b0b3ec0bd8d32a15a186. Applying a patch is advised to resolve this issue.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-09-16",
+      "modified": "2026-09-16",
       "cwe": null,
       "references": [
-        "ftp://sgigate.sgi.com/security/20000303-01-PX",
-        "http://www.ciac.org/ciac/bulletins/k-030.shtml",
-        "http://www.osvdb.org/1267",
-        "http://www.securityfocus.com/bid/1079",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=200003290852.aa27218%40blaze.arl.mil"
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-92363",
+        "https://github.com/ag-ui-protocol/ag-ui/issues/2440",
+        "https://github.com/ag-ui-protocol/ag-ui/pull/2501",
+        "https://github.com/ag-ui-protocol/ag-ui/commit/ab6e0bc298996caac2b4b0b3ec0bd8d32a15a186",
+        "https://github.com/ag-ui-protocol/ag-ui"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0289",
-      "summary": "IP masquerading in Linux 2.2.x allows remote attackers to route UDP packets through the internal interface by modifying the external source IP address and port number to match those of an established connection.",
+      "id": "CVE-2002-2266",
+      "summary": "NetScreen ScreenOS 2.8 through 4.0, when forwarding H.323 or Netmeeting traffic, allows remote attackers to cause a denial of service (firewall session table consumption) by establishing multiple half-open H.323 sessions, which are not cleaned up on garbage removal and do not time out for 36 hours.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2000-03-27",
+      "published": "2002-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-03/0284.html",
-        "http://www.novell.com/linux/security/advisories/suse_security_announce_48.html",
-        "http://www.securityfocus.com/bid/1078",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-03/0284.html",
-        "http://www.novell.com/linux/security/advisories/suse_security_announce_48.html"
+        "http://marc.info/?l=bugtraq&m=103827647621729&w=2",
+        "http://www.securityfocus.com/bid/6250",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10700",
+        "http://marc.info/?l=bugtraq&m=103827647621729&w=2",
+        "http://www.securityfocus.com/bid/6250"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0244",
-      "summary": "The Citrix ICA (Independent Computing Architecture) protocol uses weak encryption (XOR) for user authentication.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2000-03-29",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/1077",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=Pine.BSO.4.20.0003290949280.2640-100000%40naughty.monkey.org",
-        "http://www.securityfocus.com/bid/1077",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=Pine.BSO.4.20.0003290949280.2640-100000%40naughty.monkey.org"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0152",
-      "summary": "Remote attackers can cause a denial of service in Novell BorderManager 3.5 by pressing the enter key in a telnet connection to port 2000.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-03-30",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.osvdb.org/7468",
-        "http://www.securityfocus.com/bid/976",
-        "http://www.osvdb.org/7468",
-        "http://www.securityfocus.com/bid/976"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0802",
-      "summary": "Buffer overflow in Internet Explorer 5 allows remote attackers to execute commands via a malformed Favorites icon.",
-      "cvssScore": 7.6,
+      "id": "CVE-2002-2267",
+      "summary": "bogopass in bogofilter 0.9.0.4 allows local users to overwrite arbitrary files via a symlink attack on the bogopass temporary file.",
+      "cvssScore": 7.2,
       "severity": "High",
-      "published": "1999-05-27",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-11/0367.html",
+        "http://www.securityfocus.com/bid/6278",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10726",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-11/0367.html",
+        "http://www.securityfocus.com/bid/6278"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-2268",
+      "summary": "Buffer overflow in Webster HTTP Server allows remote attackers to execute arbitrary code via a long URL.",
+      "cvssScore": 9.4,
+      "severity": "Critical",
+      "published": "2002-12-31",
       "modified": null,
       "cwe": "CWE-119",
       "references": [
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ231450",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-018",
-        "http://support.microsoft.com/default.aspx?scid=kb%3B%5BLN%5D%3BQ231450",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-018"
+        "http://seclists.org/lists/bugtraq/2002/Dec/0013.html",
+        "http://www.securiteam.com/windowsntfocus/6R0030A6AY.html",
+        "http://www.securityfocus.com/bid/6289",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10727",
+        "http://seclists.org/lists/bugtraq/2002/Dec/0013.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0868",
-      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: CVE-2004-0866.  Reason: This candidate is a duplicate of CVE-2004-0866.  Notes: The description for CVE-2004-0866 was inadvertently attached to this issue instead.  All CVE users should reference CVE-2004-0866 instead of this candidate.  All references and descriptions in this candidate have been removed to prevent accidental usage",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2004-12-23",
+      "id": "CVE-2002-2269",
+      "summary": "Directory traversal vulnerability in Webster HTTP Server allows remote attackers to read arbitrary files via a .. (dot dot) in the URL.",
+      "cvssScore": 9.4,
+      "severity": "Critical",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": "CWE-22",
+      "references": [
+        "http://securityreason.com/securityalert/3262",
+        "http://www.securityfocus.com/archive/1/301893",
+        "http://www.securityfocus.com/bid/6291",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10728",
+        "http://securityreason.com/securityalert/3262"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-2270",
+      "summary": "Unspecified vulnerability in the ied command in HP-UX 10.10, 10.20, and 11.0 allows local users to view \"normally invisible data\" via unknown attack vectors.",
+      "cvssScore": 3.6,
+      "severity": "Low",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": "CWE-264",
+      "references": [
+        "http://www.securityfocus.com/advisories/4742",
+        "http://www.securityfocus.com/bid/6317",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10777",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A5311",
+        "http://www.securityfocus.com/advisories/4742"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-2271",
+      "summary": "Buffer overflow in BigFun 1.51b IRC client, when the Direct Client Connection (DCC) option is used, allows remote attackers to cause a denial of service (crash) via a long string.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": "CWE-119",
+      "references": [
+        "http://www.securiteam.com/exploits/6G003156AE.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10757",
+        "http://www.securiteam.com/exploits/6G003156AE.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10757"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-2272",
+      "summary": "Tomcat 4.0 through 4.1.12, using mod_jk 1.2.1 module on Apache 1.3 through 1.3.27, allows remote attackers to cause a denial of service (desynchronized communications) via an HTTP GET request with a Transfer-Encoding chunked field with invalid values.",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": "CWE-119",
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-12/0045.html",
+        "http://www.securityfocus.com/bid/6320",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10771",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-12/0045.html",
+        "http://www.securityfocus.com/bid/6320"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1372",
+      "summary": "Triactive Remote Manager with Basic authentication enabled stores the username and password in cleartext in registry keys, which could allow local users to gain privileges.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "1999-02-19",
       "modified": null,
       "cwe": null,
-      "references": [],
+      "references": [
+        "http://marc.info/?l=bugtraq&m=91966339502073&w=2",
+        "http://marc.info/?l=bugtraq&m=91966339502073&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0404",
+      "summary": "Directory traversal vulnerability in JavaServer Web Dev Kit (JSWDK) 1.0.1 allows remote attackers to read arbitrary files via a .. (dot dot) in an HTTP request to the WEB-INF directory.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-06-18",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=98583089425166&w=2",
+        "http://marc.info/?l=bugtraq&m=98583089425166&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0408",
+      "summary": "vim (aka gvim) processes VIM control codes that are embedded in a file, which could allow attackers to execute arbitrary commands when another user opens a file containing malicious VIM control codes.",
+      "cvssScore": 5.1,
+      "severity": "Medium",
+      "published": "2001-06-18",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=98593106111968&w=2",
+        "http://www.calderasystems.com/support/security/advisories/CSSA-2001-014.0.txt",
+        "http://www.linux-mandrake.com/en/security/2001/MDKSA-2001-035.php3",
+        "http://www.novell.com/linux/security/advisories/2001_012_vim.html",
+        "http://www.redhat.com/support/errata/RHSA-2001-008.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0409",
+      "summary": "vim (aka gvim) allows local users to modify files being edited by other users via a symlink attack on the backup and swap files, when the victim is editing the file in a world writable directory.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-06-18",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.calderasystems.com/support/security/advisories/CSSA-2001-014.0.txt",
+        "http://www.novell.com/linux/security/advisories/2001_012_vim.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6628",
+        "http://www.calderasystems.com/support/security/advisories/CSSA-2001-014.0.txt",
+        "http://www.novell.com/linux/security/advisories/2001_012_vim.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0410",
+      "summary": "Buffer overflow in Trend Micro Virus Buster 2001 8.02 allows remote attackers to cause a denial of service, and possibly execute arbitrary commands, via a long \"From\" header.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-06-18",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=98593642520755&w=2",
+        "http://marc.info/?l=bugtraq&m=98593642520755&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-2025",
+      "summary": "SQL injection vulnerability in application_top.php for Zen Cart 1.1.3 before patch 2 may allow remote attackers to execute arbitrary SQL commands via the products_id parameter.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.zen-cart.com/modules/ipb/index.php?showtopic=3731",
+        "http://www.zen-cart.com/modules/mydownloads/viewcat.php?cid=31&orderby=dateD",
+        "http://www.zen-cart.com/modules/ipb/index.php?showtopic=3731",
+        "http://www.zen-cart.com/modules/mydownloads/viewcat.php?cid=31&orderby=dateD"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1093",
+      "summary": "HTML interface for Cisco VPN 3000 Concentrator 2.x.x and 3.x.x before 3.0.3(B) allows remote attackers to cause a denial of service (CPU consumption) via a long URL request.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cisco.com/warp/public/707/vpn3k-multiple-vuln-pub.shtml",
+        "http://www.iss.net/security_center/static/10018.php",
+        "http://www.securityfocus.com/bid/5615",
+        "http://www.cisco.com/warp/public/707/vpn3k-multiple-vuln-pub.shtml",
+        "http://www.iss.net/security_center/static/10018.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1094",
+      "summary": "Information leaks in Cisco VPN 3000 Concentrator 2.x.x and 3.x.x before 3.5.4 allow remote attackers to obtain potentially sensitive information via the (1) SSH banner, (2) FTP banner, or (3) an incorrect HTTP request.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cisco.com/warp/public/707/vpn3k-multiple-vuln-pub.shtml",
+        "http://www.iss.net/security_center/static/10020.php",
+        "http://www.securityfocus.com/bid/5621",
+        "http://www.securityfocus.com/bid/5623",
+        "http://www.securityfocus.com/bid/5624"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0305",
+      "summary": "Windows 95, Windows 98, Windows 2000, Windows NT 4.0, and Terminal Server systems allow a remote attacker to cause a denial of service by sending a large number of identical fragmented IP packets, aka jolt2 or the \"IP Fragment Reassembly\" vulnerability.",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2000-05-19",
+      "modified": null,
+      "cwe": "CWE-399",
+      "references": [
+        "http://www.securityfocus.com/bid/1236",
+        "http://www.securityfocus.com/templates/advisory.html?id=2240",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-029",
+        "http://www.securityfocus.com/bid/1236",
+        "http://www.securityfocus.com/templates/advisory.html?id=2240"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-92708",
+      "summary": "### Impact\n\n`stringify` and `uneval` serialize a typed array by emitting its backing `ArrayBuffer`, not just the view. In the case of a Node `Buffer` object, the backing buffer is a process-wide shared pool, meaning unrelated memory can be serialized into a response that is then sent to the client. For a Node `Buffer` the backing store is Node's **process-wide shared pool**, so serializing a small `Buffer` copies up to 64 KB of unrelated process memory — including bytes from other in-flight requests — into the output. In an SSR framework (SvelteKit, Nuxt) a public page whose `load()` returns a 2-byte `Buffer`, or a small file read with `readFileSync`, ships another user's request body / `Authorization` header in its HTML. Unauthenticated, silent, ~43,000× amplification.\n\nThis is serialization-side, so the `parse`/`unflatten` prototype-pollution and DoS guards do not apply — it fires on every SSR render, not only when parsing untrusted input.\n\n### Workarounds\n\nConvert Node `Buffer` objects to `Uint8Array`:\n\n```diff\npayload = {\n- buffer\n+ buffer: new Uint8Array(buffer)\n}\n```",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": {
+        "cwe_id": "CWE-200",
+        "name": "Exposure of Sensitive Information to an Unauthorized Actor"
+      },
+      "references": [
+        "https://github.com/sveltejs/devalue/security/advisories/GHSA-j22f-vq7h-c4qm",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-92708",
+        "https://github.com/sveltejs/devalue/commit/46dc877b3570dafb1cd3291b9bb48cecef8f7266",
+        "https://github.com/sveltejs/devalue/releases/tag/v5.9.3",
+        "https://github.com/advisories/GHSA-j22f-vq7h-c4qm"
+      ],
+      "vulnerableProducts": [
+        "devalue npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-102925",
+      "summary": "### Impact\n\nThe generated `activate` (bash/zsh) and `activate.fish` scripts interpolate a `shlex.quote`-ed value into a position that quotes it a second time. The extra quotes terminate the quoted run early and leave part of the value parsed as shell code, so a path containing shell metacharacters runs commands when a user sources the activation script.\n\n`activate` is affected through the virtual environment's own path, on the branch that reports a relocated environment:\n\n```sh\necho \"Virtual environment directory __VIRTUAL_ENV__ does not exist!\" >&2\n```\n\nFor a destination named `x'$(id)'y`, `shlex.quote` emits `'x'\"'\"'$(id)'\"'\"'y'`. The inner `\"` closes the enclosing double quote and `$(id)` is left unquoted. Backtick and `;` payloads reach the same result. This branch runs whenever the recorded path is absent, which is the normal case for a virtual environment copied or distributed to another machine.\n\n`activate.fish` is affected through the interpreter's Tcl/Tk library paths:\n\n```fish\nset -gx TCL_LIBRARY '__TCL_LIBRARY__'\n```\n\n`shlex.quote` already returns `'/tcl/(cmd)/lib'`, so the rendered line is `''/tcl/(cmd)/lib''`. fish concatenates the adjacent quoted runs and expands the `(cmd)` left between them. The same doubling also splits a path containing a space into two list elements, corrupting `TCL_LIBRARY` and `TK_LIBRARY`.\n\nThis is the same defect class as GHSA-x78j-v8h9-3j2q, which covered `activate.bat`.\n\n### Patches\n\nFixed in 21.7.13 by moving the placeholders outside the surrounding quotes, so each value keeps only the quoting `shlex.quote` applied. Fix: https://github.com/pypa/virtualenv/pull/3252\n\n### Workarounds\n\nAvoid creating or distributing virtual environments whose path contains `'`, `` ` ``, `$`, `;`, `(` or `)`, and inspect the generated activation script before sourcing one you did not create.",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": {
+        "cwe_id": "CWE-78",
+        "name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      },
+      "references": [
+        "https://github.com/pypa/virtualenv/security/advisories/GHSA-p58f-9548-mpm2",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-102925",
+        "https://github.com/pypa/virtualenv/pull/3252",
+        "https://github.com/pypa/virtualenv/commit/4d5a105ec2a2723b8c7f4571bb68f4f71d01e3f6",
+        "https://github.com/pypa/advisory-database/tree/main/vulns/virtualenv/PYSEC-2026-4013.yaml"
+      ],
+      "vulnerableProducts": [
+        "virtualenv pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-102937",
+      "summary": "`BatchActivator.quote()` returned its input unchanged, the only activator with no escaping at all. `--prompt`, the `VIRTUALENV_PROMPT` environment variable, and the config file all set the prompt, and `activate.bat` writes it straight into `@set \"VAR=value\"`. A prompt containing a double quote closes that string early, and whatever follows runs as live cmd.exe syntax:\n\n```console\n$ virtualenv --prompt 'x\" & calc & \"' venv\n$ venv\\Scripts\\activate.bat\n```\n\nruns `calc` the moment someone activates the environment. Confirmed on a real Windows runner. Anyone who templates a prompt from untrusted input (a CI job using a branch name, a wrapper script deriving an environment name from user input) hands an attacker code execution in the shell of anyone who activates the resulting venv on Windows.\n\nFixed in 21.7.12 by escaping the characters cmd.exe treats as live syntax inside this construct. Fix: https://github.com/pypa/virtualenv/pull/3250",
+      "cvssScore": 7.3,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": {
+        "cwe_id": "CWE-78",
+        "name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      },
+      "references": [
+        "https://github.com/pypa/virtualenv/security/advisories/GHSA-x78j-v8h9-3j2q",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-102937",
+        "https://github.com/pypa/virtualenv/pull/3250",
+        "https://github.com/pypa/virtualenv/commit/d721ff140ce4afdc2a9b76751e4584e25d9fbea6",
+        "https://github.com/pypa/advisory-database/tree/main/vulns/virtualenv/PYSEC-2026-4014.yaml"
+      ],
+      "vulnerableProducts": [
+        "virtualenv pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-102999",
+      "summary": "### Impact\n\nAn attacker who uses this vulnerability can craft a PDF which leads to long runtimes. This requires accessing the embedded files through the dictionary-based API.\n\n### Patches\n\nThis has been fixed in [pypdf==6.19.0](https://github.com/py-pdf/pypdf/releases/tag/6.19.0).\n\n### Workarounds\n\nIf you cannot upgrade yet, consider applying the changes from PR [#4081](https://github.com/py-pdf/pypdf/pull/4081).",
+      "cvssScore": 8.7,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
+      "references": [
+        "https://github.com/py-pdf/pypdf/security/advisories/GHSA-v247-6f48-mgcj",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-102999",
+        "https://github.com/py-pdf/pypdf/pull/4081",
+        "https://github.com/py-pdf/pypdf/commit/6b10556d13609a68f9ed18bb29fdd8bba88eb2c3",
+        "https://github.com/py-pdf/pypdf/releases/tag/6.19.0"
+      ],
+      "vulnerableProducts": [
+        "pypdf pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-102998",
+      "summary": "### Impact\n\nAn attacker who uses this vulnerability can craft a PDF which leads to long runtimes. This requires updating form field values with flattening enabled, which triggers appearance stream generation.\n\n### Patches\n\nThis has been fixed in [pypdf==6.19.0](https://github.com/py-pdf/pypdf/releases/tag/6.19.0).\n\n### Workarounds\n\nIf you cannot upgrade yet, consider applying the changes from PR [#4087](https://github.com/py-pdf/pypdf/pull/4087).",
+      "cvssScore": 8.7,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
+      "references": [
+        "https://github.com/py-pdf/pypdf/security/advisories/GHSA-php9-fj8v-98fj",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-102998",
+        "https://github.com/py-pdf/pypdf/pull/4087",
+        "https://github.com/py-pdf/pypdf/commit/959467a9b95be83e2dc5ae873ece5f371263ede7",
+        "https://github.com/py-pdf/pypdf/releases/tag/6.19.0"
+      ],
+      "vulnerableProducts": [
+        "pypdf pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-103000",
+      "summary": "### Impact\n\nAn attacker who uses this vulnerability can craft a PDF which leads to large memory consumption. This requires accessing the page labels of a document with large alphabetical labels.\n\n### Patches\n\nThis has been fixed in [pypdf==6.19.0](https://github.com/py-pdf/pypdf/releases/tag/6.19.0).\n\n### Workarounds\n\nIf you cannot upgrade yet, consider applying the changes from PR [#4096](https://github.com/py-pdf/pypdf/pull/4096).",
+      "cvssScore": 8.7,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
+      "references": [
+        "https://github.com/py-pdf/pypdf/security/advisories/GHSA-w23x-9jrw-r45c",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-103000",
+        "https://github.com/py-pdf/pypdf/pull/4096",
+        "https://github.com/py-pdf/pypdf/commit/0d8b5a8832cde1ba308b5c27567b879b7b7eed4a",
+        "https://github.com/py-pdf/pypdf/releases/tag/6.19.0"
+      ],
+      "vulnerableProducts": [
+        "pypdf pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-87910",
+      "summary": "When tarfile extracts a link on a system that doesn't support links, it falls back to extracting a member from the archive. In this case, the filter function is run twice: once for the extracted member, and once with name set to the location of the link. For one of the calls, the return value was ignored. Instead, the member should be skipped if either call returns None.",
+      "cvssScore": null,
+      "severity": "Medium",
+      "published": "2026-09-11",
+      "modified": "2026-10-02",
+      "cwe": "CWE-22",
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-87910",
+        "https://github.com/python/cpython/issues/157265",
+        "https://github.com/python/cpython/pull/157266",
+        "https://github.com/python/cpython/commit/2eb0c2f1dc71847731b6ab30aebefd058d482a7f",
+        "https://github.com/python/cpython/commit/3105a3498aaf681ce128cf5baf83c2e5574267c5"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0165",
+      "summary": "LogWatch 2.5 allows local users to gain root privileges via a symlink attack, a different vulnerability than CVE-2002-0162.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2002-04-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://list.kaybee.org/archives/logwatch-announce/2002-March/000003.html",
+        "http://marc.info/?l=bugtraq&m=101787227513000&w=2",
+        "http://www.iss.net/security_center/static/8652.php",
+        "http://list.kaybee.org/archives/logwatch-announce/2002-March/000003.html",
+        "http://marc.info/?l=bugtraq&m=101787227513000&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0051",
+      "summary": "Windows 2000 allows local users to prevent the application of new group policy settings by opening Group Policy files with exclusive-read access.",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2002-04-04",
+      "modified": null,
+      "cwe": "CWE-667",
+      "references": [
+        "http://online.securityfocus.com/archive/1/244329",
+        "http://www.securityfocus.com/bid/4438",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-016",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A38",
+        "http://online.securityfocus.com/archive/1/244329"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-1011",
+      "summary": "Buffer overflow in catopen() function in FreeBSD 5.0 and earlier, and possibly other OSes, allows local users to gain root privileges via a long environmental variable.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2000-12-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-00:53.catopen.asc",
+        "http://www.osvdb.org/6070",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5638",
+        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-00:53.catopen.asc",
+        "http://www.osvdb.org/6070"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1455",
+      "summary": "Multiple cross-site scripting (XSS) vulnerabilities in OmniHTTPd allow remote attackers to insert script or HTML into web pages via (1) test.php, (2) test.shtml, or (3) redir.exe.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2003-06-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-08/0263.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-08/0264.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-08/0266.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-08/0263.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-08/0264.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1456",
+      "summary": "Buffer overflow in mIRC 6.0.2 and earlier allows remote attackers to execute arbitrary code via a long $asctime value.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-06-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0092.html",
+        "http://marc.info/?l=bugtraq&m=103046375002380&w=2",
+        "http://marc.info/?l=ntbugtraq&m=103046138631893&w=2",
+        "http://www.mirc.co.uk/whatsnew.txt",
+        "http://www.securityfocus.com/bid/5576"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1457",
+      "summary": "SQL injection vulnerability in search.php for L-Forum 2.40 allows remote attackers to execute arbitrary SQL statements via the search parameter.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-06-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0074.html",
+        "http://www.iss.net/security_center/static/9837.php",
+        "http://www.securityfocus.com/bid/5468",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0074.html",
+        "http://www.iss.net/security_center/static/9837.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1458",
+      "summary": "Cross-site scripting vulnerability in L-Forum 2.40 and earlier, when the \"Enable HTML in messages\" option is on, allows remote attackers to insert arbitrary script or HTML via message fields including (1) From, (2) E-Mail, (3) Subject and (4) Body.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-06-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-08/0115.html",
+        "http://sourceforge.net/tracker/download.php?group_id=53716&atid=471343&file_id=26687&aid=579278",
+        "http://www.iss.net/security_center/static/9838.php",
+        "http://www.securityfocus.com/bid/5462",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-08/0115.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0870",
+      "summary": "KDE Konqueror does not prevent cookies that are sent over an insecure channel (HTTP) from also being sent over a secure channel (HTTPS/SSL) in the same domain, which could allow remote attackers to steal cookies and conduct unauthorized activities, aka \"Cross Security Boundary Cookie Injection.\"",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-09-16",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://securityfocus.com/archive/1/375407",
+        "http://securitytracker.com/id?1011330",
+        "http://www.westpoint.ltd.uk/advisories/wp-04-0001.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17417",
+        "http://securityfocus.com/archive/1/375407"
+      ],
       "vulnerableProducts": [],
       "isExploited": false
     }

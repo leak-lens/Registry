@@ -5,906 +5,818 @@
   "pagination": {
     "page": 188,
     "pageSize": 50,
-    "totalPages": 268,
-    "totalItems": 13390,
+    "totalPages": 269,
+    "totalItems": 13411,
     "hasNextPage": true,
     "hasPrevPage": true
   },
   "cves": [
     {
-      "id": "CVE-2026-58271",
-      "summary": "**Affected component:** Sync-in Server v2.3.0, `POST /api/app/sync/register`.\n\n**Required attacker capability:** Valid login and password for a TOTP-enabled account with desktop sync permission.\n\n## Summary\n\n`POST /api/app/sync/register` accepts credentials and a TOTP code to register a desktop sync client. In the vulnerable version, on a failed TOTP attempt, `SyncClientsManager.register()` called `updateAccesses(user, ip, false)`, which hit a freeze branch that wrote `passwordAttempts` back unchanged. The counter never reached `USER_MAX_PASSWORD_ATTEMPTS` (10), so the account lockout gate never fired for repeated TOTP failures through this endpoint.\n\nA successful TOTP guess registers a sync client and returns a `{clientId, clientToken}` pair, provided the account has the required desktop app permission and the registration payload is valid. The token can then be exchanged via `POST /api/app/sync/auth/cookie` for an authenticated session. While the guessed TOTP code is still valid, and because the attacker already knows the password, the attacker can also call `POST /api/auth/2fa/disable` to remove MFA.\n\n## Details\n\nThe endpoint is declared at `sync.controller.ts` line 71. `@AuthTokenSkip()` bypasses the bearer-token guard, so the route is reachable without any prior session:\n```typescript\n@Post(SYNC_ROUTE.REGISTER)\n@AuthTokenSkip()\nregister(@Body() syncClientRegistrationDto: SyncClientRegistrationDto, @Req() req: FastifyRequest): Promise<SyncClientAuthRegistration> {\n  return this.syncClientsManager.register(syncClientRegistrationDto, req.ip)\n}\n```\nInside `SyncClientsManager.register()`, after both the TOTP code and the recovery code are rejected, the handler fires a fire-and-forget access update and throws (`sync-clients-manager.service.ts` line 73):\n```typescript\nthis.usersManager.updateAccesses(user, ip, false).catch((e: Error) => this.logger.error({ tag: this.register.name, msg: `${e}` }))\nthrow new HttpException(authCode.message, HttpStatus.UNAUTHORIZED)\n```\n\nIn the vulnerable version, `updateAccesses()` at `users-manager.service.ts` line 182 defaulted `isAuthTwoFa` to `false`:\n\n```typescript\nasync updateAccesses(user: UserModel, ip: string, success: boolean, isAuthTwoFa = false) {\n  let passwordAttempts: number\n  if (!isAuthTwoFa && configuration.auth.mfa.totp.enabled && user.twoFaEnabled) {\n    passwordAttempts = user.passwordAttempts\n  } else {\n    passwordAttempts = success ? 0 : Math.min(user.passwordAttempts + 1, USER_MAX_PASSWORD_ATTEMPTS)\n  }\n  await this.usersQueries.updateUserOrGuest(user.id, {\n    ...\n    passwordAttempts: passwordAttempts,\n    isActive: user.isActive && passwordAttempts < USER_MAX_PASSWORD_ATTEMPTS\n  })\n}\n```\n\nWhen `register()` called `updateAccesses(user, ip, false)`, `isAuthTwoFa` defaulted to `false`. The condition on line 184 evaluated to `true` when TOTP was enabled site-wide and the account had it active. The `else` branch with `Math.min(user.passwordAttempts + 1, ...)` was never reached. `passwordAttempts` was written back unchanged, and the lockout gate in `validateUserAccess()` at line 89 never fired for repeated TOTP failures through this endpoint.\n\nThe freeze was designed for the web login flow, where a correct password at `POST /api/auth/login` produces a partial session and the counter should be preserved until `POST /api/auth/2fa/login/verify` completes. That route calls `authProvider2FA.verify(body, req, true)`, which passes `isAuthTwoFa=true` into `updateAccesses()` and correctly increments on 2FA failure. The `register()` endpoint reused `updateAccesses()` for an outright TOTP rejection while passing the default `isAuthTwoFa=false`, triggering the freeze incorrectly.\n\nThe same freeze also applied to `logUser()` (`users-manager.service.ts` line 69), called by both `POST /api/auth/login` and `POST /api/auth/token`. On a wrong password for a 2FA-enabled account, `updateAccesses(user, ip, false)` was called without an `isAuthTwoFa` argument, so the freeze fired and `passwordAttempts` was preserved rather than incremented.\n\n## PoC\n\nFirst, create a test account with TOTP MFA enabled and desktop sync permission. Then run the following:\n\n[poc_totp_bruteforce.py](https://github.com/user-attachments/files/28857878/poc_totp_bruteforce.py)\n\n```bash\n$ python3 poc_totp_bruteforce.py --url http://192.168.16.132:8080 --user mfatest --password 'Str0ngP@ss99!' --concurrency 4 --batch 100\n```\n\nExample output:\n\n```text\n[*] Target      : http://192.168.16.132:8080\n[*] Account     : mfatest\n[*] Concurrency : 4\n\n[*] Step 1: Confirming credentials and 2FA status...\n[+] Credentials valid, 2FA active.\n\n[*] Step 2: Brute-forcing TOTP codes (4 workers)...\n  Ranges: W0=000000-250000, W1=250000-500000, W2=500000-750000, W3=750000-1000000\n  [W2]   1,100 total | 11.3 req/s | retries: 0\n      <snip>\n  [W1] 195,400 total | 11.0 req/s | retries: 0\n\n[*] Step 3: Results\n  Total attempts : 195,907\n  Time elapsed   : 17769.5s (296.2min)\n  Average RPS    : 11.0\n\n[+] VALID TOTP CODE FOUND : 026961\n[+] clientId              : 13951b88-03d4-4854-8a29-cd8921d73d82\n[+] clientToken           : c92ef5ca-7432-44d0-8a94-56398bfe4117\n\n[*] Step 4: Confirming access and attempting to disable 2FA...\n  [+] Authenticated as : mfatest (id=3, role=1)\n      passwordAttempts : 0\n  [+] 2FA DISABLED. Account 'mfatest' now accessible with password alone.\n```\n\n**Measured observations:**\n\n- No account lockout was observed across 195,907 failed TOTP attempts in this test against the vulnerable version.\n- The `clientToken` was exchanged for an authenticated session.\n- MFA was disabled via `POST /api/auth/2fa/disable` while the guessed TOTP code was still valid and because the attacker already knew the account password.\n\n## Impact\n\nAn attacker who already knows valid credentials for a TOTP-enabled account with desktop sync permission can brute-force the second factor through `POST /api/app/sync/register` without triggering account lockout.\n\nWith `drift: 1`, 3 of 1,000,000 six-digit codes are valid per 30-second window (`p = 3/1,000,000`), giving an expected 333,333 attempts to find a valid code.\n\nAt 3 r/s, measured against a default single-worker deployment:\n\n| Success probability | Attempts | Time at 3 r/s |\n|---|---:|---:|\n| 50% | 231,049 | 21.4 h |\n| 90% | 767,528 | 71.1 h |\n| 95% | 998,577 | 92.5 h |\n| 99% | 1,535,056 | 142.1 h |\n| Expected (mean) | 333,333 | 30.9 h |\n\nDeployments with `server.workers > 1` may allow higher throughput, depending on CPU capacity and other bottlenecks. Throughput is heavily influenced by server-side password verification cost, worker count, database latency, and deployment limits, not only by the attacker's network speed.\n\n## Remediation\n\nAdd `&& success` to the freeze condition at `users-manager.service.ts` line 184:\n\n```typescript\n// Before\nif (!isAuthTwoFa && configuration.auth.mfa.totp.enabled && user.twoFaEnabled) {\n\n// After\nif (!isAuthTwoFa && configuration.auth.mfa.totp.enabled && user.twoFaEnabled && success) {\n```\n\nThe freeze still applies when a password succeeds but 2FA is pending, which was its intended purpose. A failed TOTP at `register()` and a failed password at `login`/`token` both fall through to the increment path, restoring lockout after 10 failures.\n\nFor defense-in-depth, apply an IP and/or account-based rate limiter to `POST /api/app/sync/register` and other pre-auth credential endpoints.",
+      "id": "CVE-2026-74915",
+      "summary": "A web page that contains unusual WebGPU content loaded into the GPU GLES render process can trigger a OOB read and/or write crash in the GPU GLES user-space shared library. On certain platforms, when the process executing graphics workload has system privileges this could enable further exploits on the device.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-74915",
+        "https://www.imaginationtech.com/gpu-driver-vulnerabilities"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-76030",
+      "summary": "Memory corruption in FileSystem in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-76030",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/572269631"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-118475",
+      "summary": "A flaw was found in Eye of GNOME. When parsing a specially crafted PNG image containing malformed color profile metadata, the application fails to validate chunk boundaries while searching for a null terminator. An attacker could trick a user into opening a malicious image, causing the application to read past the allocated buffer. This issue can lead to an application crash, resulting in a Denial of Service (DoS), or potentially expose sensitive memory contents.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-118475",
+        "https://access.redhat.com/security/cve/CVE-2026-118475",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2562716",
+        "https://gitlab.gnome.org/GNOME/eog/-/commit/04e4f313421eacb9fc529781542bb7fb81a3cd1a"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-76031",
+      "summary": "Use after free in Input in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-76031",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/572556403"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-19199",
+      "summary": "Software installed and run as a non-privileged user may conduct improper system calls to allocate physical memory. A 32-bit integer overflow in the KM driver during page-to-byte conversion of an allocation size can result in an undersized kernel buffer allocation. This may allow unallocated or previously allocated physical pages to be mapped into an attacker-controlled GPU MMU context, leading to disclosure of sensitive kernel data.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-19199",
+        "https://www.imaginationtech.com/gpu-driver-vulnerabilities"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-112922",
+      "summary": "A flaw was found in Ghostscript. A remote attacker could exploit this vulnerability by enticing a user to process a specially crafted PDF or PostScript document containing malicious mesh shading data. Due to improper bounds validation during the processing of indexed color values, Ghostscript triggers an out-of-bounds memory read. Successful exploitation can lead to a Denial of Service (DoS) through an application crash or result in limited information disclosure.",
+      "cvssScore": 3.2,
+      "severity": "Low",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112922",
+        "https://access.redhat.com/security/cve/CVE-2026-112922",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2463016"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-65586",
+      "summary": "Software installed and run as a non-privileged user may conduct improper GPU system calls to free memory in still in use, replace with another allocation and cause arbitrary memory reads or writes to physical memory pages.\n\nA memory buffer managed by a CPU thread of control (driver) and accessed by a GPU thread of control (firmware) can be freed while in use. Software installed and run as a non-privileged user may replace that buffer with another and replace a shared resource (memory page address list) managed by the CPU thread of control (driver) leading to the GPU accessing memory not managed by the CPU thread of control (driver).",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-65586",
+        "https://www.imaginationtech.com/gpu-driver-vulnerabilities"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-76029",
+      "summary": "Memory corruption in Network in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-76029",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/572055997"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-74912",
+      "summary": "On GPU systems with the security vulnerability fix for CVE-2026-49746 applied, the mapping range of graphics buffers is limited which causes errors when the mapping outside of that range.\n\nInteger truncation caused when mapping GPU buffer pages in the buffer’s range 0GB - 4GB, produces error and limits the functionality of the kernel mode driver.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-74912",
+        "https://www.imaginationtech.com/gpu-driver-vulnerabilities"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-65584",
+      "summary": "Software installed and run as a non-privileged user may conduct improper GPU system calls causing a stack overflow in the kernel. The overflow occurs when processing resolved Linux/Android fence synchronization checkpoints, while user checkpoints are excluded from the stack array. Successful exploitation can cause kernel memory corruption and typically results in a denial-of-service condition through a kernel crash.\n\nThe code vulnerability is a buffer write beyond the allocated array on the stack caused by copying excessive data from an internal buffer.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-65584",
+        "https://www.imaginationtech.com/gpu-driver-vulnerabilities"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-15466",
+      "summary": "Software installed and run as a non-privileged user may conduct improper GPU system calls to cause race condition in hardware performance counters buffer’s destruction path leading to read and/or write UAF.\n\nThe race condition in the destruction path could lead to reference counter being decremented in non-atomical way allowing other code paths using a freed object to read and/or write kernel heap memory.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-15466",
+        "https://www.imaginationtech.com/gpu-driver-vulnerabilities"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-65587",
+      "summary": "A web page that contains unusual WebGPU content loaded into the GPU GLES render process can trigger an OOB write in the GPU user-space driver, leading to memory corruption and possible browser/GPU process crash.\n\nThe software writes data past the end of an intended memory offset. Writing outside the bounds of allocated memory can corrupt adjacent memory, crash the process, or cause undefined behaviour.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-65587",
+        "https://www.imaginationtech.com/gpu-driver-vulnerabilities"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-91920",
+      "summary": "A flaw was found in the ChunkReader component of the Undertow web server, which is used to handle chunked transfer encoding in HTTP requests. The issue occurs because a security check for the chunk size is performed before the value is shifted, allowing a specifically crafted 15-digit chunk size to bypass the limit and overflow into internal state flags. This can cause the server to terminate a request body prematurely and interpret the remaining data as a separate, smuggled request.",
+      "cvssScore": 6.4,
+      "severity": "Medium",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-91920",
+        "https://access.redhat.com/security/cve/CVE-2026-91920",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2528758"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-18629",
+      "summary": "A web page that contains unusual GPU shader code is loaded into the GPU compiler process and can lead memory allocation failure. If the allocation failure is not properly handled, the compiler may dereference a NULL pointer at a controlled offset, resulting in a crash of the compiler process. On certain platforms, when the compiler process has system privileges this could lead to crashes or enable further exploits on the device.\n\nThe weakness results from performing arithmetic operations on values derived from the shader program without properly preventing integer overflow. The overflow can cause incorrect memory size calculations, leading to memory allocation failures and subsequent invalid program behaviour. Integer overflow can produce unexpected values that affect memory allocation and other security-relevant operations.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-18629",
+        "https://www.imaginationtech.com/gpu-driver-vulnerabilities"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-76027",
+      "summary": "Memory corruption in CacheStorage in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to read memory via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-76027",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/568894475"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-76025",
+      "summary": "Use after free in FileSystem in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-76025",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/559780982"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119265",
+      "summary": "Memory corruption in Quota in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119265",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/575201795"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119271",
+      "summary": "Use after free in Skia in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119271",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/577403270"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119263",
+      "summary": "Memory corruption in GarbageCollection in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code outside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119263",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/575143870"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119272",
+      "summary": "Out of bounds read in FileSystem in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to read memory inside the sandbox via a crafted HTML page. (Chromium security severity: Medium)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119272",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/569012543"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-76024",
+      "summary": "Memory corruption in MediaStream in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially read memory inside the sandbox via a crafted HTML page. (Chromium security severity: Critical)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-76024",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/576215540"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119270",
+      "summary": "Improper input validation in CacheStorage in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119270",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/577333729"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119267",
+      "summary": "Memory corruption in DOM in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119267",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/576203565"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-76028",
+      "summary": "Use after free in FileSystem in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-76028",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/569012015"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119262",
+      "summary": "Improper input validation in V8 in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119262",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/574660146"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119269",
+      "summary": "Use after free in Blink in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119269",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/577072000"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119266",
+      "summary": "Use after free in Quota in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119266",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/575202553"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119264",
+      "summary": "Memory corruption in Dawn in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119264",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/575150692"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-76026",
+      "summary": "Memory corruption in Autofill in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-76026",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/567673200"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119268",
+      "summary": "Integer overflow in Editing in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119268",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/576984708"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-112605",
+      "summary": "This issue was addressed with improved handling of symlinks. This issue is fixed in Xcode 27.2. An app may be able to read arbitrary files.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112605",
+        "https://support.apple.com/en-us/149589"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-110133",
+      "summary": "A flaw was found in Ghostscript. When processing a specially crafted TrueType font or document embedding one, an accounting error during font rendering can bypass buffer size checks, triggering a heap-based buffer overflow. A remote attacker could exploit this by enticing a victim or automated service to open the malicious content, potentially resulting in a Denial of Service (DoS) crash or arbitrary code execution.",
+      "cvssScore": 2,
+      "severity": "Low",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-110133",
+        "https://access.redhat.com/security/cve/CVE-2026-110133",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2461973"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-115943",
+      "summary": "Spreadsheet::XLSX versions before 0.19 for Perl allow code execution via string eval of number format conditions in ExcelFmt.\n\nWhen a number format has a condition such as [>100], ExcelFmt chooses the format section by passing the condition and the cell value to a string eval. Both come from the workbook, and the eval runs while Spreadsheet::XLSX->new parses it.\n\nAn attacker who supplies an XLSX file can run arbitrary Perl code.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-115943",
+        "https://metacpan.org/release/ASB/Spreadsheet-XLSX-0.19/changes",
+        "http://www.openwall.com/lists/oss-security/2026/10/30/3"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-112602",
+      "summary": "An authorization issue was addressed with improved state management. This issue is fixed in Xcode 27.2. An app may be able to access sensitive user data.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112602",
+        "https://support.apple.com/en-us/149589"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119261",
+      "summary": "Improper input validation in Skia in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to potentially execute arbitrary code outside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119261",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/574213633"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-118959",
+      "summary": "A flaw was found in the required action provider mechanism of Keycloak. The issue occurs when an authorization request includes the kc_action query parameter set to a mandatory action already assigned to the user, such as profile verification or terms and conditions. Due to incorrect handling of application-initiated actions, Keycloak may skip these mandatory challenges and issue an authorization code. This can allow a user to bypass administrative requirements and gain access to the application without completing necessary profile updates or agreeing to terms.",
+      "cvssScore": 4.2,
+      "severity": "Medium",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-118959",
+        "https://access.redhat.com/security/cve/CVE-2026-118959",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2563288"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-118947",
+      "summary": "A flaw was found in the UMA resource registration endpoint of the keycloak-services component, which provides the core logic for Keycloak's authorization and identity services. The issue occurs when remote resource management is enabled, allowing an authenticated user with specific permissions to update resources they do not own by providing a target resource ID in a request. This can lead to unauthorized modification of resource configurations, such as names, URIs, and scopes.",
+      "cvssScore": 4.2,
+      "severity": "Medium",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-118947",
+        "https://access.redhat.com/security/cve/CVE-2026-118947",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2563274"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-119260",
+      "summary": "Use after free in Frames in Google Chrome prior to 156.0.8078.79 allowed a remote attacker to execute arbitrary code inside the sandbox via a crafted HTML page. (Chromium security severity: High)",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-30",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-119260",
+        "https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_02107719452.html",
+        "https://issues.chromium.org/issues/573264074"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-98432",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nipv4: free inet_opt and ireq_opt after an RCU grace period\n\ntcp_v4_syn_recv_sock() transfers ownership of ireq->ireq_opt to the\nchild socket (newinet->inet_opt) without copying it.\n\nAnother cpu can concurrently process a retransmitted SYN for the same\nrequest socket, and send a SYNACK from tcp_check_req().\ntcp_v4_send_synack() and inet_csk_route_req() read ireq->ireq_opt\nunder rcu_read_lock() only, and ip_build_and_send_pkt() and\nip_options_build() then read opt->optlen twice.\n\nNote that the SYNACK timer itself is not an issue: it holds a\nreference on its request socket, and inet_csk_reqsk_queue_drop()\ncalls timer_delete_sync() before the child can be freed.\n\nSince commit 079096f103fa (\"tcp/dccp: install syn_recv requests\ninto ehash table\"), request sockets are processed without holding\nthe listener lock, so nothing prevents the child socket from being\nfreed while the SYNACK is still being built. TCP child sockets do\nnot have SOCK_RCU_FREE, and inet_sock_destruct() frees inet_opt\nwith a plain kfree(), leading to a use-after-free in\nip_options_build().\n\nA similar issue exists with request socket migration\n(net.ipv4.tcp_migrate_req=1, or a BPF_SK_REUSEPORT_SELECT_OR_MIGRATE\nprogram). reqsk_timer_handler() clones the request socket with\ninet_reqsk_clone(), so that the old request socket and its clone\nshare the same ireq_opt, then reqsk_migrate_reset() clears the\npointer in the old one. Another cpu holding a reference on the old\nrequest socket can still be using these options (sending a SYNACK,\nor creating a child in tcp_v4_syn_recv_sock()) when the clone is\nfreed, and tcp_v4_reqsk_destructor() also uses a plain kfree().\n\nReaders already use RCU, and other paths replacing inet_opt\n(do_ip_setsockopt(), cipso_v4_sock_setattr()...) already use\nkfree_rcu(). Use kfree_rcu() in inet_sock_destruct() and\ntcp_v4_reqsk_destructor() as well.\n\nIPv6 is not affected by the first issue, because tcp_v6_syn_recv_sock()\nduplicates the options. tcp_v6_reqsk_destructor() has the same\nmigration issue with ipv6_opt, which is only set by CALIPSO. This\nwill be addressed in a separate patch.",
+      "cvssScore": 8.1,
+      "severity": "High",
+      "published": "2026-10-15",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-98432",
+        "https://git.kernel.org/stable/c/11a03ce3c4a62d84c10ccdfe47f8075006498568",
+        "https://git.kernel.org/stable/c/26d4c36d318cffbbd160884a0e4cec0da4da4936",
+        "https://git.kernel.org/stable/c/742f73df544e03744f2981c467d6542fe8172a2a",
+        "https://git.kernel.org/stable/c/89b5b1eb7d633c33832b7ff2c02e19a144705036"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-11822",
+      "summary": "SQLite before 3.53.2 contains memory corruption vulnerabilities in the FTS5 full-text search extension that allow attackers to cause process crashes, memory exhaustion, or arbitrary code execution by supplying a crafted database with malformed FTS5 page data. Attackers can trigger an out-of-bounds read in fts5LeafSeek() via an attacker-controlled loop bound and a heap buffer overflow write in fts5ChunkIterate() through a crafted continuation page causing an integer underflow, exploitable when an FTS5 MATCH query is executed against the malicious database.",
+      "cvssScore": 6.1,
+      "severity": "Medium",
+      "published": "2026-06-09",
+      "modified": "2026-10-30",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-11822",
+        "https://cert-portal.siemens.com/productcert/html/ssa-765416.html",
+        "https://sqlite.org/releaselog/3_53_2.html",
+        "https://sqlite.org/src/info/061febcf41ca",
+        "https://sqlite.org/src/info/4a5ad516ea93"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-2215",
+      "summary": "The imap_header function in the IMAP functionality for PHP before 4.3.0 allows remote attackers to cause a denial of service via an e-mail message with a large number of \"To\" addresses, which triggers an error in the rfc822_write_address function.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://bugs.php.net/bug.php?id=19280",
+        "https://bugzilla.redhat.com/bugzilla/show_bug.cgi?id=175040",
+        "http://bugs.php.net/bug.php?id=19280",
+        "https://bugzilla.redhat.com/bugzilla/show_bug.cgi?id=175040"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-2233",
+      "summary": "Unknown \"front page vulnerability with Moodle servers\" for Moodle before 1.3.2 has unknown impact and attack vectors.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://moodle.org/doc/?file=releaseold.html",
+        "http://secunia.com/advisories/12045",
+        "http://www.osvdb.org/7710",
+        "http://www.securityfocus.com/bid/10697",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16662"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0096",
+      "summary": "The installation of Geeklog 1.3 creates an extra group_assignments record which is not properly deleted, which causes the first newly created user to be added to the GroupAdmin and UserAdmin groups, which could provide that user with administrative privileges that were not intended.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2002-03-25",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://geeklog.sourceforge.net/index.php?topic=Security",
+        "http://www.iss.net/security_center/static/7780.php",
+        "http://www.securityfocus.com/archive/1/248367",
+        "http://www.securityfocus.com/bid/3783",
+        "http://geeklog.sourceforge.net/index.php?topic=Security"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0448",
+      "summary": "Portmon 1.7 and possibly earlier versions allows local users to read and write arbitrary files via the (1) -c (host file) or (2) -l (log file) command line options.",
+      "cvssScore": 3.6,
+      "severity": "Low",
+      "published": "2003-07-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=105588111714856&w=2",
+        "http://marc.info/?l=bugtraq&m=105588111714856&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0460",
+      "summary": "Buffer overflow in KDE kdesud on Linux allows local uses to gain privileges via a long DISPLAY environmental variable.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2000-05-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0353.html",
+        "http://www.securityfocus.com/bid/1274",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0353.html",
+        "http://www.securityfocus.com/bid/1274"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0456",
+      "summary": "NetBSD 1.4.2 and earlier allows local users to cause a denial of service by repeatedly running certain system calls in the kernel which do not yield the CPU, aka \"cpu-hog\".",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2000-05-28",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.netbsd.org/pub/NetBSD/misc/security/advisories/NetBSD-SA2000-005.txt.asc",
+        "http://www.osvdb.org/1365",
+        "http://www.securityfocus.com/bid/1272",
+        "ftp://ftp.netbsd.org/pub/NetBSD/misc/security/advisories/NetBSD-SA2000-005.txt.asc",
+        "http://www.osvdb.org/1365"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1464",
+      "summary": "Cross-site scripting (XSS) vulnerability in CafeLog b2 Weblog Tool allows remote attackers to insert arbitrary HTML or script via the GPC variable.",
       "cvssScore": 6.8,
       "severity": "Medium",
-      "published": "2026-09-22",
-      "modified": "2026-09-22",
-      "cwe": {
-        "cwe_id": "CWE-307",
-        "name": "Improper Restriction of Excessive Authentication Attempts"
-      },
+      "published": "2003-04-22",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/Sync-in/server/security/advisories/GHSA-274f-6w77-8qm9",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-58271",
-        "https://github.com/Sync-in/server/pull/228",
-        "https://github.com/Sync-in/server/commit/b13a4aad5c2b38fe8231a0d007cd08a086ec5bdb",
-        "https://github.com/Sync-in/server/releases/tag/v2.4.0"
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0071.html",
+        "http://online.securityfocus.com/archive/1/287228",
+        "http://www.iss.net/security_center/static/9835.php",
+        "http://www.securityfocus.com/bid/5455",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0071.html"
       ],
-      "vulnerableProducts": [
-        "@sync-in/server npm"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-61647",
-      "summary": "## Summary\n\nThe `vault_batch` MCP tool (and the equivalent `POST /batch-to-vault` HTTP endpoint) accepted a caller-supplied `vault_dir` path that was passed directly to `path.resolve()` + `fs.mkdir()` with no containment check. A caller — or a prompt-injected LLM driving the MCP — could therefore create directories and write `.md` / `.json` answer files anywhere the server process can write.\n\nThe `slug_prefix` parameter had a parallel, smaller traversal vector: it was concatenated into the filename without sanitization, so a prefix containing `/` or `..` could escape the resolved vault directory through the filename component.\n\n## Impact\n\nFile write (markdown + JSON sidecars) to any location writable by the server process. The written files are inert content (no code execution by themselves), but in a multi-user context — or when the MCP server is driven by an LLM that has read untrusted content (prompt injection) — this allows an attacker to plant files in sensitive locations (autostart folders, shell startup files, etc.) for downstream exploitation.\n\nThe vulnerability exists from **v1.6.0** (when the HTTP `/batch-to-vault` endpoint was introduced) and v1.7.0 (when the same logic was exposed as the `batch_to_vault` MCP tool) through **v2.0.2**.\n\n## Patch\n\nFixed in **v2.0.3**:\n\n- **Opt-in containment via `NOTEBOOKLM_VAULT_ROOT` env var.** When set, `vault_dir` is resolved relative to that root and `realpath`-based containment is enforced. Absolute paths or `..` segments outside the root are rejected with a clear error.\n- **`slug_prefix` is always sanitized.** Path separators (`/`, `\\`), `..` sequences and NUL bytes are stripped, length capped at 64 characters. This applies regardless of whether `NOTEBOOKLM_VAULT_ROOT` is set.\n- 15 unit tests in `src/__tests__/vault-writer.test.ts` cover the escape vectors (absolute paths, sibling-prefix attacks, `..` traversal, NUL/separator stripping).\n\n## Workarounds for users who cannot upgrade\n\n- Run the MCP server under a dedicated unprivileged user with write access only to the intended vault directory.\n- Do not expose the HTTP `/batch-to-vault` endpoint beyond localhost.\n- If using an LLM that ingests untrusted content, validate any `vault_dir` arguments before forwarding them to the MCP.\n\n## Configuration requirement after upgrade (important)\n\nv2.0.3 preserves the legacy unrestricted behaviour when `NOTEBOOKLM_VAULT_ROOT` is **unset**, to keep existing single-user local setups working. **To enable containment, set `NOTEBOOKLM_VAULT_ROOT` in the server environment** to a directory that should bound all vault writes.\n\n## Credit\n\nReported by @mcfly-zzh — thanks for the careful diagnosis and follow-up verification.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-09-22",
-      "modified": "2026-09-22",
-      "cwe": {
-        "cwe_id": "CWE-22",
-        "name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
-      },
-      "references": [
-        "https://github.com/roomi-fields/notebooklm-mcp/security/advisories/GHSA-jjhp-8crj-mppq",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-61647",
-        "https://github.com/roomi-fields/notebooklm-mcp/issues/15",
-        "https://github.com/roomi-fields/notebooklm-mcp/commit/13828d9ff3933839ce14c1797d3b20a6bb7694a6",
-        "https://github.com/roomi-fields/notebooklm-mcp/releases/tag/v2.0.3"
-      ],
-      "vulnerableProducts": [
-        "@roomi-fields/notebooklm-mcp npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0346",
-      "summary": "Cross-site scripting vulnerability in Cobalt RAQ 4 allows remote attackers to execute arbitrary script as other Cobalt users via Javascript in a URL to (1) service.cgi or (2) alert.cgi.",
+      "id": "CVE-2002-1850",
+      "summary": "mod_cgi in Apache 2.0.39 and 2.0.40 allows local users and possibly remote attackers to cause a denial of service (hang and memory consumption) by causing a CGI script to send a large amount of data to stderr, which results in a read/write deadlock between httpd and the CGI script.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2002-06-25",
+      "published": "2002-12-31",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-667",
       "references": [
-        "http://marc.info/?l=bugtraq&m=101495944202452&w=2",
-        "http://www.iss.net/security_center/static/8321.php",
-        "http://www.securityfocus.com/bid/4211",
-        "http://marc.info/?l=bugtraq&m=101495944202452&w=2",
-        "http://www.iss.net/security_center/static/8321.php"
+        "http://cvs.apache.org/viewcvs.cgi/httpd-2.0/modules/generators/mod_cgi.c?r1=1.148.2.7&r2=1.148.2.8",
+        "http://issues.apache.org/bugzilla/show_bug.cgi?id=10515",
+        "http://issues.apache.org/bugzilla/show_bug.cgi?id=22030",
+        "http://marc.info/?l=apache-httpd-dev&m=103291952019514&w=2",
+        "http://seclists.org/bugtraq/2002/Sep/0253.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0347",
-      "summary": "Directory traversal vulnerability in Cobalt RAQ 4 allows remote attackers to read password-protected files, and possibly files outside the web root, via a .. (dot dot) in an HTTP request.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-06-25",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=101495944202452&w=2",
-        "http://www.iss.net/security_center/static/8322.php",
-        "http://www.securityfocus.com/bid/4208",
-        "http://marc.info/?l=bugtraq&m=101495944202452&w=2",
-        "http://www.iss.net/security_center/static/8322.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0309",
-      "summary": "HP-UX vgdisplay program gives root access to local users.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1997-02-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9702-056",
-        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9702-056"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0369",
-      "summary": "The Sun sdtcm_convert calendar utility for OpenWindows has a buffer overflow which can gain root access.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1997-02-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/183",
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/183"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0959",
-      "summary": "IRIX startmidi program allows local users to modify arbitrary files via a symlink attack.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1997-02-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://patches.sgi.com/support/free/security/advisories/19980301-01-PX",
-        "http://www.osvdb.org/8447",
-        "http://www.securityfocus.com/bid/469",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1634",
-        "ftp://patches.sgi.com/support/free/security/advisories/19980301-01-PX"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1962",
-      "summary": "SQL injection vulnerability in index.php in Protector System 1.15b1 allows remote attackers to bypass SQL injection filters by using \"/**/\" sequences in the targeted fields.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://protector.warcenter.se/article-53--0-0.html",
-        "http://www.securityfocus.com/archive/1/361300/2004-04-21/2004-04-27/0",
-        "http://www.securityfocus.com/bid/10206",
-        "http://www.waraxe.us/index.php?modname=sa&id=25",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15969"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-75353",
-      "summary": "OpENer v2.3/ commit 76b95cf, contains an out-of-bounds read in the server-side EtherNet/IP ForwardOpen connection-path parser. This allows a remtoe attacker to cause a denial of service",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-75353",
-        "https://github.com/EIPStackGroup/OpENer/issues/570",
-        "https://github.com/EIPStackGroup/OpENer"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2025-8457",
-      "summary": "Rejected reason: This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2025-8457"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-75351",
-      "summary": "OpENer v2.3/commit 76b95cf, contains an out-of-bounds read in the server-side EtherNet/IP ForwardOpen connection-path parser. This allows a remote attacker to cause a denial of service.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-75351",
-        "https://github.com/EIPStackGroup/OpENer/issues/574",
-        "https://github.com/EIPStackGroup/OpENer"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-75346",
-      "summary": "An out-of-bounds read vulnerability exists in EIPStackGroup OpENer v2.3 and master through commit 76b95cf in the server-side CIP SetAttributeList service. This allows a remote attacker to cause a denial of service",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-75346",
-        "https://github.com/EIPStackGroup/OpENer/issues/572",
-        "https://github.com/EIPStackGroup/OpENer",
-        "https://github.com/EIPStackGroup/OpENer/blob/master/source/src/cip/cipcommon.c",
-        "https://github.com/EIPStackGroup/OpENer/blob/master/source/src/cip/cipidentity.c"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1223",
-      "summary": "The web administration server for ELSA Lancom 1100 Office does not require authentication, which allows arbitrary remote attackers to gain administrative privileges by connecting to the server.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2001-12-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.iss.net/security_center/static/7739.php",
-        "http://www.securityfocus.com/archive/1/247274",
-        "http://www.securityfocus.com/bid/3746",
-        "http://www.iss.net/security_center/static/7739.php",
-        "http://www.securityfocus.com/archive/1/247274"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1225",
-      "summary": "Hughes Technology Mini SQL 2.0.10 through 2.0.12 allows local users to cause a denial of service by creating a very large array in a table, which causes miniSQL to crash when the table is queried.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2001-12-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.iss.net/security_center/static/7746.php",
-        "http://www.securityfocus.com/archive/1/247222",
-        "http://www.securityfocus.com/bid/3742",
-        "http://www.iss.net/security_center/static/7746.php",
-        "http://www.securityfocus.com/archive/1/247222"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1203",
-      "summary": "Format string vulnerability in gpm-root in gpm 1.17.8 through 1.17.18 allows local users to gain root privileges.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2001-12-27",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.debian.org/security/2001/dsa-095",
-        "http://www.securityfocus.com/bid/3750",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7748",
-        "http://www.debian.org/security/2001/dsa-095",
-        "http://www.securityfocus.com/bid/3750"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1352",
-      "summary": "Cross-site scripting vulnerability in Namazu 2.0.9 and earlier allows remote attackers to execute arbitrary Javascript as other web users via an error message that is returned when an invalid index file is specified in the idxname parameter.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-12-27",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=100947261916155&w=2",
-        "http://marc.info/?l=bugtraq&m=101060476404565&w=2",
-        "http://marc.info/?l=bugtraq&m=101068116016472&w=2",
-        "http://www.osvdb.org/5691",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7875"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1202",
-      "summary": "Cross-site scripting vulnerability in DeleGate 7.7.0 and 7.7.1 does not quote scripting commands within a \"403 Forbidden\" error page, which allows remote attackers to execute arbitrary Javascript on other clients via a URL that generates an error.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-12-28",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=100956050432351&w=2",
-        "http://www.iss.net/security_center/static/7745.php",
-        "http://www.securityfocus.com/bid/3749",
-        "http://marc.info/?l=bugtraq&m=100956050432351&w=2",
-        "http://www.iss.net/security_center/static/7745.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1136",
-      "summary": "Vulnerability in Predictive on HP-UX 11.0 and earlier, and MPE/iX 5.5 and earlier, allows attackers to compromise data transfer for Predictive messages (using e-mail or modem) between customer and Response Center Predictive systems.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1998-07-30",
-      "modified": null,
-      "cwe": "CWE-200",
-      "references": [
-        "http://cert.ip-plus.net/bulletin-archive/msg00040.html",
-        "http://marc.info/?l=bugtraq&m=90221104526177&w=2",
-        "http://www.ciac.org/ciac/bulletins/i-081.shtml",
-        "http://www.codetalker.com/advisories/vendor/hp/hpsbux9807-081.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1413"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2130",
-      "summary": "publish_xp_docs.php in Gallery 1.3.2 allows remote attackers to execute arbitrary PHP code by modifying the GALLERY_BASEDIR parameter to reference a URL on a remote web server that contains the code.",
+      "id": "CVE-2002-1851",
+      "summary": "Buffer overflow in WS_FTP Pro 7.5 allows remote attackers to execute code on a client system via unknown attack vectors.",
       "cvssScore": 7.5,
       "severity": "High",
       "published": "2002-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-12/0260.html",
-        "http://gallery.menalto.com/modules.php?op=modload&name=News&file=article&sid=64&mode=thread&order=0&thold=0",
-        "http://www.iss.net/security_center/static/10943.php",
-        "http://www.securityfocus.com/bid/6489",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-12/0260.html"
+        "http://www.iss.net/security_center/static/10185.php",
+        "http://www.nextgenss.com/vna/ips-wsftp.txt",
+        "http://www.securityfocus.com/bid/4850",
+        "http://www.iss.net/security_center/static/10185.php",
+        "http://www.nextgenss.com/vna/ips-wsftp.txt"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-96959",
-      "summary": "## Executive summary\n\nMicrosoft is releasing this security advisory to provide information about a vulnerability in System.Security.Cryptography.Xml; System.Private.Xml. This advisory also provides guidance on what developers can do to update their applications to remove this vulnerability.\n\nSigned XML fixes add input-depth and operation-count limits, prohibit DTD processing by default, validate entity references, bound encrypted-data candidate processing, and cap attributes and namespaces used by C14N transforms.\n\n## Announcement\n\nAnnouncement for this issue can be found at https://github.com/dotnet/announcements/issues/489\n\n## CVSS Details\n\n- **Version:** 3.1\n- **Severity:** High\n- **Score:** 7.5\n- **Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H`\n\n- **Weakness:** CWE-770 (Allocation of Resources Without Limits or Throttling)\n## Affected Platforms\n\n- **Platforms:** Windows, Linux, macOS\n- **Architectures:** All\n\n## <a name=\"affected-packages\"></a>Affected Packages\n\nThe vulnerability affects Microsoft .NET projects that use an affected package version listed below.\n\nPackage name | Affected version | Patched version\n--------- | ---------------- | ---------------\n[System.Security.Cryptography.Xml](https://www.nuget.org/packages/System.Security.Cryptography.Xml) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[System.Security.Cryptography.Xml](https://www.nuget.org/packages/System.Security.Cryptography.Xml) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[System.Security.Cryptography.Xml](https://www.nuget.org/packages/System.Security.Cryptography.Xml) | >= 8.0.0, <= 8.0.4 | 8.0.5\n[System.Security.Cryptography.Xml](https://www.nuget.org/packages/System.Security.Cryptography.Xml) | >= 9.0.0, <= 9.0.20 | 9.0.21\n\n## Advisory FAQ\n\n### <a name=\"how-affected\"></a>How do I know if I am affected?\n\nIf using a package listed in [affected packages](#affected-packages), you're exposed to the vulnerability.\n\n### <a name=\"how-fix\"></a>How do I fix the issue?\n\n1. To fix the issue please install the latest version of .NET. If you have installed one or more .NET SDKs through Visual Studio, Visual Studio will prompt you to update Visual Studio, which will also update your .NET SDKs.\n2. If your application references the vulnerable package, update the package reference to the patched version. You can list the versions you have installed by running the `dotnet --info` command.\n\nOnce you have installed the updated runtime or SDK, restart your apps for the update to take effect.\n\nAdditionally, if you've deployed [self-contained applications](https://docs.microsoft.com/dotnet/core/deploying/#self-contained-deployments-scd) targeting any of the impacted versions, these applications are also vulnerable and must be recompiled and redeployed.\n\n## Other Information\n\n### Reporting Security Issues\n\nIf you have found a potential security issue in a supported version of .NET, please report it to the Microsoft Security Response Center (MSRC) via the [MSRC Researcher Portal](https://msrc.microsoft.com/report/vulnerability/new). Further information can be found in the MSRC [Report an Issue FAQ](https://www.microsoft.com/msrc/faqs-report-an-issue).\n\nSecurity reports made through MSRC may qualify for the Microsoft .NET Bounty. Details of the Microsoft .NET Bounty Program including terms and conditions are at https://aka.ms/corebounty.\n\n### Support\n\nYou can ask questions about this issue on GitHub in the .NET GitHub organization. The main repos are located at https://github.com/dotnet/runtime. The Announcements repo (https://github.com/dotnet/Announcements) will contain this bulletin as an issue and will include a link to a discussion issue. You can ask questions in the linked discussion issue.\n\n### Disclaimer\n\nThe information provided in this advisory is provided \"as is\" without warranty of any kind. Microsoft disclaims all warranties, either express or implied, including the warranties of merchantability and fitness for a particular purpose. In no event shall Microsoft Corporation or its suppliers be liable for any damages whatsoever including direct, indirect, incidental, consequential, loss of business profits or special damages, even if Microsoft Corporation or its suppliers have been advised of the possibility of such damages. Some states do not allow the exclusion or limitation of liability for consequential or incidental damages so the foregoing limitation may not apply.\n\n### External Links\n\n[CVE-2026-96959](https://www.cve.org/CVERecord?id=CVE-2026-96959)\n\n### Acknowledgements\n\n- novice-22\n- Ky0toFu (@ky0tofu)\n- Dr.-Ing Ashar Javed (@soaj1664ashar)\n\n### Revisions\n\nV1.0 (10/13/2026): Advisory published.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-10-13",
-      "modified": "2026-10-19",
-      "cwe": {
-        "cwe_id": "CWE-770",
-        "name": "Allocation of Resources Without Limits or Throttling"
-      },
-      "references": [
-        "https://github.com/dotnet/runtime/security/advisories/GHSA-c399-9853-6jmj",
-        "https://github.com/dotnet/announcements/issues/489",
-        "https://github.com/dotnet/runtime/issues/135710",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-96959",
-        "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-96959"
-      ],
-      "vulnerableProducts": [
-        "System.Security.Cryptography.Xml nuget"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-83520",
-      "summary": "## Executive summary\n\nMicrosoft is releasing this security advisory to provide information about a vulnerability in Microsoft.WindowsDesktop.App.Runtime (WPF). This advisory also provides guidance on what developers can do to update their applications to remove this vulnerability.\n\nRestrictive XAML and XPS security fixes block unsafe URI fetching and navigation, propagate untrusted-input state through hyperlink navigation, add TrueType font protection and XAML nesting-depth limits, and avoid caching positive DNS zone-policy decisions.\n\n## Announcement\n\nAnnouncement for this issue can be found at https://github.com/dotnet/announcements/issues/467\n\n## CVSS Details\n\n- **Version:** 3.1\n- **Severity:** High\n- **Score:** 8.8\n- **Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H`\n\n- **Weakness:** CWE-502 (Deserialization of Untrusted Data)\n## Affected Platforms\n\n- **Platforms:** Windows\n- **Architectures:** All\n\n## <a name=\"affected-packages\"></a>Affected Packages\n\nThe vulnerability affects Microsoft .NET projects that use an affected package version listed below.\n\nPackage name | Affected version | Patched version\n--------- | ---------------- | ---------------\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 9.0.0, <= 9.0.20 | 9.0.21\n\n## Advisory FAQ\n\n### <a name=\"how-affected\"></a>How do I know if I am affected?\n\nIf using a package listed in [affected packages](#affected-packages), you're exposed to the vulnerability.\n\n### <a name=\"how-fix\"></a>How do I fix the issue?\n\n1. To fix the issue please install the latest version of .NET. If you have installed one or more .NET SDKs through Visual Studio, Visual Studio will prompt you to update Visual Studio, which will also update your .NET SDKs.\n2. If your application references the vulnerable package, update the package reference to the patched version. You can list the versions you have installed by running the `dotnet --info` command.\n\nOnce you have installed the updated runtime or SDK, restart your apps for the update to take effect.\n\nAdditionally, if you've deployed [self-contained applications](https://docs.microsoft.com/dotnet/core/deploying/#self-contained-deployments-scd) targeting any of the impacted versions, these applications are also vulnerable and must be recompiled and redeployed.\n\n## Other Information\n\n### Reporting Security Issues\n\nIf you have found a potential security issue in a supported version of .NET, please report it to the Microsoft Security Response Center (MSRC) via the [MSRC Researcher Portal](https://msrc.microsoft.com/report/vulnerability/new). Further information can be found in the MSRC [Report an Issue FAQ](https://www.microsoft.com/msrc/faqs-report-an-issue).\n\nSecurity reports made through MSRC may qualify for the Microsoft .NET Bounty. Details of the Microsoft .NET Bounty Program including terms and conditions are at https://aka.ms/corebounty.\n\n### Support\n\nYou can ask questions about this issue on GitHub in the .NET GitHub organization. The main repos are located at https://github.com/dotnet/runtime. The Announcements repo (https://github.com/dotnet/Announcements) will contain this bulletin as an issue and will include a link to a discussion issue. You can ask questions in the linked discussion issue.\n\n### Disclaimer\n\nThe information provided in this advisory is provided \"as is\" without warranty of any kind. Microsoft disclaims all warranties, either express or implied, including the warranties of merchantability and fitness for a particular purpose. In no event shall Microsoft Corporation or its suppliers be liable for any damages whatsoever including direct, indirect, incidental, consequential, loss of business profits or special damages, even if Microsoft Corporation or its suppliers have been advised of the possibility of such damages. Some states do not allow the exclusion or limitation of liability for consequential or incidental damages so the foregoing limitation may not apply.\n\n### External Links\n\n[CVE-2026-83520](https://www.cve.org/CVERecord?id=CVE-2026-83520)\n\n### Acknowledgements\n\n- Dr.-Ing Ashar Javed (@soaj1664ashar)\n- Vincent55 Yang\n\n### Revisions\n\nV1.0 (10/13/2026): Advisory published.",
-      "cvssScore": 8.8,
-      "severity": "High",
-      "published": "2026-10-13",
-      "modified": "2026-10-19",
-      "cwe": {
-        "cwe_id": "CWE-502",
-        "name": "Deserialization of Untrusted Data"
-      },
-      "references": [
-        "https://github.com/dotnet/wpf/security/advisories/GHSA-4w5f-7jp2-w48g",
-        "https://github.com/dotnet/announcements/issues/467",
-        "https://github.com/dotnet/wpf/issues/12019",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-83520",
-        "https://msrc.microsoft.com/update-guide/vulnerability/CVE-2026-83520"
-      ],
-      "vulnerableProducts": [
-        "Microsoft.WindowsDesktop.App.Runtime.win-arm64 nuget",
-        "Microsoft.WindowsDesktop.App.Runtime.win-x64 nuget",
-        "Microsoft.WindowsDesktop.App.Runtime.win-x86 nuget"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-70174",
-      "summary": "## Executive summary\n\nMicrosoft is releasing this security advisory to provide information about a vulnerability in Microsoft.WindowsDesktop.App.Runtime (WPF). This advisory also provides guidance on what developers can do to update their applications to remove this vulnerability.\n\nWPF XPS hyperlink navigation can bypass URI restrictions and reach an attacker-controlled `ObjectDataProvider`, enabling remote code execution after user interaction.\n\n## Announcement\n\nAnnouncement for this issue can be found at https://github.com/dotnet/announcements/issues/456\n\n## CVSS Details\n\n- **Version:** 3.1\n- **Severity:** High\n- **Score:** 8.8\n- **Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H`\n\n- **Weakness:** CWE-358 (Improperly Implemented Security Check for Standard)\n## Affected Platforms\n\n- **Platforms:** Windows\n- **Architectures:** All\n\n## <a name=\"affected-packages\"></a>Affected Packages\n\nThe vulnerability affects Microsoft .NET projects that use an affected package version listed below.\n\nPackage name | Affected version | Patched version\n--------- | ---------------- | ---------------\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n\n## Advisory FAQ\n\n### <a name=\"how-affected\"></a>How do I know if I am affected?\n\nIf using a package listed in [affected packages](#affected-packages), you're exposed to the vulnerability.\n\n### <a name=\"how-fix\"></a>How do I fix the issue?\n\n1. To fix the issue please install the latest version of .NET. If you have installed one or more .NET SDKs through Visual Studio, Visual Studio will prompt you to update Visual Studio, which will also update your .NET SDKs.\n2. If your application references the vulnerable package, update the package reference to the patched version. You can list the versions you have installed by running the `dotnet --info` command.\n\nOnce you have installed the updated runtime or SDK, restart your apps for the update to take effect.\n\nAdditionally, if you've deployed [self-contained applications](https://docs.microsoft.com/dotnet/core/deploying/#self-contained-deployments-scd) targeting any of the impacted versions, these applications are also vulnerable and must be recompiled and redeployed.\n\n## Other Information\n\n### Reporting Security Issues\n\nIf you have found a potential security issue in a supported version of .NET, please report it to the Microsoft Security Response Center (MSRC) via the [MSRC Researcher Portal](https://msrc.microsoft.com/report/vulnerability/new). Further information can be found in the MSRC [Report an Issue FAQ](https://www.microsoft.com/msrc/faqs-report-an-issue).\n\nSecurity reports made through MSRC may qualify for the Microsoft .NET Bounty. Details of the Microsoft .NET Bounty Program including terms and conditions are at https://aka.ms/corebounty.\n\n### Support\n\nYou can ask questions about this issue on GitHub in the .NET GitHub organization. The main repos are located at https://github.com/dotnet/runtime. The Announcements repo (https://github.com/dotnet/Announcements) will contain this bulletin as an issue and will include a link to a discussion issue. You can ask questions in the linked discussion issue.\n\n### Disclaimer\n\nThe information provided in this advisory is provided \"as is\" without warranty of any kind. Microsoft disclaims all warranties, either express or implied, including the warranties of merchantability and fitness for a particular purpose. In no event shall Microsoft Corporation or its suppliers be liable for any damages whatsoever including direct, indirect, incidental, consequential, loss of business profits or special damages, even if Microsoft Corporation or its suppliers have been advised of the possibility of such damages. Some states do not allow the exclusion or limitation of liability for consequential or incidental damages so the foregoing limitation may not apply.\n\n### External Links\n\n[CVE-2026-70174](https://www.cve.org/CVERecord?id=CVE-2026-70174)\n\n### Acknowledgements\n\n- @bbznop\n- Aobo Wang (@m4x_1997)\n- Rolf Zengafinnen\n- Muhammad Abdul Rehman\n- Kevin Schmidt\n- Leandro Batista\n- nono\n- kayiz with Lien Phat Technology Corporation (http://lp.com.vn/)\n- Ky0toFu (@ky0tofu)\n\n### Revisions\n\nV1.0 (10/13/2026): Advisory published.",
-      "cvssScore": 8.8,
-      "severity": "High",
-      "published": "2026-10-13",
-      "modified": "2026-10-13",
-      "cwe": {
-        "cwe_id": "CWE-358",
-        "name": "Improperly Implemented Security Check for Standard"
-      },
-      "references": [
-        "https://github.com/dotnet/wpf/security/advisories/GHSA-f749-vhgx-39h6",
-        "https://github.com/dotnet/announcements/issues/456",
-        "https://github.com/dotnet/wpf/issues/12018",
-        "https://github.com/advisories/GHSA-f749-vhgx-39h6"
-      ],
-      "vulnerableProducts": [
-        "Microsoft.WindowsDesktop.App.Runtime.win-arm64 nuget",
-        "Microsoft.WindowsDesktop.App.Runtime.win-x64 nuget",
-        "Microsoft.WindowsDesktop.App.Runtime.win-x86 nuget"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-96232",
-      "summary": "## Executive summary\n\nMicrosoft is releasing this security advisory to provide information about a vulnerability in Microsoft.WindowsDesktop.App.Runtime (WPF). This advisory also provides guidance on what developers can do to update their applications to remove this vulnerability.\n\nRestrictive XAML and XPS security fixes block unsafe URI fetching and navigation, propagate untrusted-input state through hyperlink navigation, add TrueType font protection and XAML nesting-depth limits, and avoid caching positive DNS zone-policy decisions.\n\n## Announcement\n\nAnnouncement for this issue can be found at https://github.com/dotnet/announcements/issues/480\n\n## CVSS Details\n\n- **Version:** 3.1\n- **Severity:** High\n- **Score:** 7.5\n- **Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N`\n\n- **Weakness:** CWE-125 (Out-of-bounds Read)\n## Affected Platforms\n\n- **Platforms:** Windows\n- **Architectures:** All\n\n## <a name=\"affected-packages\"></a>Affected Packages\n\nThe vulnerability affects Microsoft .NET projects that use an affected package version listed below.\n\nPackage name | Affected version | Patched version\n--------- | ---------------- | ---------------\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 10.0.0, <= 10.0.12 | 10.0.13\n\n## Advisory FAQ\n\n### <a name=\"how-affected\"></a>How do I know if I am affected?\n\nIf using a package listed in [affected packages](#affected-packages), you're exposed to the vulnerability.\n\n### <a name=\"how-fix\"></a>How do I fix the issue?\n\n1. To fix the issue please install the latest version of .NET. If you have installed one or more .NET SDKs through Visual Studio, Visual Studio will prompt you to update Visual Studio, which will also update your .NET SDKs.\n2. If your application references the vulnerable package, update the package reference to the patched version. You can list the versions you have installed by running the `dotnet --info` command.\n\nOnce you have installed the updated runtime or SDK, restart your apps for the update to take effect.\n\nAdditionally, if you've deployed [self-contained applications](https://docs.microsoft.com/dotnet/core/deploying/#self-contained-deployments-scd) targeting any of the impacted versions, these applications are also vulnerable and must be recompiled and redeployed.\n\n## Other Information\n\n### Reporting Security Issues\n\nIf you have found a potential security issue in a supported version of .NET, please report it to the Microsoft Security Response Center (MSRC) via the [MSRC Researcher Portal](https://msrc.microsoft.com/report/vulnerability/new). Further information can be found in the MSRC [Report an Issue FAQ](https://www.microsoft.com/msrc/faqs-report-an-issue).\n\nSecurity reports made through MSRC may qualify for the Microsoft .NET Bounty. Details of the Microsoft .NET Bounty Program including terms and conditions are at https://aka.ms/corebounty.\n\n### Support\n\nYou can ask questions about this issue on GitHub in the .NET GitHub organization. The main repos are located at https://github.com/dotnet/runtime. The Announcements repo (https://github.com/dotnet/Announcements) will contain this bulletin as an issue and will include a link to a discussion issue. You can ask questions in the linked discussion issue.\n\n### Disclaimer\n\nThe information provided in this advisory is provided \"as is\" without warranty of any kind. Microsoft disclaims all warranties, either express or implied, including the warranties of merchantability and fitness for a particular purpose. In no event shall Microsoft Corporation or its suppliers be liable for any damages whatsoever including direct, indirect, incidental, consequential, loss of business profits or special damages, even if Microsoft Corporation or its suppliers have been advised of the possibility of such damages. Some states do not allow the exclusion or limitation of liability for consequential or incidental damages so the foregoing limitation may not apply.\n\n### External Links\n\n[CVE-2026-96232](https://www.cve.org/CVERecord?id=CVE-2026-96232)\n\n### Acknowledgements\n\n- Raffaello Tamagnini\n- Aobo Wang (@m4x_1997)\n- Ky0toFu (@ky0tofu)\n\n### Revisions\n\nV1.0 (10/13/2026): Advisory published.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-10-13",
-      "modified": "2026-10-13",
-      "cwe": {
-        "cwe_id": "CWE-125",
-        "name": "Out-of-bounds Read"
-      },
-      "references": [
-        "https://github.com/dotnet/wpf/security/advisories/GHSA-f8qh-mqg4-9939",
-        "https://github.com/dotnet/announcements/issues/480",
-        "https://github.com/dotnet/wpf/issues/12024",
-        "https://github.com/advisories/GHSA-f8qh-mqg4-9939"
-      ],
-      "vulnerableProducts": [
-        "Microsoft.WindowsDesktop.App.Runtime.win-arm64 nuget",
-        "Microsoft.WindowsDesktop.App.Runtime.win-x64 nuget",
-        "Microsoft.WindowsDesktop.App.Runtime.win-x86 nuget"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0033",
-      "summary": "Buffer overflow in the RPC preprocessor for Snort 1.8 and 1.9.x before 1.9.1 allows remote attackers to execute arbitrary code via fragmented RPC packets.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2003-03-07",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=104673386226064&w=2",
-        "http://marc.info/?l=bugtraq&m=104716001503409&w=2",
-        "http://marc.info/?l=bugtraq&m=105154530427824&w=2",
-        "http://www.cert.org/advisories/CA-2003-13.html",
-        "http://www.debian.org/security/2003/dsa-297"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0050",
-      "summary": "parse_xml.cgi in Apple Darwin Streaming Administration Server 4.1.2 and QuickTime Streaming Server 4.1.1 allows remote attackers to execute arbitrary code via shell metacharacters.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2003-03-07",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://lists.apple.com/archives/security-announce/2003/Feb/25/applesa20030225macosx102.txt",
-        "http://marc.info/?l=bugtraq&m=104618904330226&w=2",
-        "http://www.iss.net/security_center/static/11401.php",
-        "http://www.securityfocus.com/bid/6954",
-        "http://lists.apple.com/archives/security-announce/2003/Feb/25/applesa20030225macosx102.txt"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0185",
-      "summary": "Netopia R9100 router version 4.6 allows authenticated users to cause a denial of service by using the router's telnet program to connect to the router's IP address, which causes a crash.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-03-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/archive/1/157952",
-        "http://www.securityfocus.com/bid/2287",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6001",
-        "http://www.securityfocus.com/archive/1/157952",
-        "http://www.securityfocus.com/bid/2287"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0187",
-      "summary": "Format string vulnerability in wu-ftp 2.6.1 and earlier, when running with debug mode enabled, allows remote attackers to execute arbitrary commands via a malformed argument that is recorded in a PASV port assignment.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2001-03-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.wu-ftpd.org/pub/wu-ftpd/patches/apply_to_current/missing_format_strings.patch",
-        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000443",
-        "http://www.debian.org/security/2001/dsa-016",
-        "http://www.securityfocus.com/bid/2296",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6020"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0188",
-      "summary": "GoodTech FTP server 3.0.1.2.1.0 and earlier allows remote attackers to cause a denial of service via a flood of connections to the server, which causes it to crash.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-03-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0350.html",
-        "http://www.securityfocus.com/bid/2270",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5984",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0350.html",
-        "http://www.securityfocus.com/bid/2270"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-73177",
-      "summary": "Nozomi Networks Labs identified a CWE-345: Insufficient Verification of Data Authenticity vulnerability in the firmware upgrade mechanism of the Advantech EKI-1242EIMS in firmware version V1.06.01. The device accepts firmware images through the authenticated web management interface without performing any cryptographic signature or certificate verification. An authenticated administrator-level attacker can install arbitrary modified firmware on the device, enabling full persistent compromise of the platform.",
-      "cvssScore": null,
-      "severity": "High",
-      "published": "2026-09-16",
-      "modified": "2026-09-16",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-73177",
-        "https://advcloudfiles.advantech.com/cms/5dafee28-ad53-4d07-a328-7896fcc24b6e/Security%20Advisory%20PDF%20File/SECURITY-ADVISORY----EKI-1242IEIMS-updated-20260904.pdf",
-        "https://www.nozominetworks.com/labs/vulnerability-advisories-cve-2026-73177"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0270",
-      "summary": "The administration capability for Apple AirPort 802.11 wireless access point devices uses weak encryption (XOR with a fixed key) for protecting authentication credentials, which could allow remote attackers to obtain administrative access via sniffing when the capability is available via Ethernet or non-WEP connections.",
-      "cvssScore": 7.6,
-      "severity": "High",
-      "published": "2003-06-16",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://secunia.com/advisories/8773",
-        "http://securitytracker.com/id?1006742",
-        "http://www.atstake.com/research/advisories/2003/a051203-1.txt",
-        "http://www.securityfocus.com/bid/7554",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11980"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0275",
-      "summary": "SSI.php in YaBB SE 1.5.2 allows remote attackers to execute arbitrary PHP code by modifying the sourcedir parameter to reference a URL on a remote web server that contains the code.",
-      "cvssScore": 5.1,
-      "severity": "Medium",
-      "published": "2003-06-16",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=105249980809988&w=2",
-        "http://marc.info/?l=bugtraq&m=105249980809988&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1631",
-      "summary": "SQL injection vulnerability in the query.xsql sample page in Oracle 9i Application Server (9iAS) allows remote attackers to execute arbitrary code via the sql parameter.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.kb.cert.org/vuls/id/717827",
-        "http://www.kb.cert.org/vuls/id/SVIM-576QLZ",
-        "http://www.nextgenss.com/papers/hpoas.pdf",
-        "http://www.oracle.com/technology/deploy/security/pdf/ias_modplsql_alert.pdf",
-        "http://www.securityfocus.com/bid/6556"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0604",
-      "summary": "An incorrect configuration of the WebStore 1.0 shopping cart CGI program \"web_store.cgi\" could disclose private information.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-04-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=92462991805485&w=2",
-        "http://marc.info/?l=bugtraq&m=92462991805485&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0607",
-      "summary": "quikstore.cgi in QuikStore shopping cart stores quikstore.cfg under the web document root with insufficient access control, which allows remote attackers to obtain the cleartext administrator password and gain privileges.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-04-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=92462991805485&w=2",
-        "http://marc.info/?l=bugtraq&m=92462991805485&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0466",
-      "summary": "The SVR4 /dev/wabi special device file in NetBSD 1.3.3 and earlier allows a local user to read or write arbitrary files on the disk associated with that device.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1999-04-21",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.osvdb.org/905",
-        "http://www.osvdb.org/905"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2281",
-      "summary": "Symantec Java! JIT (Just-In-Time) Compiler for Netscape Communicator 4.0 through 4.8 allows remote attackers to execute arbitrary Java commands via an applet that uses a jump call, which is not correctly compiled by the JIT compiler.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=103798147613151&w=2",
-        "http://www.lsd-pl.net/documents/javasecurity-1.0.0.pdf",
-        "http://www.securityfocus.com/bid/6222",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10711",
-        "http://marc.info/?l=bugtraq&m=103798147613151&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0094",
-      "summary": "Integer signedness errors in XFree86 4.1.0 allow remote attackers to cause a denial of service and possibly execute arbitrary code when using the GLX extension and Direct Rendering Infrastructure (DRI).",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-03-15",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://patches.sgi.com/support/free/security/advisories/20040406-01-U",
-        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000824",
-        "http://www.debian.org/security/2004/dsa-443",
-        "http://www.redhat.com/support/errata/RHSA-2004-152.html",
-        "http://www.securityfocus.com/bid/9701"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0110",
-      "summary": "Buffer overflow in the (1) nanohttp or (2) nanoftp modules in XMLSoft Libxml 2 (Libxml2) 2.6.0 through 2.6.5 allow remote attackers to execute arbitrary code via a long URL.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-03-15",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107851606605420&w=2",
-        "http://marc.info/?l=bugtraq&m=107860178228804&w=2",
-        "http://rhn.redhat.com/errata/RHSA-2004-090.html",
-        "http://secunia.com/advisories/10958/",
-        "http://security.gentoo.org/glsa/glsa-200403-01.xml"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0159",
-      "summary": "Format string vulnerability in hsftp 1.11 allows remote authenticated users to cause a denial of service and possibly execute arbitrary code via file names containing format string characters that are not properly handled when executing an \"ls\" command.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-03-15",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-February/017737.html",
-        "http://www.osvdb.org/4029",
-        "http://www.securityfocus.com/bid/9715",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15276",
-        "https://www.debian.org/security/2004/dsa-447"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0165",
-      "summary": "Format string vulnerability in Point-to-Point Protocol (PPP) daemon (pppd) 2.4.0 for Mac OS X 10.3.2 and earlier allows remote attackers to read arbitrary pppd process data, including PAP or CHAP authentication credentials, to gain privileges.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-03-15",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://lists.apple.com/archives/security-announce/2004/Feb/msg00000.html",
-        "http://www.atstake.com/research/advisories/2004/a022304-1.txt",
-        "http://www.kb.cert.org/vuls/id/841742",
-        "http://www.osvdb.org/6822",
-        "http://www.securityfocus.com/bid/9730"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0166",
-      "summary": "Unknown vulnerability in Safari web browser for Mac OS X 10.2.8 related to \"the display of URLs in the status bar.\"",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-03-15",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://lists.apple.com/archives/security-announce/2004/Feb/msg00000.html",
-        "http://secunia.com/advisories/10959",
-        "http://www.kb.cert.org/vuls/id/194238",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/14993",
-        "http://lists.apple.com/archives/security-announce/2004/Feb/msg00000.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1607",
-      "summary": "slxweb.dll in SalesLogix 6.1 allows remote attackers to obtain sensitive information via a (1) Library or (2) Attachment request with an invalid file parameter, which reveals the path in an error message.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-10-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/fulldisclosure/2004-10/0661.html",
-        "http://marc.info/?l=bugtraq&m=109811852218478&w=2",
-        "http://secunia.com/advisories/12883",
-        "http://securitytracker.com/id?1011769",
-        "http://www.osvdb.org/10944"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1608",
-      "summary": "SQL injection vulnerability in SalesLogix 6.1 allows remote attackers to execute arbitrary SQL statements via the id parameter in a view operation.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-10-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/fulldisclosure/2004-10/0661.html",
-        "http://marc.info/?l=bugtraq&m=109811852218478&w=2",
-        "http://secunia.com/advisories/12883",
-        "http://securitytracker.com/id?1011769",
-        "http://www.osvdb.org/10945"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1559",
-      "summary": "Xylan OmniSwitch before 3.2.6 allows remote attackers to bypass the login prompt via a CTRL-D (control d) character, which locks other users out of the switch because it only supports one session at a time.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-03-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=92299263017061&w=2",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2064",
-        "http://marc.info/?l=bugtraq&m=92299263017061&w=2",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2064"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0445",
-      "summary": "In Cisco routers under some versions of IOS 12.0 running NAT, some packets may not be filtered by input access list filters.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-04-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.osvdb.org/1104",
-        "http://www.osvdb.org/1104"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0427",
-      "summary": "Eudora 4.1 allows remote attackers to perform a denial of service by sending attachments with long file names.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2000-05-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0427",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0427"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1790",
-      "summary": "Cross-site scripting (XSS) vulnerability in the web management interface in Edimax AR-6004 ADSL Routers allows remote attackers to inject arbitrary web script or HTML via the URL.",
+      "id": "CVE-2002-1852",
+      "summary": "Cross-site scripting (XSS) vulnerability in Monkey 0.5.0 allows remote attackers to inject arbitrary web script or HTML via (1) the URL or (2) a parameter to test2.pl.",
       "cvssScore": 4.3,
       "severity": "Medium",
-      "published": "2004-12-31",
+      "published": "2002-12-31",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-79",
       "references": [
-        "http://secunia.com/advisories/10576",
-        "http://securitytracker.com/id?1008643",
-        "http://www.osvdb.org/3435",
-        "http://www.securityfocus.com/archive/1/349089",
-        "http://www.securityfocus.com/bid/9374"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0300",
-      "summary": "oidldapd 2.1.1.1 in Oracle 8.1.7 records log files in a directory (ldaplog) that has world-writable permissions, which may allow local users to delete logs and/or overwrite other files via a symlink attack.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2001-06-02",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0434.html",
-        "http://www.kb.cert.org/vuls/id/610904",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5804",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0434.html",
-        "http://www.kb.cert.org/vuls/id/610904"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0309",
-      "summary": "inetd in Red Hat 6.2 does not properly close sockets for internal services such as chargen, daytime, echo, etc., which allows remote attackers to cause a denial of service via a series of connections to the internal services.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-06-02",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.redhat.com/support/errata/RHSA-2001-006.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6380",
-        "http://www.redhat.com/support/errata/RHSA-2001-006.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6380"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0310",
-      "summary": "sort in FreeBSD 4.1.1 and earlier, and possibly other operating systems, uses predictable temporary file names and does not properly handle when the temporary file already exists, which causes sort to crash and possibly impacts security-sensitive scripts.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2001-06-02",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-01:13.sort.asc",
-        "http://www.securityfocus.com/bid/3960",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6038",
-        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-01:13.sort.asc",
-        "http://www.securityfocus.com/bid/3960"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-09/0344.html",
+        "http://www.iss.net/security_center/static/10226.php",
+        "http://www.iss.net/security_center/static/10229.php",
+        "http://www.securityfocus.com/bid/5829",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-09/0344.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
